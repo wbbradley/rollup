@@ -2,6 +2,9 @@
 name = "rollup"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal dashboard for GitHub PR review workload"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"
