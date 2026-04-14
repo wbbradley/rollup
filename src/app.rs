@@ -11,7 +11,7 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
     github::{self, Data},
-    model::{Pr, ReviewerKind, ReviewerStatus, group_by_repo},
+    model::{Pr, ReviewerKind, ReviewerStatus, group_by_person, group_by_repo},
     ui,
 };
 
@@ -19,6 +19,12 @@ use crate::{
 pub enum Focus {
     Authored,
     Reviewing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Me,
+    People,
 }
 
 pub enum Row<'a> {
@@ -43,12 +49,15 @@ pub struct AppState {
     pub status: Option<String>,
     pub loading: bool,
     pub focus: Focus,
+    pub mode: ViewMode,
     pub authored_sel: usize,
     pub reviewing_sel: usize,
+    pub people_sel: usize,
     /// Persisted across frames so scroll offset is sticky — `ui` only moves
     /// the viewport when the selection crosses a scroll-margin boundary.
     pub authored_list_state: ListState,
     pub reviewing_list_state: ListState,
+    pub people_list_state: ListState,
 }
 
 impl AppState {
@@ -62,10 +71,13 @@ impl AppState {
             status: None,
             loading: true,
             focus: Focus::Authored,
+            mode: ViewMode::Me,
             authored_sel: 0,
             reviewing_sel: 0,
+            people_sel: 0,
             authored_list_state: ListState::default(),
             reviewing_list_state: ListState::default(),
+            people_list_state: ListState::default(),
         }
     }
 
@@ -98,6 +110,9 @@ impl AppState {
         } else if self.reviewing_sel >= r_len {
             self.reviewing_sel = r_len - 1;
         }
+        // PLAN "Refresh while in People mode: Reset selection to top." —
+        // easiest correct answer when the underlying data just changed.
+        self.people_sel = 0;
     }
 
     fn focused_prs(&self) -> &[Pr] {
@@ -122,8 +137,41 @@ impl AppState {
     }
 
     pub fn selected_row(&self) -> Option<Row<'_>> {
-        let prs = self.focused_prs();
-        selectable_rows(prs).into_iter().nth(self.focused_sel())
+        match self.mode {
+            ViewMode::Me => selectable_rows(self.focused_prs())
+                .into_iter()
+                .nth(self.focused_sel()),
+            ViewMode::People => {
+                let viewer = self.viewer.as_deref().unwrap_or("");
+                selectable_rows_people(&self.authored, &self.reviewing, viewer)
+                    .into_iter()
+                    .nth(self.people_sel)
+            }
+        }
+    }
+
+    fn current_len(&self) -> usize {
+        match self.mode {
+            ViewMode::Me => selectable_rows(self.focused_prs()).len(),
+            ViewMode::People => {
+                let viewer = self.viewer.as_deref().unwrap_or("");
+                selectable_rows_people(&self.authored, &self.reviewing, viewer).len()
+            }
+        }
+    }
+
+    fn current_sel(&self) -> usize {
+        match self.mode {
+            ViewMode::Me => self.focused_sel(),
+            ViewMode::People => self.people_sel,
+        }
+    }
+
+    fn current_sel_mut(&mut self) -> &mut usize {
+        match self.mode {
+            ViewMode::Me => self.focused_sel_mut(),
+            ViewMode::People => &mut self.people_sel,
+        }
     }
 }
 
@@ -133,6 +181,26 @@ pub fn selectable_rows(prs: &[Pr]) -> Vec<Row<'_>> {
     let mut rows = Vec::new();
     for (_, group_prs) in group_by_repo(prs) {
         for pr in group_prs {
+            rows.push(Row::Pr(pr));
+            for r in &pr.reviewers {
+                rows.push(Row::Reviewer { pr, reviewer: r });
+            }
+        }
+    }
+    rows
+}
+
+/// People-mode analogue: each person's Authored/Reviewing PRs flattened with
+/// their reviewer sub-rows. Person headers and sub-group labels are not
+/// selectable — they're visual only, emitted by the UI layer.
+pub fn selectable_rows_people<'a>(
+    authored: &'a [Pr],
+    reviewing: &'a [Pr],
+    viewer: &str,
+) -> Vec<Row<'a>> {
+    let mut rows = Vec::new();
+    for person in group_by_person(authored, reviewing, viewer) {
+        for pr in person.authored.iter().chain(person.reviewing.iter()) {
             rows.push(Row::Pr(pr));
             for r in &pr.reviewers {
                 rows.push(Row::Reviewer { pr, reviewer: r });
@@ -164,12 +232,28 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             && key.kind == KeyEventKind::Press
         {
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') => break,
+                KeyCode::Esc => {
+                    if state.mode == ViewMode::People {
+                        state.mode = ViewMode::Me;
+                        state.people_sel = 0;
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if state.mode == ViewMode::Me {
+                        state.mode = ViewMode::People;
+                        state.people_sel = 0;
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, 1),
                 KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, -1),
                 KeyCode::Char('g') => jump(&mut state, true),
                 KeyCode::Char('G') => jump(&mut state, false),
-                KeyCode::Tab | KeyCode::BackTab => toggle_focus(&mut state),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    if state.mode == ViewMode::Me {
+                        toggle_focus(&mut state);
+                    }
+                }
                 KeyCode::Enter => open_selected(&state),
                 KeyCode::Char('r') => {
                     if !state.loading {
@@ -214,21 +298,21 @@ fn spawn_fetch(tx: &Sender<Msg>) {
 }
 
 fn move_selection(state: &mut AppState, delta: i32) {
-    let len = selectable_rows(state.focused_prs()).len();
+    let len = state.current_len();
     if len == 0 {
         return;
     }
-    let sel = state.focused_sel() as i32 + delta;
+    let sel = state.current_sel() as i32 + delta;
     let sel = sel.clamp(0, len as i32 - 1) as usize;
-    *state.focused_sel_mut() = sel;
+    *state.current_sel_mut() = sel;
 }
 
 fn jump(state: &mut AppState, to_top: bool) {
-    let len = selectable_rows(state.focused_prs()).len();
+    let len = state.current_len();
     if len == 0 {
         return;
     }
-    *state.focused_sel_mut() = if to_top { 0 } else { len - 1 };
+    *state.current_sel_mut() = if to_top { 0 } else { len - 1 };
 }
 
 fn toggle_focus(state: &mut AppState) {

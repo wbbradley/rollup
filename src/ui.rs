@@ -9,37 +9,44 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, Focus},
-    model::{Pr, ReviewState, ReviewerKind, ReviewerStatus, group_by_repo},
+    app::{AppState, Focus, ViewMode},
+    model::{Pr, ReviewState, ReviewerKind, ReviewerStatus, group_by_person, group_by_repo},
 };
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
-    let sections = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(outer[0]);
 
-    let focus = state.focus;
-    let viewer = state.viewer.clone();
-    draw_section(
-        f,
-        sections[0],
-        "Review requested of me",
-        &state.reviewing,
-        state.reviewing_sel,
-        &mut state.reviewing_list_state,
-        focus == Focus::Reviewing,
-        None,
-    );
-    draw_section(
-        f,
-        sections[1],
-        "Authored by me",
-        &state.authored,
-        state.authored_sel,
-        &mut state.authored_list_state,
-        focus == Focus::Authored,
-        viewer.as_deref(),
-    );
+    match state.mode {
+        ViewMode::Me => {
+            let sections =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(outer[0]);
+            let focus = state.focus;
+            let viewer = state.viewer.clone();
+            draw_section(
+                f,
+                sections[0],
+                "Review requested of me",
+                &state.reviewing,
+                state.reviewing_sel,
+                &mut state.reviewing_list_state,
+                focus == Focus::Reviewing,
+                None,
+            );
+            draw_section(
+                f,
+                sections[1],
+                "Authored by me",
+                &state.authored,
+                state.authored_sel,
+                &mut state.authored_list_state,
+                focus == Focus::Authored,
+                viewer.as_deref(),
+            );
+        }
+        ViewMode::People => draw_people_section(f, outer[0], state),
+    }
+
     draw_footer(f, outer[1], state);
 }
 
@@ -124,6 +131,91 @@ fn draw_section(
         .highlight_symbol(if focused { "▶ " } else { "  " });
 
     f.render_stateful_widget(list, area, list_state);
+}
+
+fn draw_people_section(f: &mut Frame, area: Rect, state: &mut AppState) {
+    let viewer = state.viewer.as_deref().unwrap_or("");
+    let groups = group_by_person(&state.authored, &state.reviewing, viewer);
+
+    let border_style = Style::default().fg(Color::Cyan);
+    let title_line = format!(" People ({}) ", groups.len());
+    let block = Block::default()
+        .title(title_line)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    if groups.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let msg = Paragraph::new(Span::styled(
+            "(no other people)",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        f.render_widget(msg, inner);
+        return;
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut row_of_sel: Vec<usize> = Vec::new();
+
+    for person in &groups {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("@{}", person.login),
+            Style::default()
+                .fg(color_for_login(&person.login))
+                .add_modifier(Modifier::BOLD),
+        ))));
+        if !person.authored.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  Authored",
+                Style::default().add_modifier(Modifier::DIM),
+            ))));
+            for pr in &person.authored {
+                row_of_sel.push(items.len());
+                items.push(ListItem::new(pr_line(pr, Some(&person.login))));
+                for r in &pr.reviewers {
+                    row_of_sel.push(items.len());
+                    items.push(ListItem::new(reviewer_line(r)));
+                }
+            }
+        }
+        if !person.reviewing.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  Reviewing",
+                Style::default().add_modifier(Modifier::DIM),
+            ))));
+            for pr in &person.reviewing {
+                row_of_sel.push(items.len());
+                items.push(ListItem::new(pr_line(pr, None)));
+                for r in &pr.reviewers {
+                    row_of_sel.push(items.len());
+                    items.push(ListItem::new(reviewer_line(r)));
+                }
+            }
+        }
+    }
+
+    let highlighted_row = row_of_sel.get(state.people_sel).copied();
+    state.people_list_state.select(highlighted_row);
+
+    let inner_h = block.inner(area).height as usize;
+    apply_scroll_margin(
+        &mut state.people_list_state,
+        highlighted_row,
+        items.len(),
+        inner_h,
+    );
+
+    let highlight_style = Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style)
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(list, area, &mut state.people_list_state);
 }
 
 /// Vim-style `scrolloff`: only move the viewport once the selection is within
@@ -262,6 +354,17 @@ fn hue_offset() -> f32 {
     *OFFSET.get_or_init(|| (ANCHOR_HUE - raw_hue(ANCHOR_LOGIN)).rem_euclid(360.0))
 }
 
+/// Braille-dots spinner. Wall-clock driven so it animates without any per-
+/// frame state — the event loop already redraws every ~100 ms.
+fn spinner_frame() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    FRAMES[(ms / 100) as usize % FRAMES.len()]
+}
+
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h / 60.0;
@@ -299,7 +402,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         )
     } else if state.loading {
         Span::styled(
-            "Loading…",
+            format!("{} Loading…", spinner_frame()),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -318,11 +421,16 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::raw("")
     };
 
+    let hint = match state.mode {
+        ViewMode::Me => {
+            "↑↓ move · Tab switch · Enter open · x remove reviewer · p people · r refresh · q quit   "
+        }
+        ViewMode::People => {
+            "↑↓ move · Esc back · Enter open · x remove reviewer · r refresh · q quit   "
+        }
+    };
     let line = Line::from(vec![
-        Span::styled(
-            "↑↓ move · Tab switch · Enter open · x remove reviewer · r refresh · q quit   ",
-            Style::default().add_modifier(Modifier::DIM),
-        ),
+        Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         Span::raw("["),
         status,
         Span::raw("]"),

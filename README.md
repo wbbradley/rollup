@@ -27,11 +27,13 @@ rollup
 |-----------------|-------------------------------------------------------|
 | `↑` `↓` `k` `j` | Move selection (PR rows *and* reviewer sub-rows)      |
 | `g` / `G`       | Jump to top / bottom of the pane                      |
-| `Tab`           | Switch focus between the two panes                    |
+| `Tab`           | Switch focus between the two panes (Me mode only)     |
+| `p`             | Switch to People view                                 |
 | `Enter`         | Open the selected PR in your browser                  |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
-| `q` / `Esc`     | Quit                                                  |
+| `Esc`           | Back to Me mode from People view                      |
+| `q`             | Quit                                                  |
 
 ## Reviewer rows
 
