@@ -10,17 +10,32 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{Pr, ReviewState, ReviewerKind, ReviewerStatus, group_by_person, group_by_repo},
+    model::{
+        Pr,
+        ReviewState,
+        ReviewerKind,
+        ReviewerStatus,
+        authors_for_me,
+        authors_for_people,
+        group_by_person,
+        group_by_repo,
+    },
 };
+
+const MERGED_PANE_CAP: usize = 10;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
+    let top_and_merged =
+        Layout::vertical([Constraint::Percentage(75), Constraint::Percentage(25)]).split(outer[0]);
+    let top = top_and_merged[0];
+    let merged_area = top_and_merged[1];
 
     match state.mode {
         ViewMode::Me => {
             let sections =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(outer[0]);
+                    .split(top);
             let focus = state.focus;
             let viewer = state.viewer.clone();
             draw_section(
@@ -44,9 +59,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 viewer.as_deref(),
             );
         }
-        ViewMode::People => draw_people_section(f, outer[0], state),
+        ViewMode::People => draw_people_section(f, top, state),
     }
 
+    draw_merged_pane(f, merged_area, state);
     draw_footer(f, outer[1], state);
 }
 
@@ -252,6 +268,70 @@ fn apply_scroll_margin(
     }
 
     *list_state.offset_mut() = offset.min(max_offset);
+}
+
+fn draw_merged_pane(f: &mut Frame, area: Rect, state: &AppState) {
+    let viewer = state.viewer.as_deref().unwrap_or("");
+    let allowed: std::collections::BTreeSet<String> = match state.mode {
+        ViewMode::Me => authors_for_me(viewer, &state.reviewing)
+            .into_iter()
+            .collect(),
+        ViewMode::People => authors_for_people(&state.authored, &state.reviewing, viewer)
+            .into_iter()
+            .collect(),
+    };
+
+    // `state.merged` is already sorted by `merged_at` desc from the fetcher,
+    // so filter + take is enough — no re-sort.
+    let visible: Vec<&Pr> = state
+        .merged
+        .iter()
+        .filter(|p| allowed.contains(&p.author.to_ascii_lowercase()))
+        .take(MERGED_PANE_CAP)
+        .collect();
+
+    let border_style = Style::default().fg(Color::DarkGray);
+    let title_line = format!(" Recently merged PRs ({}) ", visible.len());
+    let block = Block::default()
+        .title(title_line)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    if visible.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let msg = Paragraph::new(Span::styled(
+            "No recently merged PRs.",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        f.render_widget(msg, inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = visible
+        .iter()
+        .map(|pr| ListItem::new(merged_pr_line(pr)))
+        .collect();
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
+fn merged_pr_line(pr: &Pr) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("  #{} ", pr.number),
+        Style::default().fg(Color::Blue),
+    ));
+    spans.push(Span::styled(
+        format!("{} ", pr.repo),
+        Style::default().fg(Color::Magenta),
+    ));
+    spans.push(Span::styled(
+        format!("@{} ", pr.author),
+        Style::default().fg(color_for_login(&pr.author)),
+    ));
+    spans.push(Span::raw(pr.title.clone()));
+    Line::from(spans)
 }
 
 fn pr_line(pr: &Pr, hide_author_if: Option<&str>) -> Line<'static> {

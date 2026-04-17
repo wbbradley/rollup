@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::model::{Pr, ReviewState, ReviewerKind, ReviewerStatus};
+use crate::model::{self, Pr, ReviewState, ReviewerKind, ReviewerStatus};
 
 const QUERY: &str = r#"
 query {
@@ -23,6 +23,7 @@ fragment PrFields on PullRequest {
   url
   isDraft
   updatedAt
+  mergedAt
   repository { nameWithOwner }
   author { login }
   reviewRequests(first: 20) {
@@ -40,11 +41,50 @@ fragment PrFields on PullRequest {
 }
 "#;
 
+const MERGED_QUERY: &str = r#"
+query($q: String!) {
+  merged: search(query: $q, type: ISSUE, first: 50) {
+    nodes { ...PrFields }
+  }
+}
+
+fragment PrFields on PullRequest {
+  number
+  title
+  url
+  isDraft
+  updatedAt
+  mergedAt
+  repository { nameWithOwner }
+  author { login }
+  reviewRequests(first: 20) {
+    nodes {
+      requestedReviewer {
+        __typename
+        ... on User { login }
+        ... on Team { name }
+      }
+    }
+  }
+  latestReviews(first: 20) {
+    nodes { author { login } state }
+  }
+}
+"#;
+
+/// Cap on `author:` qualifiers per merged-PR search. GitHub's search API has
+/// an undocumented limit on operators/qualifiers; 10 is well under any known
+/// ceiling and keeps the query string short.
+// TODO: paginate or batch if we need unbounded author coverage.
+const MERGED_AUTHOR_CAP: usize = 10;
+
 #[derive(Debug)]
 pub struct Data {
     pub viewer: String,
     pub authored: Vec<Pr>,
     pub reviewing: Vec<Pr>,
+    /// Already sorted by `merged_at` desc and capped to the recent N.
+    pub merged: Vec<Pr>,
 }
 
 pub fn remove_user_reviewer(owner: &str, repo: &str, pr_number: u64, login: &str) -> Result<()> {
@@ -78,6 +118,24 @@ fn remove_reviewer_impl(
 }
 
 pub fn fetch() -> Result<Data> {
+    let (viewer, authored, reviewing) = fetch_open()?;
+    // The People author-set is a superset of the Me author-set, so querying
+    // it once feeds both views; per-view filtering happens at render time.
+    let authors = model::authors_for_people(&authored, &reviewing, &viewer);
+    let merged = if authors.is_empty() {
+        Vec::new()
+    } else {
+        fetch_merged(&authors, MERGED_AUTHOR_CAP)?
+    };
+    Ok(Data {
+        viewer,
+        authored,
+        reviewing,
+        merged,
+    })
+}
+
+fn fetch_open() -> Result<(String, Vec<Pr>, Vec<Pr>)> {
     let output = Command::new("gh")
         .args(["api", "graphql", "-f"])
         .arg(format!("query={QUERY}"))
@@ -89,28 +147,66 @@ pub fn fetch() -> Result<Data> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse(&output.stdout)
+    let root: OpenRoot =
+        serde_json::from_slice(&output.stdout).context("parsing gh response JSON")?;
+    let authored = root
+        .data
+        .authored
+        .nodes
+        .into_iter()
+        .filter_map(node_to_pr)
+        .collect();
+    let reviewing = root
+        .data
+        .reviewing
+        .nodes
+        .into_iter()
+        .filter_map(node_to_pr)
+        .collect();
+    Ok((root.data.viewer.login, authored, reviewing))
 }
 
-fn parse(bytes: &[u8]) -> Result<Data> {
-    let root: Root = serde_json::from_slice(bytes).context("parsing gh response JSON")?;
-    Ok(Data {
-        viewer: root.data.viewer.login,
-        authored: root
-            .data
-            .authored
-            .nodes
-            .into_iter()
-            .filter_map(node_to_pr)
-            .collect(),
-        reviewing: root
-            .data
-            .reviewing
-            .nodes
-            .into_iter()
-            .filter_map(node_to_pr)
-            .collect(),
-    })
+fn fetch_merged(authors: &[String], cap: usize) -> Result<Vec<Pr>> {
+    let clauses: Vec<String> = authors
+        .iter()
+        .take(MERGED_AUTHOR_CAP)
+        .map(|a| format!("author:{a}"))
+        .collect();
+    if clauses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q = format!(
+        "is:pr is:merged {} archived:false sort:updated-desc",
+        clauses.join(" ")
+    );
+
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f"])
+        .arg(format!("query={MERGED_QUERY}"))
+        .args(["-f", &format!("q={q}")])
+        .output()
+        .context("failed to invoke gh; is it installed and on PATH?")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh api graphql (merged) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let root: MergedRoot =
+        serde_json::from_slice(&output.stdout).context("parsing gh merged response JSON")?;
+    let all: Vec<Pr> = root
+        .data
+        .merged
+        .nodes
+        .into_iter()
+        .filter_map(node_to_pr)
+        .filter(|p| p.merged_at.is_some())
+        .collect();
+    Ok(model::recent_merged(&all, cap)
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
 fn node_to_pr(node: PrNode) -> Option<Pr> {
@@ -200,6 +296,12 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch"));
 
+    let merged_at = node
+        .merged_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+
     Some(Pr {
         number,
         title: node.title.unwrap_or_default(),
@@ -212,19 +314,30 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
             .unwrap_or_else(|| "ghost".into()),
         reviewers,
         updated_at,
+        merged_at,
     })
 }
 
 #[derive(Deserialize)]
-struct Root {
-    data: DataResp,
+struct OpenRoot {
+    data: OpenDataResp,
 }
 
 #[derive(Deserialize)]
-struct DataResp {
+struct OpenDataResp {
     viewer: Viewer,
     authored: SearchResp,
     reviewing: SearchResp,
+}
+
+#[derive(Deserialize)]
+struct MergedRoot {
+    data: MergedDataResp,
+}
+
+#[derive(Deserialize)]
+struct MergedDataResp {
+    merged: SearchResp,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +360,8 @@ struct PrNode {
     is_draft: Option<bool>,
     #[serde(rename = "updatedAt")]
     updated_at: Option<String>,
+    #[serde(rename = "mergedAt")]
+    merged_at: Option<String>,
     repository: Option<RepoNode>,
     author: Option<AuthorNode>,
     #[serde(rename = "reviewRequests")]

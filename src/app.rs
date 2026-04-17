@@ -44,6 +44,10 @@ pub struct AppState {
     pub viewer: Option<String>,
     pub authored: Vec<Pr>,
     pub reviewing: Vec<Pr>,
+    /// Recently merged PRs authored by people visible in the current view.
+    /// Fetched as a superset (People-mode set) and filtered per view at
+    /// render time. Non-interactive.
+    pub merged: Vec<Pr>,
     pub loaded_at: Option<DateTime<Local>>,
     pub error: Option<String>,
     pub status: Option<String>,
@@ -66,6 +70,7 @@ impl AppState {
             viewer: None,
             authored: Vec::new(),
             reviewing: Vec::new(),
+            merged: Vec::new(),
             loaded_at: None,
             error: None,
             status: None,
@@ -85,6 +90,7 @@ impl AppState {
         self.viewer = Some(data.viewer);
         self.authored = data.authored;
         self.reviewing = data.reviewing;
+        self.merged = data.merged;
         self.loaded_at = Some(Local::now());
         self.error = None;
         self.status = None;

@@ -37,6 +37,8 @@ pub struct Pr {
     pub author: String,
     pub reviewers: Vec<ReviewerStatus>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// `Some(_)` iff the PR is merged. Open PRs leave this `None`.
+    pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Group by repo: repos sorted alphabetically at the top level, and within
@@ -175,6 +177,45 @@ pub fn group_by_person<'a>(
     groups
 }
 
+/// Lowercased, deduped authors visible in Me mode: the viewer plus every
+/// distinct author of a PR in `reviewing`. The Authored pane is always the
+/// viewer, so it contributes no extra logins.
+pub fn authors_for_me(viewer: &str, reviewing: &[Pr]) -> Vec<String> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let push =
+        |login: &str, seen: &mut std::collections::BTreeSet<String>, out: &mut Vec<String>| {
+            let lc = login.to_ascii_lowercase();
+            if seen.insert(lc.clone()) {
+                out.push(lc);
+            }
+        };
+    push(viewer, &mut seen, &mut out);
+    for pr in reviewing {
+        push(&pr.author, &mut seen, &mut out);
+    }
+    out
+}
+
+/// Every person surfaced by the People view as lowercased login strings.
+/// Mirrors the set that `group_by_person` materializes (authors + User-kind
+/// requested reviewers, excluding viewer and Teams).
+pub fn authors_for_people(authored: &[Pr], reviewing: &[Pr], viewer: &str) -> Vec<String> {
+    group_by_person(authored, reviewing, viewer)
+        .into_iter()
+        .map(|g| g.login.to_ascii_lowercase())
+        .collect()
+}
+
+/// Sort by `merged_at` descending (open PRs with `None` are dropped), take up
+/// to `cap` entries.
+pub fn recent_merged(prs: &[Pr], cap: usize) -> Vec<&Pr> {
+    let mut merged: Vec<&Pr> = prs.iter().filter(|p| p.merged_at.is_some()).collect();
+    merged.sort_by(|a, b| b.merged_at.cmp(&a.merged_at));
+    merged.truncate(cap);
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -202,6 +243,14 @@ mod tests {
             author: author.to_string(),
             reviewers,
             updated_at: ts(updated),
+            merged_at: None,
+        }
+    }
+
+    fn merged_pr(repo: &str, number: u64, author: &str, merged: i64) -> Pr {
+        Pr {
+            merged_at: Some(ts(merged)),
+            ..pr(repo, number, author, false, merged, vec![])
         }
     }
 
@@ -288,6 +337,87 @@ mod tests {
         let bob_authored_nums: Vec<u64> = bob.authored.iter().map(|p| p.number).collect();
         assert_eq!(bob_authored_nums, vec![1]);
         assert!(bob.reviewing.is_empty());
+    }
+
+    #[test]
+    fn recent_merged_sorts_by_merged_at_desc_and_caps() {
+        let prs = vec![
+            merged_pr("o/r", 1, "a", 100),
+            merged_pr("o/r", 2, "b", 300),
+            merged_pr("o/r", 3, "c", 200),
+            merged_pr("o/r", 4, "d", 400),
+        ];
+        let out = recent_merged(&prs, 3);
+        let nums: Vec<u64> = out.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![4, 2, 3]);
+    }
+
+    #[test]
+    fn recent_merged_skips_open_prs() {
+        let prs = vec![
+            pr("o/r", 1, "a", false, 100, vec![]),
+            merged_pr("o/r", 2, "b", 200),
+            pr("o/r", 3, "c", false, 300, vec![]),
+        ];
+        let out = recent_merged(&prs, 10);
+        let nums: Vec<u64> = out.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![2]);
+    }
+
+    #[test]
+    fn authors_for_me_includes_viewer_and_reviewing_authors() {
+        let viewer = "Me";
+        let reviewing = vec![
+            pr("o/r", 1, "Alice", false, 100, vec![]),
+            pr("o/r", 2, "bob", false, 200, vec![]),
+            pr("o/r", 3, "ALICE", false, 300, vec![]),
+        ];
+        let out = authors_for_me(viewer, &reviewing);
+        // All lowercased, deduped, viewer included.
+        let set: std::collections::BTreeSet<&str> = out.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            set,
+            ["me", "alice", "bob"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn authors_for_people_matches_group_by_person_logins() {
+        let viewer = "me";
+        let authored = vec![pr(
+            "o/r",
+            1,
+            viewer,
+            false,
+            100,
+            vec![user("Alice", true), team("@core", true)],
+        )];
+        let reviewing = vec![pr(
+            "o/r",
+            2,
+            "Bob",
+            false,
+            200,
+            vec![user(viewer, true), user("Carol", true)],
+        )];
+        let from_helper: std::collections::BTreeSet<String> =
+            authors_for_people(&authored, &reviewing, viewer)
+                .into_iter()
+                .collect();
+        let from_group: std::collections::BTreeSet<String> =
+            group_by_person(&authored, &reviewing, viewer)
+                .into_iter()
+                .map(|g| g.login.to_ascii_lowercase())
+                .collect();
+        assert_eq!(from_helper, from_group);
+        // Sanity check: viewer excluded, teams excluded, everyone else in.
+        assert!(!from_helper.contains("me"));
+        assert!(!from_helper.iter().any(|l| l.starts_with('@')));
+        assert!(from_helper.contains("alice"));
+        assert!(from_helper.contains("bob"));
+        assert!(from_helper.contains("carol"));
     }
 
     #[test]
