@@ -279,12 +279,12 @@ fn pr_line(pr: &Pr, hide_author_if: Option<&str>) -> Line<'static> {
 
 fn reviewer_line(r: &ReviewerStatus) -> Line<'static> {
     let (glyph, glyph_style) = match r.state {
-        ReviewState::Approved => ("+", Style::default().fg(Color::Green)),
-        ReviewState::ChangesRequested => ("x", Style::default().fg(Color::Red)),
-        ReviewState::Commented => (".", Style::default().fg(Color::Yellow)),
-        ReviewState::NoReview => ("?", Style::default().add_modifier(Modifier::DIM)),
+        ReviewState::Approved => ("✓", Style::default().fg(Color::Green)),
+        ReviewState::ChangesRequested => ("✗", Style::default().fg(Color::Red)),
+        ReviewState::Commented => ("◉", Style::default().fg(Color::Yellow)),
+        ReviewState::NoReview => ("○", Style::default().add_modifier(Modifier::DIM)),
         ReviewState::Dismissed => (
-            "-",
+            "⊘",
             Style::default()
                 .add_modifier(Modifier::DIM)
                 .add_modifier(Modifier::CROSSED_OUT),
