@@ -119,9 +119,11 @@ fn remove_reviewer_impl(
 
 pub fn fetch() -> Result<Data> {
     let (viewer, authored, reviewing) = fetch_open()?;
-    // The People author-set is a superset of the Me author-set, so querying
-    // it once feeds both views; per-view filtering happens at render time.
-    let authors = model::authors_for_people(&authored, &reviewing, &viewer);
+    // One fetch feeds both Me and People views; the render layer filters per
+    // view. The fetch set must cover BOTH — `authors_for_people` excludes the
+    // viewer, so on its own it would hide the viewer's own merged PRs in Me
+    // mode. Take the union.
+    let authors = model::merged_fetch_authors(&viewer, &authored, &reviewing);
     let merged = if authors.is_empty() {
         Vec::new()
     } else {

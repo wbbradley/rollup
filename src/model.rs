@@ -207,6 +207,22 @@ pub fn authors_for_people(authored: &[Pr], reviewing: &[Pr], viewer: &str) -> Ve
         .collect()
 }
 
+/// Union of the Me-mode and People-mode author sets, for the single merged-PR
+/// fetch that feeds both views. `authors_for_people` excludes the viewer
+/// by design, so this pulls the viewer and reviewing-pane authors back in.
+/// Lowercased, deduped; order is Me-set first (viewer, then reviewing
+/// authors), then any extra People-set logins.
+pub fn merged_fetch_authors(viewer: &str, authored: &[Pr], reviewing: &[Pr]) -> Vec<String> {
+    let mut out: Vec<String> = authors_for_me(viewer, reviewing);
+    let mut seen: std::collections::BTreeSet<String> = out.iter().cloned().collect();
+    for a in authors_for_people(authored, reviewing, viewer) {
+        if seen.insert(a.clone()) {
+            out.push(a);
+        }
+    }
+    out
+}
+
 /// Sort by `merged_at` descending (open PRs with `None` are dropped), take up
 /// to `cap` entries.
 pub fn recent_merged(prs: &[Pr], cap: usize) -> Vec<&Pr> {
@@ -418,6 +434,33 @@ mod tests {
         assert!(from_helper.contains("alice"));
         assert!(from_helper.contains("bob"));
         assert!(from_helper.contains("carol"));
+    }
+
+    #[test]
+    fn merged_fetch_authors_includes_viewer_and_people_set() {
+        let viewer = "Me";
+        let authored = vec![pr(
+            "o/r",
+            1,
+            viewer,
+            false,
+            100,
+            vec![user("Alice", true), team("@core", true)],
+        )];
+        let reviewing = vec![pr("o/r", 2, "Bob", false, 200, vec![user("Carol", true)])];
+        let out = merged_fetch_authors(viewer, &authored, &reviewing);
+        let set: std::collections::BTreeSet<&str> = out.iter().map(String::as_str).collect();
+        // Viewer must be present (the People set alone would omit it).
+        assert!(set.contains("me"));
+        // Reviewing author is present.
+        assert!(set.contains("bob"));
+        // People-set members not otherwise surfaced come through too.
+        assert!(set.contains("alice"));
+        assert!(set.contains("carol"));
+        // Teams never appear.
+        assert!(!set.iter().any(|l| l.starts_with('@')));
+        // Everything is lowercased.
+        assert!(out.iter().all(|s| s == &s.to_ascii_lowercase()));
     }
 
     #[test]
