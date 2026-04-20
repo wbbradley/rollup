@@ -11,7 +11,8 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
     github::{self, Data},
-    model::{Pr, ReviewerKind, ReviewerStatus, group_by_person, group_by_repo},
+    model::{Pr, ReviewerKind, ReviewerStatus},
+    report::{self, Row, Section},
     ui,
 };
 
@@ -25,14 +26,6 @@ pub enum Focus {
 pub enum ViewMode {
     Me,
     People,
-}
-
-pub enum Row<'a> {
-    Pr(&'a Pr),
-    Reviewer {
-        pr: &'a Pr,
-        reviewer: &'a ReviewerStatus,
-    },
 }
 
 pub enum Msg {
@@ -104,8 +97,8 @@ impl AppState {
     }
 
     fn clamp_selection(&mut self) {
-        let a_len = selectable_rows(&self.authored).len();
-        let r_len = selectable_rows(&self.reviewing).len();
+        let a_len = count_selectable(&self.authored_section());
+        let r_len = count_selectable(&self.reviewing_section());
         if a_len == 0 {
             self.authored_sel = 0;
         } else if self.authored_sel >= a_len {
@@ -121,99 +114,93 @@ impl AppState {
         self.people_sel = 0;
     }
 
-    fn focused_prs(&self) -> &[Pr] {
-        match self.focus {
-            Focus::Authored => &self.authored,
-            Focus::Reviewing => &self.reviewing,
-        }
+    pub fn viewer_str(&self) -> &str {
+        self.viewer.as_deref().unwrap_or("")
     }
 
-    fn focused_sel_mut(&mut self) -> &mut usize {
-        match self.focus {
-            Focus::Authored => &mut self.authored_sel,
-            Focus::Reviewing => &mut self.reviewing_sel,
-        }
+    pub fn reviewing_section(&self) -> Section<'_> {
+        report::build_section_reviewing(&self.reviewing)
     }
 
-    fn focused_sel(&self) -> usize {
-        match self.focus {
-            Focus::Authored => self.authored_sel,
-            Focus::Reviewing => self.reviewing_sel,
-        }
+    pub fn authored_section(&self) -> Section<'_> {
+        report::build_section_authored(&self.authored, self.viewer_str())
     }
 
-    pub fn selected_row(&self) -> Option<Row<'_>> {
+    pub fn people_section(&self) -> Section<'_> {
+        report::build_section_people(&self.authored, &self.reviewing, self.viewer_str())
+    }
+
+    fn current_section(&self) -> Section<'_> {
         match self.mode {
-            ViewMode::Me => selectable_rows(self.focused_prs())
-                .into_iter()
-                .nth(self.focused_sel()),
-            ViewMode::People => {
-                let viewer = self.viewer.as_deref().unwrap_or("");
-                selectable_rows_people(&self.authored, &self.reviewing, viewer)
-                    .into_iter()
-                    .nth(self.people_sel)
-            }
+            ViewMode::Me => match self.focus {
+                Focus::Authored => self.authored_section(),
+                Focus::Reviewing => self.reviewing_section(),
+            },
+            ViewMode::People => self.people_section(),
         }
     }
 
     fn current_len(&self) -> usize {
-        match self.mode {
-            ViewMode::Me => selectable_rows(self.focused_prs()).len(),
-            ViewMode::People => {
-                let viewer = self.viewer.as_deref().unwrap_or("");
-                selectable_rows_people(&self.authored, &self.reviewing, viewer).len()
-            }
-        }
+        count_selectable(&self.current_section())
     }
 
     fn current_sel(&self) -> usize {
         match self.mode {
-            ViewMode::Me => self.focused_sel(),
+            ViewMode::Me => match self.focus {
+                Focus::Authored => self.authored_sel,
+                Focus::Reviewing => self.reviewing_sel,
+            },
             ViewMode::People => self.people_sel,
         }
     }
 
     fn current_sel_mut(&mut self) -> &mut usize {
         match self.mode {
-            ViewMode::Me => self.focused_sel_mut(),
+            ViewMode::Me => match self.focus {
+                Focus::Authored => &mut self.authored_sel,
+                Focus::Reviewing => &mut self.reviewing_sel,
+            },
             ViewMode::People => &mut self.people_sel,
         }
     }
-}
 
-/// Flat list of selectable rows in display order: each PR followed by its
-/// reviewer rows, grouped by repo. Repo headers are not selectable.
-pub fn selectable_rows(prs: &[Pr]) -> Vec<Row<'_>> {
-    let mut rows = Vec::new();
-    for (_, group_prs) in group_by_repo(prs) {
-        for pr in group_prs {
-            rows.push(Row::Pr(pr));
-            for r in &pr.reviewers {
-                rows.push(Row::Reviewer { pr, reviewer: r });
+    /// Walk the current section's selectable rows, tracking each PR's parent
+    /// (so reviewer rows can locate their PR), and invoke `f` on the selected
+    /// row. `f` receives the parent PR plus `Some(reviewer)` for reviewer
+    /// rows and `None` for PR rows. Returns whatever `f` returned, or `None`
+    /// if the selection is out of range.
+    fn with_selected<R>(
+        &self,
+        mut f: impl FnMut(&Pr, Option<&ReviewerStatus>) -> Option<R>,
+    ) -> Option<R> {
+        let section = self.current_section();
+        let sel = self.current_sel();
+        let mut idx = 0usize;
+        let mut current_pr: Option<&Pr> = None;
+        for row in &section.rows {
+            match row {
+                Row::Pr { pr, .. } => {
+                    current_pr = Some(pr);
+                    if idx == sel {
+                        return f(pr, None);
+                    }
+                    idx += 1;
+                }
+                Row::Reviewer(r) => {
+                    if idx == sel {
+                        return current_pr.and_then(|pr| f(pr, Some(r)));
+                    }
+                    idx += 1;
+                }
+                _ => {}
             }
         }
+        None
     }
-    rows
 }
 
-/// People-mode analogue: each person's Authored/Reviewing PRs flattened with
-/// their reviewer sub-rows. Person headers and sub-group labels are not
-/// selectable — they're visual only, emitted by the UI layer.
-pub fn selectable_rows_people<'a>(
-    authored: &'a [Pr],
-    reviewing: &'a [Pr],
-    viewer: &str,
-) -> Vec<Row<'a>> {
-    let mut rows = Vec::new();
-    for person in group_by_person(authored, reviewing, viewer) {
-        for pr in person.authored.iter().chain(person.reviewing.iter()) {
-            rows.push(Row::Pr(pr));
-            for r in &pr.reviewers {
-                rows.push(Row::Reviewer { pr, reviewer: r });
-            }
-        }
-    }
-    rows
+fn count_selectable(section: &Section<'_>) -> usize {
+    section.rows.iter().filter(|r| r.is_selectable()).count()
 }
 
 pub fn run() -> Result<()> {
@@ -329,40 +316,42 @@ fn toggle_focus(state: &mut AppState) {
 }
 
 fn open_selected(state: &AppState) {
-    let url = match state.selected_row() {
-        Some(Row::Pr(pr)) => Some(pr.url.clone()),
-        Some(Row::Reviewer { pr, .. }) => Some(pr.url.clone()),
-        None => None,
-    };
+    let url = state.with_selected(|pr, _| Some(pr.url.clone()));
     if let Some(url) = url {
         let _ = open::that(url);
     }
 }
 
 fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
-    let Some(Row::Reviewer { pr, reviewer }) = state.selected_row() else {
+    let extracted = state.with_selected(|pr, rv| {
+        let rv = rv?;
+        Some((
+            pr.repo.clone(),
+            pr.number,
+            rv.login.clone(),
+            rv.kind,
+            rv.requested,
+        ))
+    });
+    let Some((repo_full, number, login, kind, requested)) = extracted else {
         state.status = Some("x: select a reviewer row first".into());
         return;
     };
-    if !reviewer.requested {
+    if !requested {
         // GitHub's DELETE requested_reviewers endpoint silently no-ops for
         // reviewers that aren't currently in reviewRequests. Don't pretend we
         // did anything — explain.
         state.status = Some(format!(
-            "x: {} already reviewed; nothing to un-request (dismiss the review on GitHub to clear it)",
-            reviewer.login
+            "x: {login} already reviewed; nothing to un-request (dismiss the review on GitHub to clear it)"
         ));
         return;
     }
-    let Some((owner, repo)) = pr.repo.split_once('/') else {
-        state.status = Some(format!("x: bad repo '{}'", pr.repo));
+    let Some((owner, repo)) = repo_full.split_once('/') else {
+        state.status = Some(format!("x: bad repo '{repo_full}'"));
         return;
     };
     let owner = owner.to_string();
     let repo = repo.to_string();
-    let number = pr.number;
-    let login = reviewer.login.clone();
-    let kind = reviewer.kind;
     let label = format!("remove {login} from {owner}/{repo}#{number}");
 
     state.status = Some(format!("{label}…"));

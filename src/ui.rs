@@ -1,5 +1,3 @@
-use std::hash::{Hash, Hasher};
-
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -10,19 +8,9 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{
-        Pr,
-        ReviewState,
-        ReviewerKind,
-        ReviewerStatus,
-        authors_for_me,
-        authors_for_people,
-        group_by_person,
-        group_by_repo,
-    },
+    model::{Pr, ReviewState, ReviewerKind, ReviewerStatus},
+    report::{self, Row, Section},
 };
-
-const MERGED_PANE_CAP: usize = 10;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
@@ -31,100 +19,103 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     let top = top_and_merged[0];
     let merged_area = top_and_merged[1];
 
+    let viewer_str: String = state.viewer.clone().unwrap_or_default();
+
     match state.mode {
         ViewMode::Me => {
             let sections =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(top);
             let focus = state.focus;
-            let viewer = state.viewer.clone();
+
+            let reviewing_section = report::build_section_reviewing(&state.reviewing);
             draw_section(
                 f,
                 sections[0],
-                "Review requested of me",
-                &state.reviewing,
+                &reviewing_section,
                 state.reviewing_sel,
                 &mut state.reviewing_list_state,
                 focus == Focus::Reviewing,
-                None,
             );
+            let authored_section = report::build_section_authored(&state.authored, &viewer_str);
             draw_section(
                 f,
                 sections[1],
-                "Authored by me",
-                &state.authored,
+                &authored_section,
                 state.authored_sel,
                 &mut state.authored_list_state,
                 focus == Focus::Authored,
-                viewer.as_deref(),
             );
         }
-        ViewMode::People => draw_people_section(f, top, state),
+        ViewMode::People => {
+            let people_section =
+                report::build_section_people(&state.authored, &state.reviewing, &viewer_str);
+            draw_section(
+                f,
+                top,
+                &people_section,
+                state.people_sel,
+                &mut state.people_list_state,
+                true,
+            );
+        }
     }
 
-    draw_merged_pane(f, merged_area, state);
+    let allowed: std::collections::BTreeSet<String> = match state.mode {
+        ViewMode::Me => report::allowed_authors_me(&viewer_str, &state.reviewing),
+        ViewMode::People => {
+            report::allowed_authors_people(&state.authored, &state.reviewing, &viewer_str)
+        }
+    };
+    let merged_section =
+        report::build_section_merged(&state.merged, &allowed, report::MERGED_PANE_CAP);
+    draw_merged_pane(f, merged_area, &merged_section);
+
     draw_footer(f, outer[1], state);
 }
 
 const SCROLL_MARGIN: usize = 4;
 
-#[allow(clippy::too_many_arguments)]
 fn draw_section(
     f: &mut Frame,
     area: Rect,
-    title: &str,
-    prs: &[Pr],
+    section: &Section<'_>,
     selection: usize,
     list_state: &mut ListState,
     focused: bool,
-    // When `Some`, PR rows authored by this login skip the inline author tag
-    // (the viewer's login is shown in the pane title instead).
-    viewer: Option<&str>,
 ) {
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let title_line = match viewer {
-        Some(v) => format!(" {title} ({}, @{v}) ", prs.len()),
-        None => format!(" {title} ({}) ", prs.len()),
+    let title_line = match &section.subtitle {
+        Some(sub) => format!(" {} ({}, {}) ", section.title, section.count, sub),
+        None => format!(" {} ({}) ", section.title, section.count),
     };
     let block = Block::default()
         .title(title_line)
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    if prs.is_empty() {
+    if section.rows.is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
         let msg = Paragraph::new(Span::styled(
-            "(none)",
+            section.empty_message.unwrap_or(""),
             Style::default().add_modifier(Modifier::DIM),
         ));
         f.render_widget(msg, inner);
         return;
     }
 
-    let groups = group_by_repo(prs);
     let mut items: Vec<ListItem> = Vec::new();
     let mut row_of_sel: Vec<usize> = Vec::new();
-
-    for (repo, group_prs) in &groups {
-        items.push(ListItem::new(Line::from(Span::styled(
-            repo.clone(),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))));
-        for pr in group_prs {
+    for row in &section.rows {
+        if row.is_selectable() {
             row_of_sel.push(items.len());
-            items.push(ListItem::new(pr_line(pr, viewer)));
-            for r in &pr.reviewers {
-                row_of_sel.push(items.len());
-                items.push(ListItem::new(reviewer_line(r)));
-            }
         }
+        items.push(render_list_item(row));
     }
 
     let highlighted_row = row_of_sel.get(selection).copied();
@@ -149,89 +140,28 @@ fn draw_section(
     f.render_stateful_widget(list, area, list_state);
 }
 
-fn draw_people_section(f: &mut Frame, area: Rect, state: &mut AppState) {
-    let viewer = state.viewer.as_deref().unwrap_or("");
-    let groups = group_by_person(&state.authored, &state.reviewing, viewer);
-
-    let border_style = Style::default().fg(Color::Cyan);
-    let title_line = format!(" People ({}) ", groups.len());
-    let block = Block::default()
-        .title(title_line)
-        .borders(Borders::ALL)
-        .border_style(border_style);
-
-    if groups.is_empty() {
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let msg = Paragraph::new(Span::styled(
-            "(no other people)",
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        f.render_widget(msg, inner);
-        return;
-    }
-
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut row_of_sel: Vec<usize> = Vec::new();
-
-    for person in &groups {
-        items.push(ListItem::new(Line::from(Span::styled(
-            format!("@{}", person.login),
+fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
+    match row {
+        Row::RepoHeader(repo) => ListItem::new(Line::from(Span::styled(
+            repo.clone(),
             Style::default()
-                .fg(color_for_login(&person.login))
+                .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
-        ))));
-        if !person.authored.is_empty() {
-            items.push(ListItem::new(Line::from(Span::styled(
-                "  Authored",
-                Style::default().add_modifier(Modifier::DIM),
-            ))));
-            for pr in &person.authored {
-                row_of_sel.push(items.len());
-                items.push(ListItem::new(pr_line(pr, Some(&person.login))));
-                for r in &pr.reviewers {
-                    row_of_sel.push(items.len());
-                    items.push(ListItem::new(reviewer_line(r)));
-                }
-            }
-        }
-        if !person.reviewing.is_empty() {
-            items.push(ListItem::new(Line::from(Span::styled(
-                "  Reviewing",
-                Style::default().add_modifier(Modifier::DIM),
-            ))));
-            for pr in &person.reviewing {
-                row_of_sel.push(items.len());
-                items.push(ListItem::new(pr_line(pr, None)));
-                for r in &pr.reviewers {
-                    row_of_sel.push(items.len());
-                    items.push(ListItem::new(reviewer_line(r)));
-                }
-            }
-        }
+        ))),
+        Row::PersonHeader(login) => ListItem::new(Line::from(Span::styled(
+            format!("@{login}"),
+            Style::default()
+                .fg(color_for_login(login))
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Row::SubGroupLabel(label) => ListItem::new(Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
+        Row::Pr { pr, hide_author_if } => ListItem::new(pr_line(pr, hide_author_if.as_deref())),
+        Row::Reviewer(r) => ListItem::new(reviewer_line(r)),
+        Row::MergedPr(pr) => ListItem::new(merged_pr_line(pr)),
     }
-
-    let highlighted_row = row_of_sel.get(state.people_sel).copied();
-    state.people_list_state.select(highlighted_row);
-
-    let inner_h = block.inner(area).height as usize;
-    apply_scroll_margin(
-        &mut state.people_list_state,
-        highlighted_row,
-        items.len(),
-        inner_h,
-    );
-
-    let highlight_style = Style::default()
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(highlight_style)
-        .highlight_symbol("▶ ");
-
-    f.render_stateful_widget(list, area, &mut state.people_list_state);
 }
 
 /// Vim-style `scrolloff`: only move the viewport once the selection is within
@@ -270,48 +200,26 @@ fn apply_scroll_margin(
     *list_state.offset_mut() = offset.min(max_offset);
 }
 
-fn draw_merged_pane(f: &mut Frame, area: Rect, state: &AppState) {
-    let viewer = state.viewer.as_deref().unwrap_or("");
-    let allowed: std::collections::BTreeSet<String> = match state.mode {
-        ViewMode::Me => authors_for_me(viewer, &state.reviewing)
-            .into_iter()
-            .collect(),
-        ViewMode::People => authors_for_people(&state.authored, &state.reviewing, viewer)
-            .into_iter()
-            .collect(),
-    };
-
-    // `state.merged` is already sorted by `merged_at` desc from the fetcher,
-    // so filter + take is enough — no re-sort.
-    let visible: Vec<&Pr> = state
-        .merged
-        .iter()
-        .filter(|p| allowed.contains(&p.author.to_ascii_lowercase()))
-        .take(MERGED_PANE_CAP)
-        .collect();
-
+fn draw_merged_pane(f: &mut Frame, area: Rect, section: &Section<'_>) {
     let border_style = Style::default().fg(Color::DarkGray);
-    let title_line = format!(" Recently merged PRs ({}) ", visible.len());
+    let title_line = format!(" {} ({}) ", section.title, section.count);
     let block = Block::default()
         .title(title_line)
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    if visible.is_empty() {
+    if section.rows.is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
         let msg = Paragraph::new(Span::styled(
-            "No recently merged PRs.",
+            section.empty_message.unwrap_or(""),
             Style::default().add_modifier(Modifier::DIM),
         ));
         f.render_widget(msg, inner);
         return;
     }
 
-    let items: Vec<ListItem> = visible
-        .iter()
-        .map(|pr| ListItem::new(merged_pr_line(pr)))
-        .collect();
+    let items: Vec<ListItem> = section.rows.iter().map(render_list_item).collect();
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
@@ -400,38 +308,9 @@ fn reviewer_line(r: &ReviewerStatus) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Deterministic per-login color: hash the normalized login into a hue, then
-/// map through HSL at the same L/S (~0.56/0.56) as the original muted orange
-/// so every name sits on the same perceptual "shelf" of lightness/saturation
-/// — only the hue varies. Good for scanning for a particular name.
 fn color_for_login(login: &str) -> Color {
-    let hue = (raw_hue(login) + hue_offset()).rem_euclid(360.0);
-    // Base shelf was (S=0.56, L=0.56). Cut saturation 30%, bump lightness 20%.
-    let (r, g, b) = hsl_to_rgb(hue, 0.80, 0.6);
+    let (r, g, b) = report::rgb_for_login(login);
     Color::Rgb(r, g, b)
-}
-
-fn raw_hue(login: &str) -> f32 {
-    // DefaultHasher is SipHash with a fixed (0, 0) key, so the mapping is
-    // stable across runs and machines.
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    // Tweak the hash to get better results.
-    h.write_u32(100);
-    login
-        .trim_start_matches('@')
-        .to_ascii_lowercase()
-        .hash(&mut h);
-    (h.finish() % 360) as f32
-}
-
-/// Global hue shift picked so that `wbbradley` always lands on the original
-/// muted orange (~29°). Every other login is rotated by the same amount.
-fn hue_offset() -> f32 {
-    use std::sync::OnceLock;
-    const ANCHOR_LOGIN: &str = "wbbradley";
-    const ANCHOR_HUE: f32 = 27.0;
-    static OFFSET: OnceLock<f32> = OnceLock::new();
-    *OFFSET.get_or_init(|| (ANCHOR_HUE - raw_hue(ANCHOR_LOGIN)).rem_euclid(360.0))
 }
 
 /// Braille-dots spinner. Wall-clock driven so it animates without any per-
@@ -443,28 +322,6 @@ fn spinner_frame() -> &'static str {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     FRAMES[(ms / 100) as usize % FRAMES.len()]
-}
-
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - ((hp % 2.0) - 1.0).abs());
-    let (r1, g1, b1) = if hp < 1.0 {
-        (c, x, 0.0)
-    } else if hp < 2.0 {
-        (x, c, 0.0)
-    } else if hp < 3.0 {
-        (0.0, c, x)
-    } else if hp < 4.0 {
-        (0.0, x, c)
-    } else if hp < 5.0 {
-        (x, 0.0, c)
-    } else {
-        (c, 0.0, x)
-    };
-    let m = l - c / 2.0;
-    let to_byte = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
-    (to_byte(r1), to_byte(g1), to_byte(b1))
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
