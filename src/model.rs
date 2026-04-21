@@ -223,6 +223,47 @@ pub fn merged_fetch_authors(viewer: &str, authored: &[Pr], reviewing: &[Pr]) -> 
     out
 }
 
+#[derive(Debug, Clone)]
+pub struct ReleaseInfo {
+    pub tag_name: String,
+    /// Display name; falls back to `tag_name` when the release has no name.
+    pub name: Option<String>,
+    pub url: String,
+    /// Prefer `publishedAt`, fall back to `createdAt`.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub is_prerelease: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TagInfo {
+    pub name: String,
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoReleaseInfo {
+    /// `owner/name`.
+    pub repo: String,
+    pub latest_release: Option<ReleaseInfo>,
+    pub latest_tag: Option<TagInfo>,
+}
+
+/// Short human-friendly age string (seconds, minutes, hours, days, weeks,
+/// months, years — first unit that fits). Values clamp to zero for future
+/// timestamps.
+pub fn human_age(dt: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let delta = (now - dt).num_seconds().max(0);
+    match delta {
+        d if d < 60 => format!("{d}s"),
+        d if d < 3_600 => format!("{}m", d / 60),
+        d if d < 86_400 => format!("{}h", d / 3_600),
+        d if d < 7 * 86_400 => format!("{}d", d / 86_400),
+        d if d < 30 * 86_400 => format!("{}w", d / (7 * 86_400)),
+        d if d < 365 * 86_400 => format!("{}mo", d / (30 * 86_400)),
+        d => format!("{}y", d / (365 * 86_400)),
+    }
+}
+
 /// Sort by `merged_at` descending (open PRs with `None` are dropped), take up
 /// to `cap` entries.
 pub fn recent_merged(prs: &[Pr], cap: usize) -> Vec<&Pr> {
@@ -461,6 +502,26 @@ mod tests {
         assert!(!set.iter().any(|l| l.starts_with('@')));
         // Everything is lowercased.
         assert!(out.iter().all(|s| s == &s.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn human_age_buckets() {
+        let now = ts(10_000_000_000);
+        let mk = |secs: i64| human_age(ts(10_000_000_000 - secs), now);
+        assert_eq!(mk(30), "30s");
+        assert_eq!(mk(5 * 60), "5m");
+        assert_eq!(mk(3 * 3600), "3h");
+        assert_eq!(mk(2 * 86_400), "2d");
+        // Weeks bucket runs [7d, 30d). 3w = 21d lands inside it.
+        assert_eq!(mk(3 * 7 * 86_400), "3w");
+        assert_eq!(mk(4 * 30 * 86_400), "4mo");
+        assert_eq!(mk(3 * 365 * 86_400), "3y");
+    }
+
+    #[test]
+    fn human_age_clamps_future() {
+        let now = ts(1_000);
+        assert_eq!(human_age(ts(2_000), now), "0s");
     }
 
     #[test]

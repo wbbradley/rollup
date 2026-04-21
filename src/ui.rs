@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{Pr, ReviewState, ReviewerKind, ReviewerStatus},
+    model::{Pr, RepoReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, human_age},
     report::{self, Row, Section},
 };
 
@@ -28,10 +28,22 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                     .split(top);
             let focus = state.focus;
 
+            let reviewing_col = sections[0];
+            let repos_n = state.releases.len().min(8);
+            let releases_h: u16 = if repos_n == 0 {
+                0
+            } else {
+                (repos_n as u16).saturating_add(2)
+            };
+            let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(releases_h)])
+                .split(reviewing_col);
+            let reviewing_area = parts[0];
+            let releases_area = parts[1];
+
             let reviewing_section = report::build_section_reviewing(&state.reviewing);
             draw_section(
                 f,
-                sections[0],
+                reviewing_area,
                 &reviewing_section,
                 state.reviewing_sel,
                 &mut state.reviewing_list_state,
@@ -46,6 +58,18 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 &mut state.authored_list_state,
                 focus == Focus::Authored,
             );
+            if repos_n > 0 {
+                let releases_section =
+                    report::build_section_releases(&state.releases, chrono::Utc::now());
+                draw_section(
+                    f,
+                    releases_area,
+                    &releases_section,
+                    state.releases_sel,
+                    &mut state.releases_list_state,
+                    focus == Focus::Releases,
+                );
+            }
         }
         ViewMode::People => {
             let people_section =
@@ -161,7 +185,50 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
         Row::Pr { pr, hide_author_if } => ListItem::new(pr_line(pr, hide_author_if.as_deref())),
         Row::Reviewer(r) => ListItem::new(reviewer_line(r)),
         Row::MergedPr(pr) => ListItem::new(merged_pr_line(pr)),
+        Row::Release { info, now } => ListItem::new(release_line(info, *now)),
     }
+}
+
+fn release_line(info: &RepoReleaseInfo, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
+    if info.latest_release.is_none() && info.latest_tag.is_none() {
+        return Line::from(Span::styled(
+            format!("{}  (no releases or tags)", info.repo),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("{}  ", info.repo),
+        Style::default().fg(Color::Magenta),
+    ));
+    if let Some(rel) = &info.latest_release {
+        let label = rel
+            .name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| rel.tag_name.clone());
+        spans.push(Span::raw(format!(
+            "{} ({})",
+            label,
+            human_age(rel.created_at, now)
+        )));
+        if rel.is_prerelease {
+            spans.push(Span::styled(
+                " [pre]",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    if let Some(tag) = &info.latest_tag {
+        if info.latest_release.is_some() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("tag: {} ({})", tag.name, human_age(tag.committed_at, now)),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Vim-style `scrolloff`: only move the viewport once the selection is within
@@ -360,7 +427,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
 
     let hint = match state.mode {
         ViewMode::Me => {
-            "↑↓ move · Tab switch · Enter open · x remove reviewer · p people · r refresh · q quit   "
+            "↑↓ move · Tab switch (incl. releases) · Enter open · x remove reviewer · p people · r refresh · q quit   "
         }
         ViewMode::People => {
             "↑↓ move · Esc back · Enter open · x remove reviewer · r refresh · q quit   "

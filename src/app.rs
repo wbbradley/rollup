@@ -11,7 +11,7 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
     github::{self, Data},
-    model::{Pr, ReviewerKind, ReviewerStatus},
+    model::{Pr, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
     report::{self, Row, Section},
     ui,
 };
@@ -20,6 +20,7 @@ use crate::{
 pub enum Focus {
     Authored,
     Reviewing,
+    Releases,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,11 +51,14 @@ pub struct AppState {
     pub authored_sel: usize,
     pub reviewing_sel: usize,
     pub people_sel: usize,
+    pub releases_sel: usize,
+    pub releases: Vec<RepoReleaseInfo>,
     /// Persisted across frames so scroll offset is sticky — `ui` only moves
     /// the viewport when the selection crosses a scroll-margin boundary.
     pub authored_list_state: ListState,
     pub reviewing_list_state: ListState,
     pub people_list_state: ListState,
+    pub releases_list_state: ListState,
 }
 
 impl AppState {
@@ -73,9 +77,12 @@ impl AppState {
             authored_sel: 0,
             reviewing_sel: 0,
             people_sel: 0,
+            releases_sel: 0,
+            releases: Vec::new(),
             authored_list_state: ListState::default(),
             reviewing_list_state: ListState::default(),
             people_list_state: ListState::default(),
+            releases_list_state: ListState::default(),
         }
     }
 
@@ -84,9 +91,10 @@ impl AppState {
         self.authored = data.authored;
         self.reviewing = data.reviewing;
         self.merged = data.merged;
+        self.releases = data.releases;
         self.loaded_at = Some(Local::now());
         self.error = None;
-        self.status = None;
+        self.status = data.config_error.map(|err| format!("config: {err}"));
         self.loading = false;
         self.clamp_selection();
     }
@@ -99,6 +107,7 @@ impl AppState {
     fn clamp_selection(&mut self) {
         let a_len = count_selectable(&self.authored_section());
         let r_len = count_selectable(&self.reviewing_section());
+        let rel_len = count_selectable(&self.releases_section());
         if a_len == 0 {
             self.authored_sel = 0;
         } else if self.authored_sel >= a_len {
@@ -108,6 +117,16 @@ impl AppState {
             self.reviewing_sel = 0;
         } else if self.reviewing_sel >= r_len {
             self.reviewing_sel = r_len - 1;
+        }
+        if rel_len == 0 {
+            self.releases_sel = 0;
+            // If focus landed on an empty Releases pane, bounce back to
+            // Reviewing so the user isn't stuck on a pane with no rows.
+            if self.focus == Focus::Releases {
+                self.focus = Focus::Reviewing;
+            }
+        } else if self.releases_sel >= rel_len {
+            self.releases_sel = rel_len - 1;
         }
         // PLAN "Refresh while in People mode: Reset selection to top." —
         // easiest correct answer when the underlying data just changed.
@@ -130,11 +149,16 @@ impl AppState {
         report::build_section_people(&self.authored, &self.reviewing, self.viewer_str())
     }
 
+    pub fn releases_section(&self) -> Section<'_> {
+        report::build_section_releases(&self.releases, chrono::Utc::now())
+    }
+
     fn current_section(&self) -> Section<'_> {
         match self.mode {
             ViewMode::Me => match self.focus {
                 Focus::Authored => self.authored_section(),
                 Focus::Reviewing => self.reviewing_section(),
+                Focus::Releases => self.releases_section(),
             },
             ViewMode::People => self.people_section(),
         }
@@ -149,6 +173,7 @@ impl AppState {
             ViewMode::Me => match self.focus {
                 Focus::Authored => self.authored_sel,
                 Focus::Reviewing => self.reviewing_sel,
+                Focus::Releases => self.releases_sel,
             },
             ViewMode::People => self.people_sel,
         }
@@ -159,6 +184,7 @@ impl AppState {
             ViewMode::Me => match self.focus {
                 Focus::Authored => &mut self.authored_sel,
                 Focus::Reviewing => &mut self.reviewing_sel,
+                Focus::Releases => &mut self.releases_sel,
             },
             ViewMode::People => &mut self.people_sel,
         }
@@ -242,9 +268,14 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, -1),
                 KeyCode::Char('g') => jump(&mut state, true),
                 KeyCode::Char('G') => jump(&mut state, false),
-                KeyCode::Tab | KeyCode::BackTab => {
+                KeyCode::Tab => {
                     if state.mode == ViewMode::Me {
-                        toggle_focus(&mut state);
+                        focus_next(&mut state);
+                    }
+                }
+                KeyCode::BackTab => {
+                    if state.mode == ViewMode::Me {
+                        focus_prev(&mut state);
                     }
                 }
                 KeyCode::Enter => open_selected(&state),
@@ -308,14 +339,53 @@ fn jump(state: &mut AppState, to_top: bool) {
     *state.current_sel_mut() = if to_top { 0 } else { len - 1 };
 }
 
-fn toggle_focus(state: &mut AppState) {
-    state.focus = match state.focus {
-        Focus::Authored => Focus::Reviewing,
-        Focus::Reviewing => Focus::Authored,
-    };
+fn focus_next(state: &mut AppState) {
+    let order = [Focus::Authored, Focus::Reviewing, Focus::Releases];
+    focus_step(state, &order);
+}
+
+fn focus_prev(state: &mut AppState) {
+    let order = [Focus::Authored, Focus::Releases, Focus::Reviewing];
+    focus_step(state, &order);
+}
+
+fn focus_step(state: &mut AppState, order: &[Focus]) {
+    // Skip the Releases pane when it has no rows — lands on the next
+    // non-empty pane instead of stranding the user on an empty list.
+    let start = order.iter().position(|f| *f == state.focus).unwrap_or(0);
+    for step in 1..=order.len() {
+        let next = order[(start + step) % order.len()];
+        if next == Focus::Releases && state.releases.is_empty() {
+            continue;
+        }
+        state.focus = next;
+        return;
+    }
+}
+
+fn selected_release(state: &AppState) -> Option<&RepoReleaseInfo> {
+    state.releases.get(state.releases_sel)
+}
+
+fn release_target_url(info: &RepoReleaseInfo) -> String {
+    if let Some(r) = &info.latest_release
+        && !r.url.is_empty()
+    {
+        return r.url.clone();
+    }
+    if let Some(t) = &info.latest_tag {
+        return format!("https://github.com/{}/releases/tag/{}", info.repo, t.name);
+    }
+    format!("https://github.com/{}/tags", info.repo)
 }
 
 fn open_selected(state: &AppState) {
+    if state.mode == ViewMode::Me && state.focus == Focus::Releases {
+        if let Some(info) = selected_release(state) {
+            let _ = open::that(release_target_url(info));
+        }
+        return;
+    }
     let url = state.with_selected(|pr, _| Some(pr.url.clone()));
     if let Some(url) = url {
         let _ = open::that(url);

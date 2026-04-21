@@ -5,18 +5,20 @@ use std::{
 };
 
 use anyhow::Result;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 
 use crate::{
     github,
     model::{
         Pr,
+        RepoReleaseInfo,
         ReviewState,
         ReviewerStatus,
         authors_for_me,
         authors_for_people,
         group_by_person,
         group_by_repo,
+        human_age,
         merged_fetch_authors,
     },
 };
@@ -45,6 +47,7 @@ pub enum SectionKind {
     MeAuthored,
     People,
     RecentlyMerged,
+    Releases,
 }
 
 pub enum Row<'a> {
@@ -57,11 +60,18 @@ pub enum Row<'a> {
     },
     Reviewer(&'a ReviewerStatus),
     MergedPr(&'a Pr),
+    Release {
+        info: &'a RepoReleaseInfo,
+        now: DateTime<Utc>,
+    },
 }
 
 impl Row<'_> {
     pub fn is_selectable(&self) -> bool {
-        matches!(self, Row::Pr { .. } | Row::Reviewer(_))
+        matches!(
+            self,
+            Row::Pr { .. } | Row::Reviewer(_) | Row::Release { .. }
+        )
     }
 }
 
@@ -180,11 +190,31 @@ pub fn build_section_merged<'a>(
     }
 }
 
+pub fn build_section_releases<'a>(
+    releases: &'a [RepoReleaseInfo],
+    now: DateTime<Utc>,
+) -> Section<'a> {
+    let rows: Vec<Row<'a>> = releases
+        .iter()
+        .map(|info| Row::Release { info, now })
+        .collect();
+    Section {
+        title: "Recent releases".to_string(),
+        subtitle: None,
+        count: releases.len(),
+        kind: SectionKind::Releases,
+        rows,
+        empty_message: Some("(no configured repos)"),
+    }
+}
+
 pub fn build_full_report<'a>(
     viewer: &'a str,
     authored: &'a [Pr],
     reviewing: &'a [Pr],
     merged: &'a [Pr],
+    releases: &'a [RepoReleaseInfo],
+    now: DateTime<Utc>,
     loaded_at: Option<DateTime<Local>>,
 ) -> Report<'a> {
     let allowed: BTreeSet<String> = merged_fetch_authors(viewer, authored, reviewing)
@@ -195,6 +225,7 @@ pub fn build_full_report<'a>(
         loaded_at,
         sections: vec![
             build_section_reviewing(reviewing),
+            build_section_releases(releases, now),
             build_section_authored(authored, viewer),
             build_section_people(authored, reviewing, viewer),
             build_section_merged(merged, &allowed, MERGED_PANE_CAP),
@@ -361,7 +392,52 @@ fn render_row(
         }
         Row::Reviewer(r) => render_reviewer_line(r, out, use_color),
         Row::MergedPr(pr) => render_merged_pr_line(pr, out, use_color, width),
+        Row::Release { info, now } => render_release_line(info, *now, out, use_color),
     }
+}
+
+fn render_release_line(
+    info: &RepoReleaseInfo,
+    now: DateTime<Utc>,
+    out: &mut impl Write,
+    use_color: bool,
+) -> io::Result<()> {
+    if info.latest_release.is_none() && info.latest_tag.is_none() {
+        return writeln!(
+            out,
+            "  {}{}  (no releases or tags){}",
+            dim(use_color),
+            info.repo,
+            reset(use_color),
+        );
+    }
+    write!(
+        out,
+        "  {}{}{}",
+        fg_named(use_color, 35),
+        info.repo,
+        reset(use_color),
+    )?;
+    if let Some(rel) = &info.latest_release {
+        let label = rel
+            .name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| rel.tag_name.clone());
+        write!(out, "  {} ({})", label, human_age(rel.created_at, now),)?;
+        if rel.is_prerelease {
+            write!(out, " {}[pre]{}", dim(use_color), reset(use_color))?;
+        }
+    }
+    if let Some(tag) = &info.latest_tag {
+        write!(
+            out,
+            "  tag: {} ({})",
+            tag.name,
+            human_age(tag.committed_at, now),
+        )?;
+    }
+    writeln!(out)
 }
 
 fn render_pr_line(
@@ -552,11 +628,17 @@ fn fg_rgb(on: bool, r: u8, g: u8, b: u8) -> String {
 
 pub fn run() -> Result<()> {
     let data = github::fetch()?;
+    if let Some(err) = &data.config_error {
+        eprintln!("config: {err}");
+    }
+    let now = Utc::now();
     let report = build_full_report(
         &data.viewer,
         &data.authored,
         &data.reviewing,
         &data.merged,
+        &data.releases,
+        now,
         Some(Local::now()),
     );
     let stdout = io::stdout();
@@ -719,18 +801,70 @@ mod tests {
         assert_eq!(section.count, 2);
     }
 
+    fn ts_utc(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    fn release_info(
+        repo: &str,
+        latest_release: Option<crate::model::ReleaseInfo>,
+        latest_tag: Option<crate::model::TagInfo>,
+    ) -> RepoReleaseInfo {
+        RepoReleaseInfo {
+            repo: repo.to_string(),
+            latest_release,
+            latest_tag,
+        }
+    }
+
+    fn rel(tag: &str, created_secs: i64, is_pre: bool) -> crate::model::ReleaseInfo {
+        crate::model::ReleaseInfo {
+            tag_name: tag.to_string(),
+            name: Some(tag.to_string()),
+            url: format!("https://github.com/o/r/releases/tag/{tag}"),
+            created_at: ts_utc(created_secs),
+            is_prerelease: is_pre,
+        }
+    }
+
+    fn tag(name: &str, at: i64) -> crate::model::TagInfo {
+        crate::model::TagInfo {
+            name: name.to_string(),
+            committed_at: ts_utc(at),
+        }
+    }
+
     #[test]
-    fn build_full_report_contains_all_four_sections() {
+    fn build_full_report_contains_all_five_sections() {
         let viewer = "me";
         let authored = vec![pr("o/r", 1, viewer, false, 100, vec![])];
         let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
         let merged: Vec<Pr> = vec![];
-        let report = build_full_report(viewer, &authored, &reviewing, &merged, None);
-        assert_eq!(report.sections.len(), 4);
+        let releases: Vec<RepoReleaseInfo> = vec![];
+        let now = ts_utc(1_000_000);
+        let report =
+            build_full_report(viewer, &authored, &reviewing, &merged, &releases, now, None);
+        assert_eq!(report.sections.len(), 5);
         assert_eq!(report.sections[0].kind, SectionKind::MeReviewing);
-        assert_eq!(report.sections[1].kind, SectionKind::MeAuthored);
-        assert_eq!(report.sections[2].kind, SectionKind::People);
-        assert_eq!(report.sections[3].kind, SectionKind::RecentlyMerged);
+        assert_eq!(report.sections[1].kind, SectionKind::Releases);
+        assert_eq!(report.sections[2].kind, SectionKind::MeAuthored);
+        assert_eq!(report.sections[3].kind, SectionKind::People);
+        assert_eq!(report.sections[4].kind, SectionKind::RecentlyMerged);
+    }
+
+    #[test]
+    fn build_section_releases_row_count_and_kind() {
+        let rs = vec![
+            release_info("a/b", Some(rel("v1", 100, false)), None),
+            release_info("c/d", None, Some(tag("v2", 200))),
+        ];
+        let section = build_section_releases(&rs, ts_utc(1000));
+        assert_eq!(section.kind, SectionKind::Releases);
+        assert_eq!(section.count, 2);
+        assert_eq!(section.rows.len(), 2);
+        for row in &section.rows {
+            assert!(row.is_selectable());
+        }
     }
 
     #[test]
@@ -739,7 +873,10 @@ mod tests {
         let authored = vec![pr("o/r", 1, viewer, false, 100, vec![user("alice", true)])];
         let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
         let merged: Vec<Pr> = vec![];
-        let report = build_full_report(viewer, &authored, &reviewing, &merged, None);
+        let releases: Vec<RepoReleaseInfo> = vec![];
+        let now = ts_utc(1_000_000);
+        let report =
+            build_full_report(viewer, &authored, &reviewing, &merged, &releases, now, None);
         let mut out: Vec<u8> = Vec::new();
         render_with(&report, &mut out, false, 120).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -752,12 +889,16 @@ mod tests {
         let authored = vec![pr("o/r", 1, viewer, false, 100, vec![])];
         let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
         let merged: Vec<Pr> = vec![];
-        let report = build_full_report(viewer, &authored, &reviewing, &merged, None);
+        let releases: Vec<RepoReleaseInfo> = vec![];
+        let now = ts_utc(1_000_000);
+        let report =
+            build_full_report(viewer, &authored, &reviewing, &merged, &releases, now, None);
         let mut out: Vec<u8> = Vec::new();
         render_with(&report, &mut out, false, 120).unwrap();
         let s = String::from_utf8(out).unwrap();
         for title in [
             "Review requested of me",
+            "Recent releases",
             "Authored by me",
             "People",
             "Recently merged",
@@ -772,19 +913,48 @@ mod tests {
         let authored: Vec<Pr> = vec![];
         let reviewing: Vec<Pr> = vec![];
         let merged: Vec<Pr> = vec![];
-        let report = build_full_report(viewer, &authored, &reviewing, &merged, None);
+        let releases: Vec<RepoReleaseInfo> = vec![];
+        let now = ts_utc(1_000_000);
+        let report =
+            build_full_report(viewer, &authored, &reviewing, &merged, &releases, now, None);
         let mut out: Vec<u8> = Vec::new();
         render_with(&report, &mut out, false, 120).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("(none)"));
         assert!(s.contains("(no other people)"));
         assert!(s.contains("No recently merged PRs."));
+        assert!(s.contains("(no configured repos)"));
     }
 
     #[test]
-    fn row_is_selectable_only_for_pr_and_reviewer() {
+    fn console_render_release_line_formats() {
+        let now = ts_utc(1_000_000);
+        // Normal release + tag, with prerelease.
+        let rs = vec![
+            release_info(
+                "o/pre",
+                Some(rel("v1.2.3", 1_000_000 - 3 * 86_400, true)),
+                Some(tag("v1.2.4", 1_000_000 - 86_400)),
+            ),
+            release_info("o/none", None, None),
+        ];
+        let section = build_section_releases(&rs, now);
+        let mut out: Vec<u8> = Vec::new();
+        render_section(&section, &mut out, false, 120).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("o/pre"), "{s}");
+        assert!(s.contains("v1.2.3 (3d)"), "{s}");
+        assert!(s.contains("[pre]"), "{s}");
+        assert!(s.contains("tag: v1.2.4 (1d)"), "{s}");
+        assert!(s.contains("(no releases or tags)"), "{s}");
+    }
+
+    #[test]
+    fn row_is_selectable_only_for_pr_reviewer_and_release() {
         let p = pr("o/r", 1, "a", false, 100, vec![]);
         let r = user("alice", true);
+        let rel_info = release_info("o/r", None, None);
+        let now = ts_utc(1);
         assert!(
             Row::Pr {
                 pr: &p,
@@ -793,6 +963,13 @@ mod tests {
             .is_selectable()
         );
         assert!(Row::Reviewer(&r).is_selectable());
+        assert!(
+            Row::Release {
+                info: &rel_info,
+                now,
+            }
+            .is_selectable()
+        );
         assert!(!Row::RepoHeader("o/r".to_string()).is_selectable());
         assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
         assert!(!Row::SubGroupLabel("Authored").is_selectable());
