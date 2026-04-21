@@ -452,13 +452,15 @@ struct LatestReviewNode {
 const RR_FRAGMENT: &str = r#"
 fragment RR on Repository {
   nameWithOwner
-  latestRelease {
-    name
-    tagName
-    createdAt
-    publishedAt
-    url
-    isPrerelease
+  releases(first: 3, orderBy: {field: CREATED_AT, direction: DESC}) {
+    nodes {
+      name
+      tagName
+      createdAt
+      publishedAt
+      url
+      isPrerelease
+    }
   }
   refs(refPrefix: "refs/tags/", first: 1, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
     nodes {
@@ -538,25 +540,34 @@ fn node_to_repo_release_info(r: &config::RepoRef, node: Option<&RRNode>) -> Repo
     let Some(node) = node else {
         return RepoReleaseInfo {
             repo,
-            latest_release: None,
+            recent_releases: Vec::new(),
             latest_tag: None,
         };
     };
-    let latest_release = node.latest_release.as_ref().map(|rel| {
-        let created = rel
-            .published_at
-            .as_deref()
-            .or(rel.created_at.as_deref())
-            .and_then(parse_ts)
-            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch"));
-        ReleaseInfo {
-            tag_name: rel.tag_name.clone().unwrap_or_default(),
-            name: rel.name.clone(),
-            url: rel.url.clone().unwrap_or_default(),
-            created_at: created,
-            is_prerelease: rel.is_prerelease.unwrap_or(false),
-        }
-    });
+    let recent_releases: Vec<ReleaseInfo> = node
+        .releases
+        .as_ref()
+        .map(|conn| {
+            conn.nodes
+                .iter()
+                .map(|rel| {
+                    let created = rel
+                        .published_at
+                        .as_deref()
+                        .or(rel.created_at.as_deref())
+                        .and_then(parse_ts)
+                        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch"));
+                    ReleaseInfo {
+                        tag_name: rel.tag_name.clone().unwrap_or_default(),
+                        name: rel.name.clone(),
+                        url: rel.url.clone().unwrap_or_default(),
+                        created_at: created,
+                        is_prerelease: rel.is_prerelease.unwrap_or(false),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let latest_tag = node
         .refs
         .as_ref()
@@ -570,7 +581,7 @@ fn node_to_repo_release_info(r: &config::RepoRef, node: Option<&RRNode>) -> Repo
         });
     RepoReleaseInfo {
         repo,
-        latest_release,
+        recent_releases,
         latest_tag,
     }
 }
@@ -621,14 +632,18 @@ struct ReleasesData {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RRNode {
-    #[serde(rename = "latestRelease")]
-    latest_release: Option<LatestRelease>,
+    releases: Option<ReleasesConnection>,
     refs: Option<RefsConnection>,
+}
+
+#[derive(Deserialize)]
+struct ReleasesConnection {
+    nodes: Vec<ReleaseNode>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct LatestRelease {
+struct ReleaseNode {
     name: Option<String>,
     #[serde(rename = "tagName")]
     tag_name: Option<String>,
@@ -690,20 +705,21 @@ mod tests {
     #[test]
     fn release_only() {
         let json = r#"{
-            "latestRelease": {
+            "releases": { "nodes": [{
                 "name": "v1.2.3",
                 "tagName": "v1.2.3",
                 "createdAt": "2024-05-01T00:00:00Z",
                 "publishedAt": "2024-05-02T00:00:00Z",
                 "url": "https://github.com/o/r/releases/tag/v1.2.3",
                 "isPrerelease": false
-            },
+            }]},
             "refs": { "nodes": [] }
         }"#;
         let node = parse_node(json);
         let info = node_to_repo_release_info(&repo("o", "r"), node.as_ref());
         assert_eq!(info.repo, "o/r");
-        let rel = info.latest_release.expect("release present");
+        assert_eq!(info.recent_releases.len(), 1);
+        let rel = &info.recent_releases[0];
         assert_eq!(rel.tag_name, "v1.2.3");
         // Prefer publishedAt.
         assert_eq!(rel.created_at.to_rfc3339(), "2024-05-02T00:00:00+00:00");
@@ -712,9 +728,30 @@ mod tests {
     }
 
     #[test]
+    fn releases_multiple_ordered_newest_first() {
+        let json = r#"{
+            "releases": { "nodes": [
+                {"name": "v1.2.3", "tagName": "v1.2.3", "createdAt": "2024-05-03T00:00:00Z", "publishedAt": null, "url": "https://github.com/o/r/releases/tag/v1.2.3", "isPrerelease": false},
+                {"name": "v1.2.2", "tagName": "v1.2.2", "createdAt": "2024-05-02T00:00:00Z", "publishedAt": null, "url": "https://github.com/o/r/releases/tag/v1.2.2", "isPrerelease": true},
+                {"name": "v1.2.1", "tagName": "v1.2.1", "createdAt": "2024-05-01T00:00:00Z", "publishedAt": null, "url": "https://github.com/o/r/releases/tag/v1.2.1", "isPrerelease": false}
+            ]},
+            "refs": { "nodes": [] }
+        }"#;
+        let node = parse_node(json);
+        let info = node_to_repo_release_info(&repo("o", "r"), node.as_ref());
+        let tags: Vec<&str> = info
+            .recent_releases
+            .iter()
+            .map(|r| r.tag_name.as_str())
+            .collect();
+        assert_eq!(tags, vec!["v1.2.3", "v1.2.2", "v1.2.1"]);
+        assert!(info.recent_releases[1].is_prerelease);
+    }
+
+    #[test]
     fn tag_only_lightweight_commit() {
         let json = r#"{
-            "latestRelease": null,
+            "releases": { "nodes": [] },
             "refs": {
                 "nodes": [{
                     "name": "v0.9.0",
@@ -727,7 +764,7 @@ mod tests {
         }"#;
         let node = parse_node(json);
         let info = node_to_repo_release_info(&repo("o", "r"), node.as_ref());
-        assert!(info.latest_release.is_none());
+        assert!(info.recent_releases.is_empty());
         let tag = info.latest_tag.expect("tag present");
         assert_eq!(tag.name, "v0.9.0");
         assert_eq!(tag.committed_at.to_rfc3339(), "2024-04-01T12:00:00+00:00");
@@ -736,7 +773,7 @@ mod tests {
     #[test]
     fn tag_only_annotated() {
         let json = r#"{
-            "latestRelease": null,
+            "releases": { "nodes": [] },
             "refs": {
                 "nodes": [{
                     "name": "v0.9.1",
@@ -762,7 +799,7 @@ mod tests {
     #[test]
     fn tag_only_annotated_falls_back_to_tagger() {
         let json = r#"{
-            "latestRelease": null,
+            "releases": { "nodes": [] },
             "refs": {
                 "nodes": [{
                     "name": "v0.9.2",
@@ -783,14 +820,14 @@ mod tests {
     #[test]
     fn release_and_tag_both() {
         let json = r#"{
-            "latestRelease": {
+            "releases": { "nodes": [{
                 "name": "v2.0.0",
                 "tagName": "v2.0.0",
                 "createdAt": "2024-05-01T00:00:00Z",
                 "publishedAt": null,
                 "url": "https://github.com/o/r/releases/tag/v2.0.0",
                 "isPrerelease": true
-            },
+            }]},
             "refs": {
                 "nodes": [{
                     "name": "v2.0.1",
@@ -803,7 +840,8 @@ mod tests {
         }"#;
         let node = parse_node(json);
         let info = node_to_repo_release_info(&repo("o", "r"), node.as_ref());
-        let rel = info.latest_release.expect("release");
+        assert_eq!(info.recent_releases.len(), 1);
+        let rel = &info.recent_releases[0];
         assert_eq!(rel.tag_name, "v2.0.0");
         // Falls back to createdAt when publishedAt is null.
         assert_eq!(rel.created_at.to_rfc3339(), "2024-05-01T00:00:00+00:00");
@@ -814,10 +852,10 @@ mod tests {
 
     #[test]
     fn neither_release_nor_tag() {
-        let json = r#"{ "latestRelease": null, "refs": { "nodes": [] } }"#;
+        let json = r#"{ "releases": { "nodes": [] }, "refs": { "nodes": [] } }"#;
         let node = parse_node(json);
         let info = node_to_repo_release_info(&repo("o", "r"), node.as_ref());
-        assert!(info.latest_release.is_none());
+        assert!(info.recent_releases.is_empty());
         assert!(info.latest_tag.is_none());
         assert_eq!(info.repo, "o/r");
     }
@@ -826,7 +864,7 @@ mod tests {
     fn missing_repo_alias_none_node() {
         let info = node_to_repo_release_info(&repo("o", "gone"), None);
         assert_eq!(info.repo, "o/gone");
-        assert!(info.latest_release.is_none());
+        assert!(info.recent_releases.is_empty());
         assert!(info.latest_tag.is_none());
     }
 

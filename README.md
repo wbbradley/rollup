@@ -1,12 +1,16 @@
 # rollup
 
-A terminal dashboard for your GitHub PR review workload. Two side-by-side panes:
+A terminal dashboard for your GitHub PR review workload. Panes:
 
 - **Review requested of me** — open PRs waiting on your review.
 - **Authored by me** — your open PRs and where each reviewer stands.
-- **Recent releases** — for every repo in your config, the latest release and tag plus age (Me mode only).
+- **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Me mode only).
+- **Recently merged PRs** — recently merged PRs by people in the current view.
 
 Data comes from `gh api graphql`, so auth is whatever `gh` already has.
+
+There's also a non-interactive `rollup report` subcommand that prints the same
+data to stdout.
 
 ## Install
 
@@ -67,16 +71,17 @@ repos:
   - MystenLabs/sui
 ```
 
-The file is optional — without it, the Recent releases pane is hidden and
-everything else keeps working. Parse errors surface in the footer status line
-rather than crashing the app.
+The file is optional — without it, the Recent releases pane just shows
+`(no configured repos)` and everything else keeps working. Parse errors surface
+in the footer status line rather than crashing the app.
 
-The `Recent releases` pane shows one row per repo with the latest release name
-and age, optionally followed by the most recent tag and its age (e.g.
-`owner/name  v1.2.3 (3d)  tag: v1.2.4 (1d)`). Prereleases carry a trailing
-`[pre]` marker. `Enter` opens the release URL; tag-only rows open
-`/releases/tag/<tag>`; rows with neither fall back to the repo's `/tags` page.
-The pane also appears as a section in `rollup report`.
+The `Recent releases` pane renders as a tree: one header per configured repo,
+with up to three of its most recent releases beneath (newest first, e.g.
+`v1.2.3 (3d)`). Prereleases carry a trailing `[pre]` marker. Repos with no
+releases but at least one tag show a single `tag: v… (…)` row; repos with
+neither show `(no releases or tags)`. `Enter` opens the URL of the highlighted
+row — each release line points to its own release page. The pane also appears
+as a section in `rollup report`.
 
 ## License
 

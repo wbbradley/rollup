@@ -244,7 +244,8 @@ pub struct TagInfo {
 pub struct RepoReleaseInfo {
     /// `owner/name`.
     pub repo: String,
-    pub latest_release: Option<ReleaseInfo>,
+    /// Up to N most recent releases, newest first.
+    pub recent_releases: Vec<ReleaseInfo>,
     pub latest_tag: Option<TagInfo>,
 }
 

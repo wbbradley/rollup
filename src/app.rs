@@ -16,6 +16,35 @@ use crate::{
     ui,
 };
 
+fn selected_release_url(state: &AppState) -> Option<String> {
+    let section = state.releases_section();
+    let sel = state.releases_sel;
+    let mut idx = 0usize;
+    for row in &section.rows {
+        if !row.is_selectable() {
+            continue;
+        }
+        if idx == sel {
+            return match row {
+                Row::ReleaseEntry { release, .. } => {
+                    if release.url.is_empty() {
+                        None
+                    } else {
+                        Some(release.url.clone())
+                    }
+                }
+                Row::ReleaseTag { repo, tag, .. } => Some(format!(
+                    "https://github.com/{}/releases/tag/{}",
+                    repo, tag.name
+                )),
+                _ => None,
+            };
+        }
+        idx += 1;
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Authored,
@@ -363,26 +392,10 @@ fn focus_step(state: &mut AppState, order: &[Focus]) {
     }
 }
 
-fn selected_release(state: &AppState) -> Option<&RepoReleaseInfo> {
-    state.releases.get(state.releases_sel)
-}
-
-fn release_target_url(info: &RepoReleaseInfo) -> String {
-    if let Some(r) = &info.latest_release
-        && !r.url.is_empty()
-    {
-        return r.url.clone();
-    }
-    if let Some(t) = &info.latest_tag {
-        return format!("https://github.com/{}/releases/tag/{}", info.repo, t.name);
-    }
-    format!("https://github.com/{}/tags", info.repo)
-}
-
 fn open_selected(state: &AppState) {
     if state.mode == ViewMode::Me && state.focus == Focus::Releases {
-        if let Some(info) = selected_release(state) {
-            let _ = open::that(release_target_url(info));
+        if let Some(url) = selected_release_url(state) {
+            let _ = open::that(url);
         }
         return;
     }

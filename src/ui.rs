@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{Pr, RepoReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, human_age},
+    model::{Pr, ReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, TagInfo, human_age},
     report::{self, Row, Section},
 };
 
@@ -29,13 +29,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             let focus = state.focus;
 
             let reviewing_col = sections[0];
-            let repos_n = state.releases.len().min(8);
-            let releases_h: u16 = if repos_n == 0 {
-                0
-            } else {
-                (repos_n as u16).saturating_add(2)
-            };
-            let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(releases_h)])
+            let parts = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(reviewing_col);
             let reviewing_area = parts[0];
             let releases_area = parts[1];
@@ -58,18 +52,19 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 &mut state.authored_list_state,
                 focus == Focus::Authored,
             );
-            if repos_n > 0 {
-                let releases_section =
-                    report::build_section_releases(&state.releases, chrono::Utc::now());
-                draw_section(
-                    f,
-                    releases_area,
-                    &releases_section,
-                    state.releases_sel,
-                    &mut state.releases_list_state,
-                    focus == Focus::Releases,
-                );
+            let mut releases_section =
+                report::build_section_releases(&state.releases, chrono::Utc::now());
+            if state.releases.is_empty() && state.loaded_at.is_none() {
+                releases_section.empty_message = Some("Loading…");
             }
+            draw_section(
+                f,
+                releases_area,
+                &releases_section,
+                state.releases_sel,
+                &mut state.releases_list_state,
+                focus == Focus::Releases,
+            );
         }
         ViewMode::People => {
             let people_section =
@@ -91,8 +86,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             report::allowed_authors_people(&state.authored, &state.reviewing, &viewer_str)
         }
     };
-    let merged_section =
+    let mut merged_section =
         report::build_section_merged(&state.merged, &allowed, report::MERGED_PANE_CAP);
+    if state.merged.is_empty() && state.loaded_at.is_none() {
+        merged_section.empty_message = Some("Loading…");
+    }
     draw_merged_pane(f, merged_area, &merged_section);
 
     draw_footer(f, outer[1], state);
@@ -185,50 +183,40 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
         Row::Pr { pr, hide_author_if } => ListItem::new(pr_line(pr, hide_author_if.as_deref())),
         Row::Reviewer(r) => ListItem::new(reviewer_line(r)),
         Row::MergedPr(pr) => ListItem::new(merged_pr_line(pr)),
-        Row::Release { info, now } => ListItem::new(release_line(info, *now)),
+        Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
+        Row::ReleaseTag { tag, now, .. } => ListItem::new(release_tag_line(tag, *now)),
+        Row::ReleaseEmpty => ListItem::new(Line::from(Span::styled(
+            "  (no releases or tags)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
     }
 }
 
-fn release_line(info: &RepoReleaseInfo, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
-    if info.latest_release.is_none() && info.latest_tag.is_none() {
-        return Line::from(Span::styled(
-            format!("{}  (no releases or tags)", info.repo),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        format!("{}  ", info.repo),
-        Style::default().fg(Color::Magenta),
-    ));
-    if let Some(rel) = &info.latest_release {
-        let label = rel
-            .name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| rel.tag_name.clone());
-        spans.push(Span::raw(format!(
-            "{} ({})",
-            label,
-            human_age(rel.created_at, now)
-        )));
-        if rel.is_prerelease {
-            spans.push(Span::styled(
-                " [pre]",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-    }
-    if let Some(tag) = &info.latest_tag {
-        if info.latest_release.is_some() {
-            spans.push(Span::raw("  "));
-        }
+fn release_entry_line(release: &ReleaseInfo, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
+    let label = release
+        .name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| release.tag_name.clone());
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(format!(
+        "  {} ({})",
+        label,
+        human_age(release.created_at, now)
+    ))];
+    if release.is_prerelease {
         spans.push(Span::styled(
-            format!("tag: {} ({})", tag.name, human_age(tag.committed_at, now)),
+            " [pre]",
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
     Line::from(spans)
+}
+
+fn release_tag_line(tag: &TagInfo, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  tag: {} ({})", tag.name, human_age(tag.committed_at, now)),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
 }
 
 /// Vim-style `scrolloff`: only move the viewport once the selection is within

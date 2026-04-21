@@ -11,9 +11,11 @@ use crate::{
     github,
     model::{
         Pr,
+        ReleaseInfo,
         RepoReleaseInfo,
         ReviewState,
         ReviewerStatus,
+        TagInfo,
         authors_for_me,
         authors_for_people,
         group_by_person,
@@ -60,17 +62,23 @@ pub enum Row<'a> {
     },
     Reviewer(&'a ReviewerStatus),
     MergedPr(&'a Pr),
-    Release {
-        info: &'a RepoReleaseInfo,
+    ReleaseEntry {
+        release: &'a ReleaseInfo,
         now: DateTime<Utc>,
     },
+    ReleaseTag {
+        repo: &'a str,
+        tag: &'a TagInfo,
+        now: DateTime<Utc>,
+    },
+    ReleaseEmpty,
 }
 
 impl Row<'_> {
     pub fn is_selectable(&self) -> bool {
         matches!(
             self,
-            Row::Pr { .. } | Row::Reviewer(_) | Row::Release { .. }
+            Row::Pr { .. } | Row::Reviewer(_) | Row::ReleaseEntry { .. } | Row::ReleaseTag { .. }
         )
     }
 }
@@ -194,10 +202,23 @@ pub fn build_section_releases<'a>(
     releases: &'a [RepoReleaseInfo],
     now: DateTime<Utc>,
 ) -> Section<'a> {
-    let rows: Vec<Row<'a>> = releases
-        .iter()
-        .map(|info| Row::Release { info, now })
-        .collect();
+    let mut rows: Vec<Row<'a>> = Vec::new();
+    for info in releases {
+        rows.push(Row::RepoHeader(info.repo.clone()));
+        if !info.recent_releases.is_empty() {
+            for release in &info.recent_releases {
+                rows.push(Row::ReleaseEntry { release, now });
+            }
+        } else if let Some(tag) = &info.latest_tag {
+            rows.push(Row::ReleaseTag {
+                repo: info.repo.as_str(),
+                tag,
+                now,
+            });
+        } else {
+            rows.push(Row::ReleaseEmpty);
+        }
+    }
     Section {
         title: "Recent releases".to_string(),
         subtitle: None,
@@ -392,52 +413,56 @@ fn render_row(
         }
         Row::Reviewer(r) => render_reviewer_line(r, out, use_color),
         Row::MergedPr(pr) => render_merged_pr_line(pr, out, use_color, width),
-        Row::Release { info, now } => render_release_line(info, *now, out, use_color),
+        Row::ReleaseEntry { release, now } => {
+            render_release_entry_line(release, *now, out, use_color)
+        }
+        Row::ReleaseTag { tag, now, .. } => render_release_tag_line(tag, *now, out, use_color),
+        Row::ReleaseEmpty => writeln!(
+            out,
+            "    {}(no releases or tags){}",
+            dim(use_color),
+            reset(use_color),
+        ),
     }
 }
 
-fn render_release_line(
-    info: &RepoReleaseInfo,
+fn render_release_entry_line(
+    release: &ReleaseInfo,
     now: DateTime<Utc>,
     out: &mut impl Write,
     use_color: bool,
 ) -> io::Result<()> {
-    if info.latest_release.is_none() && info.latest_tag.is_none() {
-        return writeln!(
-            out,
-            "  {}{}  (no releases or tags){}",
-            dim(use_color),
-            info.repo,
-            reset(use_color),
-        );
-    }
+    let label = release
+        .name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| release.tag_name.clone());
     write!(
         out,
-        "  {}{}{}",
-        fg_named(use_color, 35),
-        info.repo,
-        reset(use_color),
+        "    {} ({})",
+        label,
+        human_age(release.created_at, now),
     )?;
-    if let Some(rel) = &info.latest_release {
-        let label = rel
-            .name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| rel.tag_name.clone());
-        write!(out, "  {} ({})", label, human_age(rel.created_at, now),)?;
-        if rel.is_prerelease {
-            write!(out, " {}[pre]{}", dim(use_color), reset(use_color))?;
-        }
-    }
-    if let Some(tag) = &info.latest_tag {
-        write!(
-            out,
-            "  tag: {} ({})",
-            tag.name,
-            human_age(tag.committed_at, now),
-        )?;
+    if release.is_prerelease {
+        write!(out, " {}[pre]{}", dim(use_color), reset(use_color))?;
     }
     writeln!(out)
+}
+
+fn render_release_tag_line(
+    tag: &TagInfo,
+    now: DateTime<Utc>,
+    out: &mut impl Write,
+    use_color: bool,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "    {}tag: {} ({}){}",
+        dim(use_color),
+        tag.name,
+        human_age(tag.committed_at, now),
+        reset(use_color),
+    )
 }
 
 fn render_pr_line(
@@ -807,12 +832,12 @@ mod tests {
 
     fn release_info(
         repo: &str,
-        latest_release: Option<crate::model::ReleaseInfo>,
+        releases: Vec<crate::model::ReleaseInfo>,
         latest_tag: Option<crate::model::TagInfo>,
     ) -> RepoReleaseInfo {
         RepoReleaseInfo {
             repo: repo.to_string(),
-            latest_release,
+            recent_releases: releases,
             latest_tag,
         }
     }
@@ -853,18 +878,37 @@ mod tests {
     }
 
     #[test]
-    fn build_section_releases_row_count_and_kind() {
+    fn build_section_releases_tree_shape() {
         let rs = vec![
-            release_info("a/b", Some(rel("v1", 100, false)), None),
-            release_info("c/d", None, Some(tag("v2", 200))),
+            release_info(
+                "a/b",
+                vec![rel("v1.1", 200, false), rel("v1.0", 100, false)],
+                None,
+            ),
+            release_info("c/d", vec![], Some(tag("v2", 200))),
+            release_info("e/f", vec![], None),
         ];
         let section = build_section_releases(&rs, ts_utc(1000));
         assert_eq!(section.kind, SectionKind::Releases);
-        assert_eq!(section.count, 2);
-        assert_eq!(section.rows.len(), 2);
-        for row in &section.rows {
-            assert!(row.is_selectable());
-        }
+        assert_eq!(section.count, 3);
+
+        let kinds: Vec<&'static str> = section
+            .rows
+            .iter()
+            .map(|r| match r {
+                Row::RepoHeader(_) => "header",
+                Row::ReleaseEntry { .. } => "entry",
+                Row::ReleaseTag { .. } => "tag",
+                Row::ReleaseEmpty => "empty",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "header", "entry", "entry", "header", "tag", "header", "empty"
+            ],
+        );
     }
 
     #[test]
@@ -927,16 +971,19 @@ mod tests {
     }
 
     #[test]
-    fn console_render_release_line_formats() {
+    fn console_render_release_lines_format() {
         let now = ts_utc(1_000_000);
-        // Normal release + tag, with prerelease.
         let rs = vec![
             release_info(
                 "o/pre",
-                Some(rel("v1.2.3", 1_000_000 - 3 * 86_400, true)),
-                Some(tag("v1.2.4", 1_000_000 - 86_400)),
+                vec![
+                    rel("v1.2.3", 1_000_000 - 3 * 86_400, true),
+                    rel("v1.2.2", 1_000_000 - 10 * 86_400, false),
+                ],
+                None,
             ),
-            release_info("o/none", None, None),
+            release_info("o/tagged", vec![], Some(tag("v0.1.0", 1_000_000 - 86_400))),
+            release_info("o/none", vec![], None),
         ];
         let section = build_section_releases(&rs, now);
         let mut out: Vec<u8> = Vec::new();
@@ -945,15 +992,19 @@ mod tests {
         assert!(s.contains("o/pre"), "{s}");
         assert!(s.contains("v1.2.3 (3d)"), "{s}");
         assert!(s.contains("[pre]"), "{s}");
-        assert!(s.contains("tag: v1.2.4 (1d)"), "{s}");
+        assert!(s.contains("v1.2.2 (1w)"), "{s}");
+        assert!(s.contains("o/tagged"), "{s}");
+        assert!(s.contains("tag: v0.1.0 (1d)"), "{s}");
+        assert!(s.contains("o/none"), "{s}");
         assert!(s.contains("(no releases or tags)"), "{s}");
     }
 
     #[test]
-    fn row_is_selectable_only_for_pr_reviewer_and_release() {
+    fn row_is_selectable_covers_releases_and_tags() {
         let p = pr("o/r", 1, "a", false, 100, vec![]);
         let r = user("alice", true);
-        let rel_info = release_info("o/r", None, None);
+        let release = rel("v1", 100, false);
+        let tg = tag("v0", 50);
         let now = ts_utc(1);
         assert!(
             Row::Pr {
@@ -964,12 +1015,21 @@ mod tests {
         );
         assert!(Row::Reviewer(&r).is_selectable());
         assert!(
-            Row::Release {
-                info: &rel_info,
+            Row::ReleaseEntry {
+                release: &release,
                 now,
             }
             .is_selectable()
         );
+        assert!(
+            Row::ReleaseTag {
+                repo: "o/r",
+                tag: &tg,
+                now,
+            }
+            .is_selectable()
+        );
+        assert!(!Row::ReleaseEmpty.is_selectable());
         assert!(!Row::RepoHeader("o/r".to_string()).is_selectable());
         assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
         assert!(!Row::SubGroupLabel("Authored").is_selectable());
