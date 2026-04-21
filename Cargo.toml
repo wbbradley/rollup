@@ -1,6 +1,6 @@
 [package]
 name = "rollup"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Terminal dashboard for GitHub PR review workload"
 license = "MIT"
