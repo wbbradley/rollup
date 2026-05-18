@@ -61,7 +61,10 @@ pub enum Row<'a> {
         hide_author_if: Option<String>,
     },
     Reviewer(&'a ReviewerStatus),
-    MergedPr(&'a Pr),
+    MergedPr {
+        pr: &'a Pr,
+        now: DateTime<Utc>,
+    },
     ReleaseEntry {
         release: &'a ReleaseInfo,
         now: DateTime<Utc>,
@@ -180,6 +183,7 @@ pub fn build_section_merged<'a>(
     merged: &'a [Pr],
     allowed_authors: &BTreeSet<String>,
     cap: usize,
+    now: DateTime<Utc>,
 ) -> Section<'a> {
     let visible: Vec<&'a Pr> = merged
         .iter()
@@ -187,7 +191,10 @@ pub fn build_section_merged<'a>(
         .take(cap)
         .collect();
     let count = visible.len();
-    let rows: Vec<Row<'a>> = visible.into_iter().map(Row::MergedPr).collect();
+    let rows: Vec<Row<'a>> = visible
+        .into_iter()
+        .map(|pr| Row::MergedPr { pr, now })
+        .collect();
     Section {
         title: "Recently merged PRs".to_string(),
         subtitle: None,
@@ -249,7 +256,7 @@ pub fn build_full_report<'a>(
             build_section_releases(releases, now),
             build_section_authored(authored, viewer),
             build_section_people(authored, reviewing, viewer),
-            build_section_merged(merged, &allowed, MERGED_PANE_CAP),
+            build_section_merged(merged, &allowed, MERGED_PANE_CAP, now),
         ],
     }
 }
@@ -412,7 +419,7 @@ fn render_row(
             render_pr_line(pr, hide_author_if.as_deref(), out, use_color, width)
         }
         Row::Reviewer(r) => render_reviewer_line(r, out, use_color),
-        Row::MergedPr(pr) => render_merged_pr_line(pr, out, use_color, width),
+        Row::MergedPr { pr, now } => render_merged_pr_line(pr, *now, out, use_color, width),
         Row::ReleaseEntry { release, now } => {
             render_release_entry_line(release, *now, out, use_color)
         }
@@ -564,6 +571,7 @@ fn render_reviewer_line(
 
 fn render_merged_pr_line(
     pr: &Pr,
+    now: DateTime<Utc>,
     out: &mut impl Write,
     use_color: bool,
     width: usize,
@@ -578,6 +586,12 @@ fn render_merged_pr_line(
     prefix.push_str(&fg_named(use_color, 34));
     prefix.push_str(&num);
     prefix.push_str(&reset(use_color));
+
+    if let Some(merged_at) = pr.merged_at {
+        let age = format!("({}) ", human_age(merged_at, now));
+        plain_prefix_cols += age.chars().count();
+        prefix.push_str(&age);
+    }
 
     let repo = format!("{} ", pr.repo);
     plain_prefix_cols += repo.chars().count();
@@ -813,12 +827,13 @@ mod tests {
         let allowed: BTreeSet<String> = ["alice".to_string(), "carol".to_string()]
             .into_iter()
             .collect();
-        let section = build_section_merged(&desc_sorted, &allowed, 2);
+        let now = ts_utc(1_000_000);
+        let section = build_section_merged(&desc_sorted, &allowed, 2, now);
         let nums: Vec<u64> = section
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::MergedPr(pr) => Some(pr.number),
+                Row::MergedPr { pr, .. } => Some(pr.number),
                 _ => None,
             })
             .collect();
@@ -971,6 +986,19 @@ mod tests {
     }
 
     #[test]
+    fn console_render_merged_pr_includes_age() {
+        let now = ts_utc(1_000_000);
+        let merged = vec![merged_pr("o/r", 42, "alice", 1_000_000 - 3 * 86_400)];
+        let allowed: BTreeSet<String> = ["alice".to_string()].into_iter().collect();
+        let section = build_section_merged(&merged, &allowed, 10, now);
+        let mut out: Vec<u8> = Vec::new();
+        render_section(&section, &mut out, false, 120).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("#42"), "{s}");
+        assert!(s.contains("(3d)"), "{s}");
+    }
+
+    #[test]
     fn console_render_release_lines_format() {
         let now = ts_utc(1_000_000);
         let rs = vec![
@@ -1033,6 +1061,6 @@ mod tests {
         assert!(!Row::RepoHeader("o/r".to_string()).is_selectable());
         assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
         assert!(!Row::SubGroupLabel("Authored").is_selectable());
-        assert!(!Row::MergedPr(&p).is_selectable());
+        assert!(!Row::MergedPr { pr: &p, now }.is_selectable());
     }
 }

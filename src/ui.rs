@@ -86,8 +86,12 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             report::allowed_authors_people(&state.authored, &state.reviewing, &viewer_str)
         }
     };
-    let mut merged_section =
-        report::build_section_merged(&state.merged, &allowed, report::MERGED_PANE_CAP);
+    let mut merged_section = report::build_section_merged(
+        &state.merged,
+        &allowed,
+        report::MERGED_PANE_CAP,
+        chrono::Utc::now(),
+    );
     if state.merged.is_empty() && state.loaded_at.is_none() {
         merged_section.empty_message = Some("Loading…");
     }
@@ -182,7 +186,7 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
         ))),
         Row::Pr { pr, hide_author_if } => ListItem::new(pr_line(pr, hide_author_if.as_deref())),
         Row::Reviewer(r) => ListItem::new(reviewer_line(r)),
-        Row::MergedPr(pr) => ListItem::new(merged_pr_line(pr)),
+        Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
         Row::ReleaseTag { tag, now, .. } => ListItem::new(release_tag_line(tag, *now)),
         Row::ReleaseEmpty => ListItem::new(Line::from(Span::styled(
@@ -279,12 +283,15 @@ fn draw_merged_pane(f: &mut Frame, area: Rect, section: &Section<'_>) {
     f.render_widget(list, area);
 }
 
-fn merged_pr_line(pr: &Pr) -> Line<'static> {
+fn merged_pr_line(pr: &Pr, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
         format!("  #{} ", pr.number),
         Style::default().fg(Color::Blue),
     ));
+    if let Some(merged_at) = pr.merged_at {
+        spans.push(Span::raw(format!("({}) ", human_age(merged_at, now))));
+    }
     spans.push(Span::styled(
         format!("{} ", pr.repo),
         Style::default().fg(Color::Magenta),
