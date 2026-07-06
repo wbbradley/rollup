@@ -7,14 +7,7 @@ use serde::Deserialize;
 use crate::{
     config,
     model::{
-        self,
-        Pr,
-        ReleaseInfo,
-        RepoReleaseInfo,
-        ReviewState,
-        ReviewerKind,
-        ReviewerStatus,
-        TagInfo,
+        self, Pr, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, TagInfo,
     },
 };
 
@@ -36,6 +29,8 @@ fragment PrFields on PullRequest {
   isDraft
   updatedAt
   mergedAt
+  baseRefName
+  headRefName
   repository { nameWithOwner }
   author { login }
   reviewRequests(first: 20) {
@@ -67,6 +62,8 @@ fragment PrFields on PullRequest {
   isDraft
   updatedAt
   mergedAt
+  baseRefName
+  headRefName
   repository { nameWithOwner }
   author { login }
   reviewRequests(first: 20) {
@@ -339,6 +336,8 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         url: node.url.unwrap_or_default(),
         is_draft: node.is_draft.unwrap_or(false),
         repo,
+        base_ref: node.base_ref_name.unwrap_or_default(),
+        head_ref: node.head_ref_name.unwrap_or_default(),
         author: node
             .author
             .map(|a| a.login)
@@ -393,6 +392,10 @@ struct PrNode {
     updated_at: Option<String>,
     #[serde(rename = "mergedAt")]
     merged_at: Option<String>,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: Option<String>,
+    #[serde(rename = "headRefName")]
+    head_ref_name: Option<String>,
     repository: Option<RepoNode>,
     author: Option<AuthorNode>,
     #[serde(rename = "reviewRequests")]

@@ -10,18 +10,9 @@ use chrono::{DateTime, Local, Utc};
 use crate::{
     github,
     model::{
-        Pr,
-        ReleaseInfo,
-        RepoReleaseInfo,
-        ReviewState,
-        ReviewerStatus,
-        TagInfo,
-        authors_for_me,
-        authors_for_people,
-        group_by_person,
-        group_by_repo,
-        human_age,
-        merged_fetch_authors,
+        AuthoredTreeNode, Pr, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo,
+        authored_forest, authors_for_me, authors_for_people, group_by_person, group_by_repo,
+        human_age, merged_fetch_authors,
     },
 };
 
@@ -59,8 +50,15 @@ pub enum Row<'a> {
     Pr {
         pr: &'a Pr,
         hide_author_if: Option<String>,
+        /// Full leading indent string for tree rendering (with `├`/`└`/`│`
+        /// connectors). `None` in flat panes, which fall back to a fixed indent.
+        tree_prefix: Option<String>,
     },
-    Reviewer(&'a ReviewerStatus),
+    Reviewer {
+        r: &'a ReviewerStatus,
+        /// Leading indent for tree rendering; `None` uses the fixed indent.
+        tree_prefix: Option<String>,
+    },
     MergedPr {
         pr: &'a Pr,
         now: DateTime<Utc>,
@@ -81,7 +79,10 @@ impl Row<'_> {
     pub fn is_selectable(&self) -> bool {
         matches!(
             self,
-            Row::Pr { .. } | Row::Reviewer(_) | Row::ReleaseEntry { .. } | Row::ReleaseTag { .. }
+            Row::Pr { .. }
+                | Row::Reviewer { .. }
+                | Row::ReleaseEntry { .. }
+                | Row::ReleaseTag { .. }
         )
     }
 }
@@ -94,9 +95,13 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
             rows.push(Row::Pr {
                 pr,
                 hide_author_if: None,
+                tree_prefix: None,
             });
             for r in &pr.reviewers {
-                rows.push(Row::Reviewer(r));
+                rows.push(Row::Reviewer {
+                    r,
+                    tree_prefix: None,
+                });
             }
         }
     }
@@ -114,13 +119,19 @@ pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(authored) {
         rows.push(Row::RepoHeader(repo));
-        for pr in group_prs {
+        // Within each repo, nest PRs by merge target (stacked-PR tree).
+        for node in authored_forest(&group_prs) {
             rows.push(Row::Pr {
-                pr,
+                pr: node.pr,
                 hide_author_if: Some(viewer.to_string()),
+                tree_prefix: Some(tree_pr_prefix(&node)),
             });
-            for r in &pr.reviewers {
-                rows.push(Row::Reviewer(r));
+            let reviewer_prefix = tree_reviewer_prefix(&node);
+            for r in &node.pr.reviewers {
+                rows.push(Row::Reviewer {
+                    r,
+                    tree_prefix: Some(reviewer_prefix.clone()),
+                });
             }
         }
     }
@@ -132,6 +143,31 @@ pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'
         rows,
         empty_message: Some("(none)"),
     }
+}
+
+/// Leading indent for a PR row in the Authored tree: a two-space base (one
+/// level under the repo header), a `│`/blank column per ancestor, then this
+/// node's `├`/`└` connector.
+fn tree_pr_prefix(node: &AuthoredTreeNode) -> String {
+    let mut s = String::from("  ");
+    for &cont in &node.ancestors_continue {
+        s.push_str(if cont { "│  " } else { "   " });
+    }
+    s.push_str(if node.is_last { "└─ " } else { "├─ " });
+    s
+}
+
+/// Leading indent for a reviewer row: aligns under its PR. The PR's own column
+/// continues with a `│` iff the PR has a following sibling, then a small offset
+/// so the reviewer glyph sits just past where child PRs connect.
+fn tree_reviewer_prefix(node: &AuthoredTreeNode) -> String {
+    let mut s = String::from("  ");
+    for &cont in &node.ancestors_continue {
+        s.push_str(if cont { "│  " } else { "   " });
+    }
+    s.push_str(if node.is_last { "   " } else { "│  " });
+    s.push_str("  ");
+    s
 }
 
 pub fn build_section_people<'a>(
@@ -150,9 +186,13 @@ pub fn build_section_people<'a>(
                 rows.push(Row::Pr {
                     pr,
                     hide_author_if: Some(person.login.clone()),
+                    tree_prefix: None,
                 });
                 for r in &pr.reviewers {
-                    rows.push(Row::Reviewer(r));
+                    rows.push(Row::Reviewer {
+                        r,
+                        tree_prefix: None,
+                    });
                 }
             }
         }
@@ -162,9 +202,13 @@ pub fn build_section_people<'a>(
                 rows.push(Row::Pr {
                     pr,
                     hide_author_if: None,
+                    tree_prefix: None,
                 });
                 for r in &pr.reviewers {
-                    rows.push(Row::Reviewer(r));
+                    rows.push(Row::Reviewer {
+                        r,
+                        tree_prefix: None,
+                    });
                 }
             }
         }
@@ -415,10 +459,21 @@ fn render_row(
         Row::SubGroupLabel(label) => {
             writeln!(out, "    {}{}:{}", dim(use_color), label, reset(use_color))
         }
-        Row::Pr { pr, hide_author_if } => {
-            render_pr_line(pr, hide_author_if.as_deref(), out, use_color, width)
+        Row::Pr {
+            pr,
+            hide_author_if,
+            tree_prefix,
+        } => render_pr_line(
+            pr,
+            hide_author_if.as_deref(),
+            tree_prefix.as_deref(),
+            out,
+            use_color,
+            width,
+        ),
+        Row::Reviewer { r, tree_prefix } => {
+            render_reviewer_line(r, tree_prefix.as_deref(), out, use_color)
         }
-        Row::Reviewer(r) => render_reviewer_line(r, out, use_color),
         Row::MergedPr { pr, now } => render_merged_pr_line(pr, *now, out, use_color, width),
         Row::ReleaseEntry { release, now } => {
             render_release_entry_line(release, *now, out, use_color)
@@ -475,15 +530,28 @@ fn render_release_tag_line(
 fn render_pr_line(
     pr: &Pr,
     hide_author_if: Option<&str>,
+    tree_prefix: Option<&str>,
     out: &mut impl Write,
     use_color: bool,
     width: usize,
 ) -> io::Result<()> {
-    let indent = "    ";
     let mut prefix = String::new();
-    let mut plain_prefix_cols = indent.chars().count();
+    let mut plain_prefix_cols;
 
-    prefix.push_str(indent);
+    match tree_prefix {
+        Some(tp) => {
+            plain_prefix_cols = tp.chars().count();
+            prefix.push_str(&dim(use_color));
+            prefix.push_str(tp);
+            prefix.push_str(&reset(use_color));
+        }
+        None => {
+            let indent = "    ";
+            plain_prefix_cols = indent.chars().count();
+            prefix.push_str(indent);
+        }
+    }
+
     let num = format!("#{} ", pr.number);
     plain_prefix_cols += num.chars().count();
     prefix.push_str(&fg_named(use_color, 34));
@@ -514,6 +582,7 @@ fn render_pr_line(
 
 fn render_reviewer_line(
     r: &ReviewerStatus,
+    tree_prefix: Option<&str>,
     out: &mut impl Write,
     use_color: bool,
 ) -> io::Result<()> {
@@ -525,7 +594,10 @@ fn render_reviewer_line(
         ReviewState::Dismissed => ("⊘", None, true),
     };
 
-    write!(out, "      ")?;
+    match tree_prefix {
+        Some(tp) => write!(out, "{}{}{}", dim(use_color), tp, reset(use_color))?,
+        None => write!(out, "      ")?,
+    }
     if let Some(code) = glyph_color {
         write!(
             out,
@@ -714,6 +786,8 @@ mod tests {
             url: format!("https://github.com/{repo}/pull/{number}"),
             is_draft,
             repo: repo.to_string(),
+            base_ref: "main".to_string(),
+            head_ref: format!("branch-{number}"),
             author: author.to_string(),
             reviewers,
             updated_at: ts(updated),
@@ -761,7 +835,7 @@ mod tests {
             .map(|r| match r {
                 Row::RepoHeader(h) => format!("H:{h}"),
                 Row::Pr { pr, .. } => format!("P:{}", pr.number),
-                Row::Reviewer(r) => format!("R:{}", r.login),
+                Row::Reviewer { r, .. } => format!("R:{}", r.login),
                 _ => "?".into(),
             })
             .collect();
@@ -926,6 +1000,62 @@ mod tests {
         );
     }
 
+    fn pr_refs(repo: &str, number: u64, base: &str, head: &str) -> Pr {
+        Pr {
+            base_ref: base.to_string(),
+            head_ref: head.to_string(),
+            ..pr(repo, number, "me", false, 100, vec![])
+        }
+    }
+
+    #[test]
+    fn build_section_authored_tree_shape() {
+        // A(main←a) is the root; B(a←b) stacks on A; C(main←c) is a second root.
+        let a = pr_refs("o/r", 1, "main", "a");
+        let b = pr_refs("o/r", 2, "a", "b");
+        let c = pr_refs("o/r", 3, "main", "c");
+        let authored = vec![a, b, c];
+        let section = build_section_authored(&authored, "me");
+        assert_eq!(section.kind, SectionKind::MeAuthored);
+        assert_eq!(section.count, 3);
+
+        // Pre-order: header, then A, its child B, then sibling root C.
+        let seq: Vec<String> = section
+            .rows
+            .iter()
+            .map(|r| match r {
+                Row::RepoHeader(h) => format!("H:{h}"),
+                Row::Pr { pr, .. } => format!("P:{}", pr.number),
+                Row::Reviewer { r, .. } => format!("R:{}", r.login),
+                _ => "?".into(),
+            })
+            .collect();
+        assert_eq!(seq, vec!["H:o/r", "P:1", "P:2", "P:3"]);
+
+        // Grab each PR's tree prefix by number.
+        let prefix = |num: u64| -> String {
+            section
+                .rows
+                .iter()
+                .find_map(|r| match r {
+                    Row::Pr {
+                        pr,
+                        tree_prefix: Some(tp),
+                        ..
+                    } if pr.number == num => Some(tp.clone()),
+                    _ => None,
+                })
+                .expect("pr present with prefix")
+        };
+        // Roots: A has a following sibling (its child doesn't count as a
+        // sibling), so it uses `├─`; C is the last root, so `└─`.
+        assert_eq!(prefix(1), "  ├─ ");
+        assert_eq!(prefix(3), "  └─ ");
+        // B is A's only child: one continuation bar under A (A is not last),
+        // then a `└─` connector.
+        assert_eq!(prefix(2), "  │  └─ ");
+    }
+
     #[test]
     fn console_render_no_color_has_no_escape_bytes() {
         let viewer = "me";
@@ -1038,10 +1168,17 @@ mod tests {
             Row::Pr {
                 pr: &p,
                 hide_author_if: None,
+                tree_prefix: None,
             }
             .is_selectable()
         );
-        assert!(Row::Reviewer(&r).is_selectable());
+        assert!(
+            Row::Reviewer {
+                r: &r,
+                tree_prefix: None,
+            }
+            .is_selectable()
+        );
         assert!(
             Row::ReleaseEntry {
                 release: &release,

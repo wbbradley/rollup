@@ -34,6 +34,12 @@ pub struct Pr {
     pub url: String,
     pub is_draft: bool,
     pub repo: String,
+    /// The branch this PR merges into (GitHub `baseRefName`). Its merge target;
+    /// used to build the stacked-PR tree in the Authored pane.
+    pub base_ref: String,
+    /// The branch this PR is built from (GitHub `headRefName`). A PR is the
+    /// parent of any PR whose `base_ref` equals this `head_ref`.
+    pub head_ref: String,
     pub author: String,
     pub reviewers: Vec<ReviewerStatus>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -62,6 +68,116 @@ pub fn group_by_repo(prs: &[Pr]) -> Vec<(String, Vec<&Pr>)> {
     }
     groups.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     groups
+}
+
+/// A node in the Authored pane's merge-target forest, carrying the structural
+/// bits a renderer needs to draw tree connectors. Produced in DFS pre-order by
+/// [`authored_forest`].
+#[derive(Debug)]
+pub struct AuthoredTreeNode<'a> {
+    pub pr: &'a Pr,
+    /// True iff this node is the last among its siblings (drives `└` vs `├`).
+    pub is_last: bool,
+    /// One flag per ancestor level, root-most first: whether that ancestor has
+    /// a following sibling. A `true` means a vertical bar `│` should be drawn
+    /// in that ancestor's column; `false` means blank space.
+    pub ancestors_continue: Vec<bool>,
+}
+
+/// Build the merge-target forest for a single repo's authored PRs and return
+/// the nodes in DFS pre-order (ready to flatten into rows).
+///
+/// `prs` is expected to already be sorted the way the Authored pane sorts (see
+/// [`group_by_repo`]: non-drafts first, then newest-updated); sibling order in
+/// the output preserves the input order.
+///
+/// Parenting: a PR *C* is a child of PR *P* iff `P.head_ref == C.base_ref`.
+/// PRs whose `base_ref` is not the `head_ref` of any PR here are roots. When
+/// two PRs share a `head_ref` (unusual), the first in the sorted input wins, so
+/// the result is deterministic. Self-parenting (`base_ref == head_ref`) is
+/// ignored, and any PRs caught in a reference cycle are defensively promoted to
+/// roots so the walk always terminates.
+pub fn authored_forest<'a>(prs: &[&'a Pr]) -> Vec<AuthoredTreeNode<'a>> {
+    // Map each non-empty head ref to the first PR that declares it.
+    let mut head_to_idx: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, pr) in prs.iter().enumerate() {
+        if !pr.head_ref.is_empty() {
+            head_to_idx.entry(pr.head_ref.as_str()).or_insert(i);
+        }
+    }
+
+    // Resolve each PR's parent by its base ref, skipping self-parents.
+    let parent: Vec<Option<usize>> = prs
+        .iter()
+        .enumerate()
+        .map(|(i, pr)| {
+            if pr.base_ref.is_empty() {
+                return None;
+            }
+            match head_to_idx.get(pr.base_ref.as_str()) {
+                Some(&p) if p != i => Some(p),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Children lists and root list, both in input order (preserves the sort).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); prs.len()];
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, p) in parent.iter().enumerate() {
+        match p {
+            Some(p) => children[*p].push(i),
+            None => roots.push(i),
+        }
+    }
+
+    let mut out: Vec<AuthoredTreeNode<'a>> = Vec::with_capacity(prs.len());
+    let mut visited: Vec<bool> = vec![false; prs.len()];
+    let mut ancestors: Vec<bool> = Vec::new();
+    emit_forest(
+        &roots,
+        &children,
+        prs,
+        &mut visited,
+        &mut ancestors,
+        &mut out,
+    );
+
+    // Cycle guard: any PR not reached from a root is part of a reference cycle
+    // (e.g. A→B→A). Promote each such PR to a root, in input order, so it still
+    // appears exactly once and the walk terminates.
+    for i in 0..prs.len() {
+        if !visited[i] {
+            emit_forest(&[i], &children, prs, &mut visited, &mut ancestors, &mut out);
+        }
+    }
+
+    out
+}
+
+fn emit_forest<'a>(
+    sibs: &[usize],
+    children: &[Vec<usize>],
+    prs: &[&'a Pr],
+    visited: &mut [bool],
+    ancestors: &mut Vec<bool>,
+    out: &mut Vec<AuthoredTreeNode<'a>>,
+) {
+    for (i, &idx) in sibs.iter().enumerate() {
+        if visited[idx] {
+            continue;
+        }
+        visited[idx] = true;
+        let is_last = i + 1 == sibs.len();
+        out.push(AuthoredTreeNode {
+            pr: prs[idx],
+            is_last,
+            ancestors_continue: ancestors.clone(),
+        });
+        ancestors.push(!is_last);
+        emit_forest(&children[idx], children, prs, visited, ancestors, out);
+        ancestors.pop();
+    }
 }
 
 #[derive(Debug)]
@@ -298,10 +414,29 @@ mod tests {
             url: format!("https://github.com/{repo}/pull/{number}"),
             is_draft,
             repo: repo.to_string(),
+            base_ref: "main".to_string(),
+            head_ref: format!("branch-{number}"),
             author: author.to_string(),
             reviewers,
             updated_at: ts(updated),
             merged_at: None,
+        }
+    }
+
+    /// Like `pr`, but with explicit merge-target (`base`) and source (`head`)
+    /// branches so tests can wire up stacked-PR relationships.
+    fn pr_refs(
+        repo: &str,
+        number: u64,
+        base: &str,
+        head: &str,
+        is_draft: bool,
+        updated: i64,
+    ) -> Pr {
+        Pr {
+            base_ref: base.to_string(),
+            head_ref: head.to_string(),
+            ..pr(repo, number, "me", is_draft, updated, vec![])
         }
     }
 
@@ -543,5 +678,84 @@ mod tests {
         let logins: Vec<&str> = groups.iter().map(|g| g.login.as_str()).collect();
         assert!(!logins.contains(&"carol"));
         assert!(logins.contains(&"dave"));
+    }
+
+    #[test]
+    fn authored_forest_linear_stack() {
+        // C targets B's branch, B targets A's branch, A targets main.
+        let a = pr_refs("o/r", 1, "main", "a", false, 100);
+        let b = pr_refs("o/r", 2, "a", "b", false, 100);
+        let c = pr_refs("o/r", 3, "b", "c", false, 100);
+        // Input order is arbitrary; the forest must still nest A→B→C.
+        let prs: Vec<&Pr> = vec![&c, &a, &b];
+        let nodes = authored_forest(&prs);
+        let nums: Vec<u64> = nodes.iter().map(|n| n.pr.number).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+        let depths: Vec<usize> = nodes.iter().map(|n| n.ancestors_continue.len()).collect();
+        assert_eq!(depths, vec![0, 1, 2]);
+        // Every node is an only-child, so all are "last" and no ancestor
+        // continues with a sibling bar.
+        assert!(nodes.iter().all(|n| n.is_last));
+        assert_eq!(nodes[2].ancestors_continue, vec![false, false]);
+    }
+
+    #[test]
+    fn authored_forest_roots_target_main() {
+        let a = pr_refs("o/r", 1, "main", "a", false, 200);
+        let b = pr_refs("o/r", 2, "main", "b", false, 100);
+        let prs: Vec<&Pr> = vec![&a, &b];
+        let nodes = authored_forest(&prs);
+        let nums: Vec<u64> = nodes.iter().map(|n| n.pr.number).collect();
+        assert_eq!(nums, vec![1, 2]);
+        assert!(nodes.iter().all(|n| n.ancestors_continue.is_empty()));
+        // First root has a following sibling; only the last is `is_last`.
+        assert!(!nodes[0].is_last);
+        assert!(nodes[1].is_last);
+    }
+
+    #[test]
+    fn authored_forest_sibling_order_and_bars() {
+        // Parent A with two children (both target A's branch). Sibling order
+        // follows input order.
+        let a = pr_refs("o/r", 1, "main", "a", false, 300);
+        let c1 = pr_refs("o/r", 2, "a", "c1", false, 200);
+        let c2 = pr_refs("o/r", 3, "a", "c2", false, 100);
+        let prs: Vec<&Pr> = vec![&a, &c1, &c2];
+        let nodes = authored_forest(&prs);
+        let nums: Vec<u64> = nodes.iter().map(|n| n.pr.number).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+        // A is the sole root -> is_last.
+        assert!(nodes[0].is_last);
+        // First child has a following sibling; second is last.
+        assert!(!nodes[1].is_last);
+        assert!(nodes[2].is_last);
+        // Both children sit one level deep; A is the only root so it never
+        // draws a continuation bar for its descendants.
+        assert_eq!(nodes[1].ancestors_continue, vec![false]);
+        assert_eq!(nodes[2].ancestors_continue, vec![false]);
+    }
+
+    #[test]
+    fn authored_forest_cycle_guard() {
+        // A targets B's branch and B targets A's branch: a 2-cycle with no
+        // root. Both must still appear exactly once and the call must return.
+        let a = pr_refs("o/r", 1, "b", "a", false, 200);
+        let b = pr_refs("o/r", 2, "a", "b", false, 100);
+        let prs: Vec<&Pr> = vec![&a, &b];
+        let nodes = authored_forest(&prs);
+        let mut nums: Vec<u64> = nodes.iter().map(|n| n.pr.number).collect();
+        nums.sort_unstable();
+        assert_eq!(nums, vec![1, 2]);
+    }
+
+    #[test]
+    fn authored_forest_self_parent_is_root() {
+        // A PR whose base and head are the same branch must not parent itself.
+        let a = pr_refs("o/r", 1, "x", "x", false, 100);
+        let prs: Vec<&Pr> = vec![&a];
+        let nodes = authored_forest(&prs);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].ancestors_continue.is_empty());
+        assert!(nodes[0].is_last);
     }
 }

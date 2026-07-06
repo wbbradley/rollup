@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{Pr, ReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, TagInfo, human_age},
+    model::{Pr, ReleaseInfo, ReviewState, ReviewerStatus, TagInfo, human_age},
     report::{self, Row, Section},
 };
 
@@ -184,8 +184,16 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             format!("  {label}"),
             Style::default().add_modifier(Modifier::DIM),
         ))),
-        Row::Pr { pr, hide_author_if } => ListItem::new(pr_line(pr, hide_author_if.as_deref())),
-        Row::Reviewer(r) => ListItem::new(reviewer_line(r)),
+        Row::Pr {
+            pr,
+            hide_author_if,
+            tree_prefix,
+        } => ListItem::new(pr_line(
+            pr,
+            hide_author_if.as_deref(),
+            tree_prefix.as_deref(),
+        )),
+        Row::Reviewer { r, tree_prefix } => ListItem::new(reviewer_line(r, tree_prefix.as_deref())),
         Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
         Row::ReleaseTag { tag, now, .. } => ListItem::new(release_tag_line(tag, *now)),
@@ -304,10 +312,17 @@ fn merged_pr_line(pr: &Pr, now: chrono::DateTime<chrono::Utc>) -> Line<'static> 
     Line::from(spans)
 }
 
-fn pr_line(pr: &Pr, hide_author_if: Option<&str>) -> Line<'static> {
+fn pr_line(pr: &Pr, hide_author_if: Option<&str>, tree_prefix: Option<&str>) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    match tree_prefix {
+        Some(tp) => spans.push(Span::styled(
+            tp.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        None => spans.push(Span::raw("  ")),
+    }
     spans.push(Span::styled(
-        format!("  #{} ", pr.number),
+        format!("#{} ", pr.number),
         Style::default().fg(Color::Blue),
     ));
     if pr.is_draft {
@@ -327,7 +342,7 @@ fn pr_line(pr: &Pr, hide_author_if: Option<&str>) -> Line<'static> {
     Line::from(spans)
 }
 
-fn reviewer_line(r: &ReviewerStatus) -> Line<'static> {
+fn reviewer_line(r: &ReviewerStatus, tree_prefix: Option<&str>) -> Line<'static> {
     let (glyph, glyph_style) = match r.state {
         ReviewState::Approved => ("✓", Style::default().fg(Color::Green)),
         ReviewState::ChangesRequested => ("✗", Style::default().fg(Color::Red)),
@@ -341,12 +356,12 @@ fn reviewer_line(r: &ReviewerStatus) -> Line<'static> {
         ),
     };
     let name_style = Style::default().fg(color_for_login(&r.login));
-    let prefix = match r.kind {
-        ReviewerKind::User => "      ",
-        ReviewerKind::Team => "      ",
+    let prefix_span = match tree_prefix {
+        Some(tp) => Span::styled(tp.to_string(), Style::default().add_modifier(Modifier::DIM)),
+        None => Span::raw("      "),
     };
     let mut spans = vec![
-        Span::raw(prefix),
+        prefix_span,
         Span::styled(glyph.to_string(), glyph_style),
         Span::raw(" "),
         Span::styled(r.login.clone(), name_style),

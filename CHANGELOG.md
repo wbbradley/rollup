@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Changed
+- `Authored by me` pane now nests PRs into a merge-target tree: a PR whose base branch is another of your open PRs' branch renders as a child of that PR, with `├─`/`└─`/`│` connectors. PRs targeting a branch you don't have an open PR for (e.g. `main`) stay at the top level under their repo header. The flat single-PR case gains the same connector glyphs. Applies to both the TUI and `rollup report`.
+
 ## [0.2.0] - 2026-04-21
 
 ### Breaking Changes

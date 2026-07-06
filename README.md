@@ -3,7 +3,7 @@
 A terminal dashboard for your GitHub PR review workload. Panes:
 
 - **Review requested of me** — open PRs waiting on your review.
-- **Authored by me** — your open PRs and where each reviewer stands.
+- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch).
 - **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Me mode only).
 - **Recently merged PRs** — recently merged PRs by people in the current view.
 
@@ -58,6 +58,16 @@ Plus a trailing badge:
 - `(reviewed)` — in the list because they already submitted a review. `x` can't remove them (GitHub's DELETE endpoint no-ops here — you'd have to dismiss the review on the web UI).
 
 Login names get stable, hash-derived colors so you can scan for a particular person quickly.
+
+## Authored tree
+
+Within each repo, the `Authored by me` pane nests your PRs by **merge target**:
+a PR whose base branch is another of your PRs' branch is drawn as a child of
+that PR, with `├─`/`└─`/`│` connectors — so stacked PRs read at a glance. A PR
+that targets a branch you don't have an open PR for (e.g. `main`) sits at the
+top level under its repo header. Reviewer sub-rows hang beneath their PR as
+usual. Navigation and `Enter`-to-open work across the nested rows unchanged.
+The same shape appears in `rollup report`.
 
 ## Config
 

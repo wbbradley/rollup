@@ -241,7 +241,7 @@ impl AppState {
                     }
                     idx += 1;
                 }
-                Row::Reviewer(r) => {
+                Row::Reviewer { r, .. } => {
                     if idx == sel {
                         return current_pr.and_then(|pr| f(pr, Some(r)));
                     }
