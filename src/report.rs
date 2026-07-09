@@ -10,8 +10,8 @@ use chrono::{DateTime, Local, Utc};
 use crate::{
     github,
     model::{
-        AuthoredTreeNode, Pr, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo,
-        authored_forest, authors_for_me, authors_for_people, group_by_person, group_by_repo,
+        Pr, PrComment, PrTreeNode, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerStatus,
+        TagInfo, authored_tree, authors_for_me, authors_for_people, group_by_person, group_by_repo,
         human_age, merged_fetch_authors,
     },
 };
@@ -59,6 +59,18 @@ pub enum Row<'a> {
         /// Leading indent for tree rendering; `None` uses the fixed indent.
         tree_prefix: Option<String>,
     },
+    /// A flat, un-branched section label (e.g. "Reviewers") sitting at a PR's
+    /// child indent. Not selectable.
+    SectionHeader {
+        label: &'static str,
+        tree_prefix: String,
+    },
+    /// An unresolved review-thread comment under a PR. Selectable; Enter opens
+    /// the comment's permalink.
+    Comment {
+        c: &'a PrComment,
+        tree_prefix: String,
+    },
     MergedPr {
         pr: &'a Pr,
         now: DateTime<Utc>,
@@ -81,6 +93,7 @@ impl Row<'_> {
             self,
             Row::Pr { .. }
                 | Row::Reviewer { .. }
+                | Row::Comment { .. }
                 | Row::ReleaseEntry { .. }
                 | Row::ReleaseTag { .. }
         )
@@ -119,20 +132,12 @@ pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(authored) {
         rows.push(Row::RepoHeader(repo));
-        // Within each repo, nest PRs by merge target (stacked-PR tree).
-        for node in authored_forest(&group_prs) {
-            rows.push(Row::Pr {
-                pr: node.pr,
-                hide_author_if: Some(viewer.to_string()),
-                tree_prefix: Some(tree_pr_prefix(&node)),
-            });
-            let reviewer_prefix = tree_reviewer_prefix(&node);
-            for r in &node.pr.reviewers {
-                rows.push(Row::Reviewer {
-                    r,
-                    tree_prefix: Some(reviewer_prefix.clone()),
-                });
-            }
+        // Within each repo, nest PRs by merge target (stacked-PR tree). Roots
+        // start at the two-space base under the repo header.
+        let tree = authored_tree(&group_prs);
+        let n = tree.len();
+        for (i, node) in tree.iter().enumerate() {
+            push_pr(&mut rows, node, viewer, "  ", i + 1 == n);
         }
     }
     Section {
@@ -145,29 +150,85 @@ pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'
     }
 }
 
-/// Leading indent for a PR row in the Authored tree: a two-space base (one
-/// level under the repo header), a `│`/blank column per ancestor, then this
-/// node's `├`/`└` connector.
-fn tree_pr_prefix(node: &AuthoredTreeNode) -> String {
-    let mut s = String::from("  ");
-    for &cont in &node.ancestors_continue {
-        s.push_str(if cont { "│  " } else { "   " });
-    }
-    s.push_str(if node.is_last { "└─ " } else { "├─ " });
-    s
-}
+/// Flatten one PR tree node (and its stacked children) into rows. Each PR's
+/// children are grouped into up to three ordered sections — Reviewers, Open
+/// comments, Stacked PRs — drawn with classic `├─`/`└─`/`│` connectors. A
+/// section header appears only when the PR has two or more non-empty sections
+/// (the lone section hangs its items directly under the PR).
+///
+/// `node: &PrTreeNode<'a>` yields `node.pr: &'a Pr`; iterating
+/// `node.pr.reviewers` / `node.pr.unresolved_comments` produces `&'a _`, so the
+/// rows carry `'a` references into `authored` and are independent of the local
+/// `tree` that may drop between loop iterations.
+fn push_pr<'a>(
+    rows: &mut Vec<Row<'a>>,
+    node: &PrTreeNode<'a>,
+    viewer: &str,
+    prefix: &str,
+    is_last: bool,
+) {
+    let connector = if is_last { "└─ " } else { "├─ " };
+    rows.push(Row::Pr {
+        pr: node.pr,
+        hide_author_if: Some(viewer.to_string()),
+        tree_prefix: Some(format!("{prefix}{connector}")),
+    });
+    let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
 
-/// Leading indent for a reviewer row: aligns under its PR. The PR's own column
-/// continues with a `│` iff the PR has a following sibling, then a small offset
-/// so the reviewer glyph sits just past where child PRs connect.
-fn tree_reviewer_prefix(node: &AuthoredTreeNode) -> String {
-    let mut s = String::from("  ");
-    for &cont in &node.ancestors_continue {
-        s.push_str(if cont { "│  " } else { "   " });
+    let n_sections = (!node.pr.reviewers.is_empty()) as usize
+        + (!node.pr.unresolved_comments.is_empty()) as usize
+        + (!node.children.is_empty()) as usize;
+    let show_headers = n_sections > 1;
+
+    // Reviewers section.
+    if !node.pr.reviewers.is_empty() {
+        if show_headers {
+            rows.push(Row::SectionHeader {
+                label: "Reviewers",
+                tree_prefix: child_base.clone(),
+            });
+        }
+        let m = node.pr.reviewers.len();
+        for (i, r) in node.pr.reviewers.iter().enumerate() {
+            let c = if i + 1 == m { "└─ " } else { "├─ " };
+            rows.push(Row::Reviewer {
+                r,
+                tree_prefix: Some(format!("{child_base}{c}")),
+            });
+        }
     }
-    s.push_str(if node.is_last { "   " } else { "│  " });
-    s.push_str("  ");
-    s
+
+    // Open comments section.
+    if !node.pr.unresolved_comments.is_empty() {
+        if show_headers {
+            rows.push(Row::SectionHeader {
+                label: "Open comments",
+                tree_prefix: child_base.clone(),
+            });
+        }
+        let m = node.pr.unresolved_comments.len();
+        for (i, c) in node.pr.unresolved_comments.iter().enumerate() {
+            let conn = if i + 1 == m { "└─ " } else { "├─ " };
+            rows.push(Row::Comment {
+                c,
+                tree_prefix: format!("{child_base}{conn}"),
+            });
+        }
+    }
+
+    // Stacked PRs section.
+    if !node.children.is_empty() {
+        if show_headers {
+            rows.push(Row::SectionHeader {
+                label: "Stacked PRs",
+                tree_prefix: child_base.clone(),
+            });
+        }
+        let m = node.children.len();
+        for (i, kid) in node.children.iter().enumerate() {
+            push_pr(rows, kid, viewer, &child_base, i + 1 == m);
+        }
+    }
 }
 
 pub fn build_section_people<'a>(
@@ -474,6 +535,15 @@ fn render_row(
         Row::Reviewer { r, tree_prefix } => {
             render_reviewer_line(r, tree_prefix.as_deref(), out, use_color)
         }
+        Row::SectionHeader { label, tree_prefix } => writeln!(
+            out,
+            "{}{}{}{}",
+            dim(use_color),
+            tree_prefix,
+            label,
+            reset(use_color),
+        ),
+        Row::Comment { c, tree_prefix } => render_comment_line(c, tree_prefix, out, use_color),
         Row::MergedPr { pr, now } => render_merged_pr_line(pr, *now, out, use_color, width),
         Row::ReleaseEntry { release, now } => {
             render_release_entry_line(release, *now, out, use_color)
@@ -641,6 +711,31 @@ fn render_reviewer_line(
     }
 }
 
+fn render_comment_line(
+    c: &PrComment,
+    tree_prefix: &str,
+    out: &mut impl Write,
+    use_color: bool,
+) -> io::Result<()> {
+    write!(out, "{}{}{}", dim(use_color), tree_prefix, reset(use_color))?;
+    let (r, g, b) = rgb_for_login(&c.author);
+    write!(
+        out,
+        "{}@{}{}",
+        fg_rgb(use_color, r, g, b),
+        c.author,
+        reset(use_color),
+    )?;
+    write!(out, " {}", c.body)?;
+    if let Some(path) = &c.path {
+        write!(out, " {}({}){}", dim(use_color), path, reset(use_color))?;
+    }
+    if c.is_outdated {
+        write!(out, " {}[outdated]{}", dim(use_color), reset(use_color))?;
+    }
+    writeln!(out)
+}
+
 fn render_merged_pr_line(
     pr: &Pr,
     now: DateTime<Utc>,
@@ -792,6 +887,17 @@ mod tests {
             reviewers,
             updated_at: ts(updated),
             merged_at: None,
+            unresolved_comments: vec![],
+        }
+    }
+
+    fn comment(author: &str, body: &str, path: Option<&str>, is_outdated: bool) -> PrComment {
+        PrComment {
+            author: author.to_string(),
+            body: body.to_string(),
+            url: format!("https://github.com/o/r/pull/1#discussion_r_{author}"),
+            path: path.map(str::to_string),
+            is_outdated,
         }
     }
 
@@ -1057,6 +1163,46 @@ mod tests {
     }
 
     #[test]
+    fn build_section_authored_three_deep_bars() {
+        // A(main←a) sole root with two children B1(a←b1) and B2(a←b2); B1 has
+        // its own child C(b1←c). Verifies a mid-level `│` bar three deep: C
+        // sits under B1, and B1 is *not* the last child of A, so B1's column
+        // must keep drawing `│` down to C.
+        let a = pr_refs("o/r", 1, "main", "a");
+        let b1 = pr_refs("o/r", 2, "a", "b1");
+        let c = pr_refs("o/r", 3, "b1", "c");
+        let b2 = pr_refs("o/r", 4, "a", "b2");
+        // Sort within the repo is stable at equal update times, so input order
+        // (a, b1, c, b2) is preserved and B1 precedes B2 as A's children.
+        let authored = vec![a, b1, c, b2];
+        let section = build_section_authored(&authored, "me");
+
+        let prefix = |num: u64| -> String {
+            section
+                .rows
+                .iter()
+                .find_map(|r| match r {
+                    Row::Pr {
+                        pr,
+                        tree_prefix: Some(tp),
+                        ..
+                    } if pr.number == num => Some(tp.clone()),
+                    _ => None,
+                })
+                .expect("pr present with prefix")
+        };
+        // A: sole root → `└─`; child base is five spaces.
+        assert_eq!(prefix(1), "  └─ ");
+        // B1: first of A's two children → `├─`, no ancestor bar (A is last).
+        assert_eq!(prefix(2), "     ├─ ");
+        // B2: last child → `└─`.
+        assert_eq!(prefix(4), "     └─ ");
+        // C: only child of B1. B1 is *not* last, so its column keeps a `│`
+        // bar, then C's own `└─`.
+        assert_eq!(prefix(3), "     │  └─ ");
+    }
+
+    #[test]
     fn console_render_no_color_has_no_escape_bytes() {
         let viewer = "me";
         let authored = vec![pr("o/r", 1, viewer, false, 100, vec![user("alice", true)])];
@@ -1194,10 +1340,107 @@ mod tests {
             }
             .is_selectable()
         );
+        let cm = comment("carol", "add a test", Some("src/foo.rs"), false);
+        assert!(
+            Row::Comment {
+                c: &cm,
+                tree_prefix: "  ".to_string(),
+            }
+            .is_selectable()
+        );
         assert!(!Row::ReleaseEmpty.is_selectable());
         assert!(!Row::RepoHeader("o/r".to_string()).is_selectable());
         assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
         assert!(!Row::SubGroupLabel("Authored").is_selectable());
         assert!(!Row::MergedPr { pr: &p, now }.is_selectable());
+        assert!(
+            !Row::SectionHeader {
+                label: "Reviewers",
+                tree_prefix: "  ".to_string(),
+            }
+            .is_selectable()
+        );
+    }
+
+    #[test]
+    fn build_section_authored_suppresses_lone_header() {
+        // A single PR with only reviewers (one non-empty section) → no header,
+        // reviewers hang directly under the PR.
+        let p = pr("o/r", 1, "me", false, 100, vec![user("alice", true)]);
+        let authored = vec![p];
+        let section = build_section_authored(&authored, "me");
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::SectionHeader { .. })),
+            "reviewers-only PR must not emit a section header",
+        );
+        // The reviewer hangs at the PR's child base with a `└─` connector.
+        let rev_prefix = section.rows.iter().find_map(|r| match r {
+            Row::Reviewer {
+                tree_prefix: Some(tp),
+                ..
+            } => Some(tp.clone()),
+            _ => None,
+        });
+        assert_eq!(rev_prefix.as_deref(), Some("     └─ "));
+    }
+
+    #[test]
+    fn build_section_authored_emits_headers_for_multi_section() {
+        // A PR with reviewers AND open comments (two non-empty sections) →
+        // headers appear, each at the child base with no connector; items hang
+        // below with their own connectors restarting per section.
+        let mut p = pr("o/r", 1, "me", false, 100, vec![user("alice", true)]);
+        p.unresolved_comments = vec![
+            comment("carol", "add a test here", Some("src/foo.rs"), false),
+            comment("dave", "nit: rename", None, true),
+        ];
+        let authored = vec![p];
+        let section = build_section_authored(&authored, "me");
+
+        // Root PR at the two-space base → child base is "     " (2 + 3).
+        let child_base = "     ";
+
+        let headers: Vec<(&str, String)> = section
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::SectionHeader { label, tree_prefix } => Some((*label, tree_prefix.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                ("Reviewers", child_base.to_string()),
+                ("Open comments", child_base.to_string()),
+            ],
+        );
+
+        // The lone reviewer restarts numbering: `└─`.
+        let rev_prefix = section.rows.iter().find_map(|r| match r {
+            Row::Reviewer {
+                tree_prefix: Some(tp),
+                ..
+            } => Some(tp.clone()),
+            _ => None,
+        });
+        assert_eq!(rev_prefix.as_deref(), Some("     └─ "));
+
+        // Two comments: first `├─`, second `└─`, both at child base.
+        let comment_prefixes: Vec<String> = section
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Comment { tree_prefix, .. } => Some(tree_prefix.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            comment_prefixes,
+            vec!["     ├─ ".to_string(), "     └─ ".to_string()],
+        );
     }
 }

@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{Pr, ReleaseInfo, ReviewState, ReviewerStatus, TagInfo, human_age},
+    model::{Pr, PrComment, ReleaseInfo, ReviewState, ReviewerStatus, TagInfo, human_age},
     report::{self, Row, Section},
 };
 
@@ -194,6 +194,11 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             tree_prefix.as_deref(),
         )),
         Row::Reviewer { r, tree_prefix } => ListItem::new(reviewer_line(r, tree_prefix.as_deref())),
+        Row::SectionHeader { label, tree_prefix } => ListItem::new(Line::from(Span::styled(
+            format!("{tree_prefix}{label}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
+        Row::Comment { c, tree_prefix } => ListItem::new(comment_line(c, tree_prefix)),
         Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
         Row::ReleaseTag { tag, now, .. } => ListItem::new(release_tag_line(tag, *now)),
@@ -379,6 +384,33 @@ fn reviewer_line(r: &ReviewerStatus, tree_prefix: Option<&str>) -> Line<'static>
     } else {
         spans.push(Span::styled(
             "  (reviewed)",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn comment_line(c: &PrComment, tree_prefix: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(
+            tree_prefix.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("@{} ", c.author),
+            Style::default().fg(color_for_login(&c.author)),
+        ),
+        Span::raw(c.body.clone()),
+    ];
+    if let Some(path) = &c.path {
+        spans.push(Span::styled(
+            format!(" ({path})"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if c.is_outdated {
+        spans.push(Span::styled(
+            " [outdated]",
             Style::default().add_modifier(Modifier::DIM),
         ));
     }

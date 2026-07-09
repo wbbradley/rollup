@@ -11,7 +11,7 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
     github::{self, Data},
-    model::{Pr, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
+    model::{Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
     report::{self, Row, Section},
     ui,
 };
@@ -218,40 +218,49 @@ impl AppState {
             ViewMode::People => &mut self.people_sel,
         }
     }
+}
 
-    /// Walk the current section's selectable rows, tracking each PR's parent
-    /// (so reviewer rows can locate their PR), and invoke `f` on the selected
-    /// row. `f` receives the parent PR plus `Some(reviewer)` for reviewer
-    /// rows and `None` for PR rows. Returns whatever `f` returned, or `None`
-    /// if the selection is out of range.
-    fn with_selected<R>(
-        &self,
-        mut f: impl FnMut(&Pr, Option<&ReviewerStatus>) -> Option<R>,
-    ) -> Option<R> {
-        let section = self.current_section();
-        let sel = self.current_sel();
-        let mut idx = 0usize;
-        let mut current_pr: Option<&Pr> = None;
-        for row in &section.rows {
-            match row {
-                Row::Pr { pr, .. } => {
-                    current_pr = Some(pr);
-                    if idx == sel {
-                        return f(pr, None);
-                    }
-                    idx += 1;
+/// The row the user has selected, resolved to a semantic target.
+enum Selected<'a> {
+    Pr(&'a Pr),
+    Reviewer(&'a Pr, &'a ReviewerStatus),
+    Comment(&'a PrComment),
+}
+
+/// Walk `rows`' selectable entries, tracking each PR's parent (so reviewer rows
+/// can locate their PR), and return the `sel`-th selectable row as a
+/// [`Selected`]. A free function (not an `&self` method) so it borrows the
+/// caller-owned `Section` local, keeping the returned `'a` references tied to
+/// it. It counts Pr, Reviewer, **and** Comment rows so its index stays in
+/// lock-step with `ui`'s `is_selectable()` count; `SectionHeader` is skipped.
+fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
+    let mut idx = 0usize;
+    let mut current_pr: Option<&'a Pr> = None;
+    for row in rows {
+        match row {
+            Row::Pr { pr, .. } => {
+                current_pr = Some(pr);
+                if idx == sel {
+                    return Some(Selected::Pr(pr));
                 }
-                Row::Reviewer { r, .. } => {
-                    if idx == sel {
-                        return current_pr.and_then(|pr| f(pr, Some(r)));
-                    }
-                    idx += 1;
-                }
-                _ => {}
+                idx += 1;
             }
+            Row::Reviewer { r, .. } => {
+                if idx == sel {
+                    return current_pr.map(|pr| Selected::Reviewer(pr, r));
+                }
+                idx += 1;
+            }
+            Row::Comment { c, .. } => {
+                if idx == sel {
+                    return Some(Selected::Comment(c));
+                }
+                idx += 1;
+            }
+            _ => {}
         }
-        None
     }
+    None
 }
 
 fn count_selectable(section: &Section<'_>) -> usize {
@@ -399,23 +408,32 @@ fn open_selected(state: &AppState) {
         }
         return;
     }
-    let url = state.with_selected(|pr, _| Some(pr.url.clone()));
+    let section = state.current_section();
+    let url = match selected_row(&section.rows, state.current_sel()) {
+        Some(Selected::Pr(pr)) | Some(Selected::Reviewer(pr, _)) => Some(pr.url.clone()),
+        Some(Selected::Comment(c)) => Some(c.url.clone()),
+        None => None,
+    };
     if let Some(url) = url {
         let _ = open::that(url);
     }
 }
 
 fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
-    let extracted = state.with_selected(|pr, rv| {
-        let rv = rv?;
-        Some((
+    let section = state.current_section();
+    // Extract owned copies for the reviewer case only; anything else is a
+    // no-op. The owned clones let the immutable borrow of `section` end (NLL)
+    // before we write `state.status`.
+    let extracted = match selected_row(&section.rows, state.current_sel()) {
+        Some(Selected::Reviewer(pr, rv)) => Some((
             pr.repo.clone(),
             pr.number,
             rv.login.clone(),
             rv.kind,
             rv.requested,
-        ))
-    });
+        )),
+        _ => None,
+    };
     let Some((repo_full, number, login, kind, requested)) = extracted else {
         state.status = Some("x: select a reviewer row first".into());
         return;
@@ -449,4 +467,69 @@ fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
         };
         let _ = tx.send(Msg::Action { label, result });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::model::{ReviewState, ReviewerKind};
+
+    fn authored_pr_with_reviewer_and_comment() -> Pr {
+        Pr {
+            number: 12,
+            title: "Fix the thing".to_string(),
+            url: "https://github.com/o/r/pull/12".to_string(),
+            is_draft: false,
+            repo: "o/r".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "feature".to_string(),
+            author: "me".to_string(),
+            reviewers: vec![ReviewerStatus {
+                login: "alice".to_string(),
+                kind: ReviewerKind::User,
+                state: ReviewState::NoReview,
+                requested: true,
+            }],
+            updated_at: chrono::Utc.timestamp_opt(100, 0).unwrap(),
+            merged_at: None,
+            unresolved_comments: vec![PrComment {
+                author: "carol".to_string(),
+                body: "add a test here".to_string(),
+                url: "https://github.com/o/r/pull/12#discussion_r1".to_string(),
+                path: Some("src/foo.rs".to_string()),
+                is_outdated: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn selected_row_maps_pr_reviewer_and_comment() {
+        // A PR with a reviewer AND a comment → two sections → headers shown.
+        // Selectable rows in order: Pr (0), Reviewer (1), Comment (2).
+        let authored = vec![authored_pr_with_reviewer_and_comment()];
+        let section = report::build_section_authored(&authored, "me");
+
+        match selected_row(&section.rows, 0) {
+            Some(Selected::Pr(pr)) => assert_eq!(pr.number, 12),
+            _ => panic!("index 0 should be the PR"),
+        }
+        match selected_row(&section.rows, 1) {
+            Some(Selected::Reviewer(pr, rv)) => {
+                assert_eq!(pr.number, 12);
+                assert_eq!(rv.login, "alice");
+            }
+            _ => panic!("index 1 should be the reviewer"),
+        }
+        match selected_row(&section.rows, 2) {
+            Some(Selected::Comment(c)) => {
+                assert_eq!(c.url, "https://github.com/o/r/pull/12#discussion_r1");
+                assert_eq!(c.author, "carol");
+            }
+            _ => panic!("index 2 should be the comment"),
+        }
+        // Out of range → None.
+        assert!(selected_row(&section.rows, 3).is_none());
+    }
 }

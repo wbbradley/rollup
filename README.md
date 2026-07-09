@@ -65,9 +65,24 @@ Within each repo, the `Authored by me` pane nests your PRs by **merge target**:
 a PR whose base branch is another of your PRs' branch is drawn as a child of
 that PR, with `├─`/`└─`/`│` connectors — so stacked PRs read at a glance. A PR
 that targets a branch you don't have an open PR for (e.g. `main`) sits at the
-top level under its repo header. Reviewer sub-rows hang beneath their PR as
-usual. Navigation and `Enter`-to-open work across the nested rows unchanged.
-The same shape appears in `rollup report`.
+top level under its repo header.
+
+Under each PR its children are grouped into up to three ordered sections:
+
+1. **Reviewers** — where each reviewer stands (see the glyph table above).
+2. **Open comments** — the first comment of every *unresolved* review thread
+   (`isResolved == false`), shown as `@author excerpt (path)`. Threads whose
+   diff hunk has moved or collapsed are still listed, tagged `[outdated]`.
+3. **Stacked PRs** — PRs stacked on this one, each recursing into its own
+   sections.
+
+Only non-empty sections appear, in that order. When a PR has two or more
+non-empty sections, each gets a dim header; when it has exactly one, the header
+is suppressed and the items hang directly under the PR (e.g. a reviewers-only
+PR looks unchanged). `Enter` on a comment opens that comment's permalink;
+`Enter` on a PR or reviewer opens the PR. Navigation and selection work across
+all the nested rows (section headers are not landable). The same shape appears
+in `rollup report`.
 
 ## Config
 

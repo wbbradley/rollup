@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+- `Authored by me` pane now groups each PR's children into up to three ordered sections — **Reviewers**, **Open comments**, **Stacked PRs** — drawn as a classic ASCII tree. A PR with two or more non-empty sections shows a dim header per section; a PR with exactly one shows no header and hangs its items directly (the previous reviewers-only look). `Open comments` lists the first comment of every unresolved review thread (`@author excerpt (path)`), including outdated ones tagged `[outdated]`; `Enter` on a comment opens its permalink. Applies to both the TUI and `rollup report`.
+
 ### Changed
 - `Authored by me` pane now nests PRs into a merge-target tree: a PR whose base branch is another of your open PRs' branch renders as a child of that PR, with `├─`/`└─`/`│` connectors. PRs targeting a branch you don't have an open PR for (e.g. `main`) stay at the top level under their repo header. The flat single-PR case gains the same connector glyphs. Applies to both the TUI and `rollup report`.
 

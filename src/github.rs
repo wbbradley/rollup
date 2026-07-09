@@ -7,7 +7,8 @@ use serde::Deserialize;
 use crate::{
     config,
     model::{
-        self, Pr, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, TagInfo,
+        self, Pr, PrComment, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerKind,
+        ReviewerStatus, TagInfo,
     },
 };
 
@@ -15,7 +16,7 @@ const QUERY: &str = r#"
 query {
   viewer { login }
   authored: search(query: "is:pr is:open author:@me archived:false", type: ISSUE, first: 100) {
-    nodes { ...PrFields }
+    nodes { ...AuthoredPrFields }
   }
   reviewing: search(query: "is:pr is:open review-requested:@me archived:false", type: ISSUE, first: 100) {
     nodes { ...PrFields }
@@ -44,6 +45,19 @@ fragment PrFields on PullRequest {
   }
   latestReviews(first: 20) {
     nodes { author { login } state }
+  }
+}
+
+fragment AuthoredPrFields on PullRequest {
+  ...PrFields
+  reviewThreads(first: 50) {
+    nodes {
+      isResolved
+      isOutdated
+      comments(first: 1) {
+        nodes { author { login } bodyText url path }
+      }
+    }
   }
 }
 "#;
@@ -330,6 +344,36 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc));
 
+    // Only the `authored:` query fetches `reviewThreads`; reviewing/merged nodes
+    // leave it `None`, so their `unresolved_comments` come out empty. Surface the
+    // first comment of each unresolved thread (including outdated ones).
+    let mut unresolved_comments: Vec<PrComment> = Vec::new();
+    if let Some(threads) = node.review_threads {
+        for thread in threads.nodes {
+            if thread.is_resolved {
+                continue;
+            }
+            let Some(comment) = thread.comments.and_then(|c| c.nodes.into_iter().next()) else {
+                continue;
+            };
+            let url = comment.url.unwrap_or_default();
+            if url.is_empty() {
+                continue;
+            }
+            let path = comment.path.filter(|p| !p.is_empty());
+            unresolved_comments.push(PrComment {
+                author: comment
+                    .author
+                    .map(|a| a.login)
+                    .unwrap_or_else(|| "ghost".into()),
+                body: excerpt(&comment.body_text.unwrap_or_default()),
+                url,
+                path,
+                is_outdated: thread.is_outdated,
+            });
+        }
+    }
+
     Some(Pr {
         number,
         title: node.title.unwrap_or_default(),
@@ -345,7 +389,27 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         reviewers,
         updated_at,
         merged_at,
+        unresolved_comments,
     })
+}
+
+/// Max characters kept from a review-thread comment's first line for display.
+const COMMENT_EXCERPT_MAX: usize = 60;
+
+/// A short, single-line excerpt of a review comment body: the first non-empty
+/// line, trimmed, char-truncated to [`COMMENT_EXCERPT_MAX`] with a trailing `…`.
+fn excerpt(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= COMMENT_EXCERPT_MAX {
+        return line.to_string();
+    }
+    let mut s: String = line.chars().take(COMMENT_EXCERPT_MAX - 1).collect();
+    s.push('…');
+    s
 }
 
 #[derive(Deserialize)]
@@ -402,6 +466,38 @@ struct PrNode {
     review_requests: Option<ReviewRequests>,
     #[serde(rename = "latestReviews")]
     latest_reviews: Option<LatestReviews>,
+    #[serde(rename = "reviewThreads")]
+    review_threads: Option<ReviewThreads>,
+}
+
+#[derive(Deserialize)]
+struct ReviewThreads {
+    nodes: Vec<ReviewThreadNode>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReviewThreadNode {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    #[serde(rename = "isOutdated")]
+    is_outdated: bool,
+    comments: Option<ThreadComments>,
+}
+
+#[derive(Deserialize)]
+struct ThreadComments {
+    nodes: Vec<ThreadCommentNode>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ThreadCommentNode {
+    author: Option<AuthorNode>,
+    #[serde(rename = "bodyText")]
+    body_text: Option<String>,
+    url: Option<String>,
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -876,5 +972,84 @@ mod tests {
         assert_eq!(escape_graphql_string("plain"), "plain");
         assert_eq!(escape_graphql_string("a\"b"), "a\\\"b");
         assert_eq!(escape_graphql_string("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn node_to_pr_keeps_unresolved_threads_including_outdated() {
+        // Three threads: resolved (dropped), unresolved (kept), and
+        // unresolved+outdated (kept with the [outdated] flag).
+        let json = r#"{
+            "number": 12,
+            "title": "Fix the thing",
+            "url": "https://github.com/o/r/pull/12",
+            "repository": { "nameWithOwner": "o/r" },
+            "author": { "login": "me" },
+            "reviewThreads": { "nodes": [
+                {
+                    "isResolved": true,
+                    "isOutdated": false,
+                    "comments": { "nodes": [
+                        { "author": { "login": "resolved-guy" }, "bodyText": "done", "url": "https://x/1", "path": "src/a.rs" }
+                    ]}
+                },
+                {
+                    "isResolved": false,
+                    "isOutdated": false,
+                    "comments": { "nodes": [
+                        { "author": { "login": "carol" }, "bodyText": "add a test here", "url": "https://x/2", "path": "src/foo.rs" }
+                    ]}
+                },
+                {
+                    "isResolved": false,
+                    "isOutdated": true,
+                    "comments": { "nodes": [
+                        { "author": { "login": "dave" }, "bodyText": "nit: rename", "url": "https://x/3", "path": "" }
+                    ]}
+                }
+            ]}
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).expect("pr parsed");
+        assert_eq!(pr.unresolved_comments.len(), 2);
+
+        let carol = &pr.unresolved_comments[0];
+        assert_eq!(carol.author, "carol");
+        assert_eq!(carol.body, "add a test here");
+        assert_eq!(carol.url, "https://x/2");
+        assert_eq!(carol.path.as_deref(), Some("src/foo.rs"));
+        assert!(!carol.is_outdated);
+
+        let dave = &pr.unresolved_comments[1];
+        assert_eq!(dave.author, "dave");
+        assert!(dave.is_outdated);
+        // Empty path collapses to None.
+        assert_eq!(dave.path, None);
+    }
+
+    #[test]
+    fn node_to_pr_skips_threads_without_first_comment_or_url() {
+        let json = r#"{
+            "number": 5,
+            "repository": { "nameWithOwner": "o/r" },
+            "reviewThreads": { "nodes": [
+                { "isResolved": false, "isOutdated": false, "comments": { "nodes": [] } },
+                { "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+                    { "author": { "login": "eve" }, "bodyText": "hmm", "url": "", "path": null }
+                ]}}
+            ]}
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).expect("pr parsed");
+        assert!(pr.unresolved_comments.is_empty());
+    }
+
+    #[test]
+    fn excerpt_takes_first_nonempty_line_and_truncates() {
+        assert_eq!(excerpt(""), "");
+        assert_eq!(excerpt("\n\n  hello  \nworld"), "hello");
+        let long = "x".repeat(100);
+        let e = excerpt(&long);
+        assert_eq!(e.chars().count(), COMMENT_EXCERPT_MAX);
+        assert!(e.ends_with('…'));
     }
 }
