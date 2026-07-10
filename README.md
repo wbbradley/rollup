@@ -31,6 +31,7 @@ rollup
 | Key             | Action                                                |
 |-----------------|-------------------------------------------------------|
 | `↑` `↓` `k` `j` | Move selection (PR rows *and* reviewer sub-rows)      |
+| `l` / `h`       | Expand / collapse the selected section (Authored pane; Right/Left also work) |
 | `g` / `G`       | Jump to top / bottom of the pane                      |
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
@@ -77,13 +78,18 @@ Under each PR its children are grouped into up to three ordered sections:
 3. **Stacked PRs** — PRs stacked on this one, each recursing into its own
    sections.
 
-Only non-empty sections appear, in that order. When a PR has two or more
-non-empty sections, each gets a dim header; when it has exactly one, the header
-is suppressed and the items hang directly under the PR (e.g. a reviewers-only
-PR looks unchanged). `Enter` on a comment opens that comment's permalink;
-`Enter` on a PR or reviewer opens the PR. Navigation and selection work across
-all the nested rows (section headers are not landable). The same shape appears
-in `rollup report`.
+Only non-empty sections appear, in that order. Every non-empty section shows a
+selectable `▸`/`▾` header that is also a **collapse control**: `l`/Right expands
+it, `h`/Left collapses it. `h`/Left on a child row (reviewer, comment, or nested
+PR) collapses its enclosing section and moves the cursor back to that section's
+header. **Reviewers is collapsed by default** (the other two start expanded), and
+its header carries a compact response-state summary — e.g. `▸ Reviewers [req, ✗
+changes]` — so a changes-requested review (`✗`) is visible at a glance without
+expanding. Collapse state is per-`(PR, section)` and survives background
+refreshes. `Enter` on a comment opens that comment's permalink; `Enter` on a PR,
+reviewer, or section header opens the PR. The same shape appears in `rollup
+report` (rendered at the default collapse state, with text tokens in the
+summary).
 
 ## Config
 

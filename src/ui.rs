@@ -9,7 +9,7 @@ use ratatui::{
 use crate::{
     app::{AppState, Focus, ViewMode},
     model::{Pr, PrComment, ReleaseInfo, ReviewState, ReviewerStatus, TagInfo, human_age},
-    report::{self, Row, Section},
+    report::{self, ReviewerSummaryToken, Row, Section, SectionId},
 };
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
@@ -23,7 +23,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     match state.mode {
         ViewMode::Me => {
-            let authored_section = report::build_section_authored(&state.authored, &viewer_str);
+            let authored_section =
+                report::build_section_authored(&state.authored, &viewer_str, &state.toggled);
             draw_section(
                 f,
                 top,
@@ -186,25 +187,24 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             pr,
             hide_author_if,
             tree_prefix,
+            ..
         } => ListItem::new(pr_line(
             pr,
             hide_author_if.as_deref(),
             tree_prefix.as_deref(),
         )),
         Row::Reviewer { r, tree_prefix } => ListItem::new(reviewer_line(r, tree_prefix.as_deref())),
-        Row::SectionHeader { label, tree_prefix } => {
-            let style = if *label == "Open comments" {
-                Style::default()
-                    .fg(Color::Rgb(255, 140, 0))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().add_modifier(Modifier::DIM)
-            };
-            ListItem::new(Line::from(Span::styled(
-                format!("{tree_prefix}{label}"),
-                style,
-            )))
-        }
+        Row::SectionHeader {
+            section,
+            expanded,
+            summary,
+            tree_prefix,
+        } => ListItem::new(section_header_line(
+            *section,
+            *expanded,
+            summary,
+            tree_prefix,
+        )),
         Row::Comment { c, tree_prefix } => ListItem::new(comment_line(c, tree_prefix)),
         Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
@@ -397,6 +397,60 @@ fn reviewer_line(r: &ReviewerStatus, tree_prefix: Option<&str>) -> Line<'static>
     Line::from(spans)
 }
 
+fn section_header_line(
+    section: SectionId,
+    expanded: bool,
+    summary: &[ReviewerSummaryToken],
+    tree_prefix: &str,
+) -> Line<'static> {
+    let glyph = if expanded { "▾" } else { "▸" };
+    let label_style = if section == SectionId::Comments {
+        Style::default()
+            .fg(Color::Rgb(255, 140, 0))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(
+            tree_prefix.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("{glyph} "),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(section.label().to_string(), label_style),
+    ];
+    if !summary.is_empty() {
+        let bracket = Style::default().add_modifier(Modifier::DIM);
+        spans.push(Span::styled(" [", bracket));
+        for (i, token) in summary.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(", ", bracket));
+            }
+            spans.push(Span::styled(
+                token.tui_label().to_string(),
+                summary_token_style(*token),
+            ));
+        }
+        spans.push(Span::styled("]", bracket));
+    }
+    Line::from(spans)
+}
+
+fn summary_token_style(token: ReviewerSummaryToken) -> Style {
+    match token {
+        ReviewerSummaryToken::Requested => Style::default().fg(Color::Cyan),
+        ReviewerSummaryToken::Approved => Style::default().fg(Color::Green),
+        ReviewerSummaryToken::ChangesRequested => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        ReviewerSummaryToken::Commented => Style::default().fg(Color::Yellow),
+        ReviewerSummaryToken::Dismissed => Style::default().add_modifier(Modifier::DIM),
+    }
+}
+
 fn comment_line(c: &PrComment, tree_prefix: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
@@ -476,7 +530,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
 
     let hint = match state.mode {
         ViewMode::Me => {
-            "↑↓ move · Enter open · e radar · p people · r refresh · q quit   "
+            "↑↓ move · h/l collapse/expand · Enter open · e radar · p people · r refresh · q quit   "
         }
         ViewMode::Radar => {
             "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   "

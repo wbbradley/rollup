@@ -43,6 +43,112 @@ pub enum SectionKind {
     Releases,
 }
 
+/// The set of collapse-state *deviations from default* for the Authored pane's
+/// section nodes, keyed by stable PR identity `(repo, number)` plus the section
+/// kind. Rows are rebuilt every frame and carry no identity, so collapse state
+/// cannot live on a row — it lives here, on `AppState`, and survives refetches.
+/// A key present in the set means "opposite of this section's default".
+pub type ToggledSet = std::collections::HashSet<(String, u64, SectionId)>;
+
+/// Identifies one of a PR's three collapsible child sections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SectionId {
+    Reviewers,
+    Comments,
+    Stacked,
+}
+
+impl SectionId {
+    pub fn label(self) -> &'static str {
+        match self {
+            SectionId::Reviewers => "Reviewers",
+            SectionId::Comments => "Open comments",
+            SectionId::Stacked => "Stacked PRs",
+        }
+    }
+
+    /// Reviewers collapses by default (so a rejection reads from the summary
+    /// without scrolling); the other two start expanded.
+    pub fn default_expanded(self) -> bool {
+        !matches!(self, SectionId::Reviewers)
+    }
+}
+
+/// One distinct reviewer response-state token, shown as a set on the Reviewers
+/// header so a `✗ changes` is visible while the section is collapsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewerSummaryToken {
+    Requested,
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+}
+
+impl ReviewerSummaryToken {
+    pub fn tui_label(self) -> &'static str {
+        match self {
+            ReviewerSummaryToken::Requested => "req",
+            ReviewerSummaryToken::Approved => "✓ approved",
+            ReviewerSummaryToken::ChangesRequested => "✗ changes",
+            ReviewerSummaryToken::Commented => "◉ commented",
+            ReviewerSummaryToken::Dismissed => "⊘ dismissed",
+        }
+    }
+
+    pub fn console_label(self) -> &'static str {
+        match self {
+            ReviewerSummaryToken::Requested => "req",
+            ReviewerSummaryToken::Approved => "approved",
+            ReviewerSummaryToken::ChangesRequested => "changes-requested",
+            ReviewerSummaryToken::Commented => "commented",
+            ReviewerSummaryToken::Dismissed => "dismissed",
+        }
+    }
+}
+
+/// Whether a PR's section is currently expanded, given the deviation set.
+/// `default_expanded(id) XOR (key present)`.
+pub fn is_expanded(t: &ToggledSet, repo: &str, number: u64, id: SectionId) -> bool {
+    id.default_expanded() ^ t.contains(&(repo.to_string(), number, id))
+}
+
+/// Set a PR's section to `want` expanded/collapsed. Stored as a deviation from
+/// the section's default, so a key exists only when the state differs.
+pub fn set_expanded(t: &mut ToggledSet, repo: &str, number: u64, id: SectionId, want: bool) {
+    let key = (repo.to_string(), number, id);
+    if want != id.default_expanded() {
+        t.insert(key);
+    } else {
+        t.remove(&key);
+    }
+}
+
+/// The distinct reviewer response states present on a PR, stably ordered: `req`
+/// first (any reviewer still requested), then, for reviewers who have reviewed,
+/// each distinct verdict in the order approved, changes, commented, dismissed.
+/// `NoReview` contributes nothing on its own (only via `requested`).
+fn reviewer_summary(reviewers: &[ReviewerStatus]) -> Vec<ReviewerSummaryToken> {
+    let mut out: Vec<ReviewerSummaryToken> = Vec::new();
+    if reviewers.iter().any(|r| r.requested) {
+        out.push(ReviewerSummaryToken::Requested);
+    }
+    for (state, token) in [
+        (ReviewState::Approved, ReviewerSummaryToken::Approved),
+        (
+            ReviewState::ChangesRequested,
+            ReviewerSummaryToken::ChangesRequested,
+        ),
+        (ReviewState::Commented, ReviewerSummaryToken::Commented),
+        (ReviewState::Dismissed, ReviewerSummaryToken::Dismissed),
+    ] {
+        if reviewers.iter().any(|r| !r.requested && r.state == state) {
+            out.push(token);
+        }
+    }
+    out
+}
+
 pub enum Row<'a> {
     RepoHeader(String),
     PersonHeader(String),
@@ -53,16 +159,24 @@ pub enum Row<'a> {
         /// Full leading indent string for tree rendering (with `├`/`└`/`│`
         /// connectors). `None` in flat panes, which fall back to a fixed indent.
         tree_prefix: Option<String>,
+        /// For a stacked child PR in the Authored pane, the parent PR's number
+        /// (same repo), so `h` on the child collapses the parent's Stacked PRs
+        /// node. `None` for roots and in every other pane's builder.
+        stacked_under: Option<u64>,
     },
     Reviewer {
         r: &'a ReviewerStatus,
         /// Leading indent for tree rendering; `None` uses the fixed indent.
         tree_prefix: Option<String>,
     },
-    /// A flat, un-branched section label (e.g. "Reviewers") sitting at a PR's
-    /// child indent. Not selectable.
+    /// A selectable, collapsible section node (e.g. "Reviewers") sitting at a
+    /// PR's child indent. `l`/Right expands, `h`/Left collapses; its child rows
+    /// are only emitted when `expanded`. The display label comes from
+    /// `section.label()`. `summary` is non-empty only for Reviewers.
     SectionHeader {
-        label: &'static str,
+        section: SectionId,
+        expanded: bool,
+        summary: Vec<ReviewerSummaryToken>,
         tree_prefix: String,
     },
     /// An unresolved review-thread comment under a PR. Selectable; Enter opens
@@ -93,6 +207,7 @@ impl Row<'_> {
             self,
             Row::Pr { .. }
                 | Row::Reviewer { .. }
+                | Row::SectionHeader { .. }
                 | Row::Comment { .. }
                 | Row::ReleaseEntry { .. }
                 | Row::ReleaseTag { .. }
@@ -109,6 +224,7 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
                 pr,
                 hide_author_if: None,
                 tree_prefix: None,
+                stacked_under: None,
             });
             for r in &pr.reviewers {
                 rows.push(Row::Reviewer {
@@ -128,7 +244,11 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
     }
 }
 
-pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'a> {
+pub fn build_section_authored<'a>(
+    authored: &'a [Pr],
+    viewer: &str,
+    toggled: &ToggledSet,
+) -> Section<'a> {
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(authored) {
         rows.push(Row::RepoHeader(repo));
@@ -137,7 +257,7 @@ pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'
         let tree = authored_tree(&group_prs);
         let n = tree.len();
         for (i, node) in tree.iter().enumerate() {
-            push_pr(&mut rows, node, viewer, "  ", i + 1 == n);
+            push_pr(&mut rows, node, viewer, "  ", i + 1 == n, None, toggled);
         }
     }
     Section {
@@ -152,81 +272,105 @@ pub fn build_section_authored<'a>(authored: &'a [Pr], viewer: &str) -> Section<'
 
 /// Flatten one PR tree node (and its stacked children) into rows. Each PR's
 /// children are grouped into up to three ordered sections — Reviewers, Open
-/// comments, Stacked PRs — drawn with classic `├─`/`└─`/`│` connectors. A
-/// section header appears only when the PR has two or more non-empty sections
-/// (the lone section hangs its items directly under the PR).
+/// comments, Stacked PRs — drawn with classic `├─`/`└─`/`│` connectors. Every
+/// non-empty section always emits a selectable, collapsible `SectionHeader`;
+/// its child rows are emitted only when that `(repo, number, section)` is
+/// expanded per `toggled` (Reviewers collapsed by default, the others
+/// expanded).
+///
+/// `stacked_under` is the parent PR's number when this node is a stacked child
+/// (so `h` on the child can collapse the parent's Stacked PRs node); `None` for
+/// roots.
 ///
 /// `node: &PrTreeNode<'a>` yields `node.pr: &'a Pr`; iterating
 /// `node.pr.reviewers` / `node.pr.unresolved_comments` produces `&'a _`, so the
 /// rows carry `'a` references into `authored` and are independent of the local
 /// `tree` that may drop between loop iterations.
+#[allow(clippy::too_many_arguments)]
 fn push_pr<'a>(
     rows: &mut Vec<Row<'a>>,
     node: &PrTreeNode<'a>,
     viewer: &str,
     prefix: &str,
     is_last: bool,
+    stacked_under: Option<u64>,
+    toggled: &ToggledSet,
 ) {
     let connector = if is_last { "└─ " } else { "├─ " };
     rows.push(Row::Pr {
         pr: node.pr,
         hide_author_if: Some(viewer.to_string()),
         tree_prefix: Some(format!("{prefix}{connector}")),
+        stacked_under,
     });
     let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
-
-    let n_sections = (!node.pr.reviewers.is_empty()) as usize
-        + (!node.pr.unresolved_comments.is_empty()) as usize
-        + (!node.children.is_empty()) as usize;
-    let show_headers = n_sections > 1;
+    let repo = node.pr.repo.as_str();
+    let number = node.pr.number;
 
     // Reviewers section.
     if !node.pr.reviewers.is_empty() {
-        if show_headers {
-            rows.push(Row::SectionHeader {
-                label: "Reviewers",
-                tree_prefix: child_base.clone(),
-            });
-        }
-        let m = node.pr.reviewers.len();
-        for (i, r) in node.pr.reviewers.iter().enumerate() {
-            let c = if i + 1 == m { "└─ " } else { "├─ " };
-            rows.push(Row::Reviewer {
-                r,
-                tree_prefix: Some(format!("{child_base}{c}")),
-            });
+        let expanded = is_expanded(toggled, repo, number, SectionId::Reviewers);
+        rows.push(Row::SectionHeader {
+            section: SectionId::Reviewers,
+            expanded,
+            summary: reviewer_summary(&node.pr.reviewers),
+            tree_prefix: child_base.clone(),
+        });
+        if expanded {
+            let m = node.pr.reviewers.len();
+            for (i, r) in node.pr.reviewers.iter().enumerate() {
+                let c = if i + 1 == m { "└─ " } else { "├─ " };
+                rows.push(Row::Reviewer {
+                    r,
+                    tree_prefix: Some(format!("{child_base}{c}")),
+                });
+            }
         }
     }
 
     // Open comments section.
     if !node.pr.unresolved_comments.is_empty() {
-        if show_headers {
-            rows.push(Row::SectionHeader {
-                label: "Open comments",
-                tree_prefix: child_base.clone(),
-            });
-        }
-        let m = node.pr.unresolved_comments.len();
-        for (i, c) in node.pr.unresolved_comments.iter().enumerate() {
-            let conn = if i + 1 == m { "└─ " } else { "├─ " };
-            rows.push(Row::Comment {
-                c,
-                tree_prefix: format!("{child_base}{conn}"),
-            });
+        let expanded = is_expanded(toggled, repo, number, SectionId::Comments);
+        rows.push(Row::SectionHeader {
+            section: SectionId::Comments,
+            expanded,
+            summary: Vec::new(),
+            tree_prefix: child_base.clone(),
+        });
+        if expanded {
+            let m = node.pr.unresolved_comments.len();
+            for (i, c) in node.pr.unresolved_comments.iter().enumerate() {
+                let conn = if i + 1 == m { "└─ " } else { "├─ " };
+                rows.push(Row::Comment {
+                    c,
+                    tree_prefix: format!("{child_base}{conn}"),
+                });
+            }
         }
     }
 
     // Stacked PRs section.
     if !node.children.is_empty() {
-        if show_headers {
-            rows.push(Row::SectionHeader {
-                label: "Stacked PRs",
-                tree_prefix: child_base.clone(),
-            });
-        }
-        let m = node.children.len();
-        for (i, kid) in node.children.iter().enumerate() {
-            push_pr(rows, kid, viewer, &child_base, i + 1 == m);
+        let expanded = is_expanded(toggled, repo, number, SectionId::Stacked);
+        rows.push(Row::SectionHeader {
+            section: SectionId::Stacked,
+            expanded,
+            summary: Vec::new(),
+            tree_prefix: child_base.clone(),
+        });
+        if expanded {
+            let m = node.children.len();
+            for (i, kid) in node.children.iter().enumerate() {
+                push_pr(
+                    rows,
+                    kid,
+                    viewer,
+                    &child_base,
+                    i + 1 == m,
+                    Some(number),
+                    toggled,
+                );
+            }
         }
     }
 }
@@ -248,6 +392,7 @@ pub fn build_section_people<'a>(
                     pr,
                     hide_author_if: Some(person.login.clone()),
                     tree_prefix: None,
+                    stacked_under: None,
                 });
                 for r in &pr.reviewers {
                     rows.push(Row::Reviewer {
@@ -264,6 +409,7 @@ pub fn build_section_people<'a>(
                     pr,
                     hide_author_if: None,
                     tree_prefix: None,
+                    stacked_under: None,
                 });
                 for r in &pr.reviewers {
                     rows.push(Row::Reviewer {
@@ -353,13 +499,16 @@ pub fn build_full_report<'a>(
     let allowed: BTreeSet<String> = merged_fetch_authors(viewer, authored, reviewing)
         .into_iter()
         .collect();
+    // The console has no interactive state, so it renders at defaults:
+    // Reviewers collapsed, Open comments / Stacked PRs expanded.
+    let toggled = ToggledSet::new();
     Report {
         viewer,
         loaded_at,
         sections: vec![
             build_section_reviewing(reviewing),
             build_section_releases(releases, now),
-            build_section_authored(authored, viewer),
+            build_section_authored(authored, viewer, &toggled),
             build_section_people(authored, reviewing, viewer),
             build_section_merged(merged, &allowed, MERGED_PANE_CAP, now),
         ],
@@ -524,6 +673,7 @@ fn render_row(
             pr,
             hide_author_if,
             tree_prefix,
+            ..
         } => render_pr_line(
             pr,
             hide_author_if.as_deref(),
@@ -535,14 +685,12 @@ fn render_row(
         Row::Reviewer { r, tree_prefix } => {
             render_reviewer_line(r, tree_prefix.as_deref(), out, use_color)
         }
-        Row::SectionHeader { label, tree_prefix } => writeln!(
-            out,
-            "{}{}{}{}",
-            dim(use_color),
+        Row::SectionHeader {
+            section,
+            expanded,
+            summary,
             tree_prefix,
-            label,
-            reset(use_color),
-        ),
+        } => render_section_header_line(*section, *expanded, summary, tree_prefix, out, use_color),
         Row::Comment { c, tree_prefix } => render_comment_line(c, tree_prefix, out, use_color),
         Row::MergedPr { pr, now } => render_merged_pr_line(pr, *now, out, use_color, width),
         Row::ReleaseEntry { release, now } => {
@@ -556,6 +704,37 @@ fn render_row(
             reset(use_color),
         ),
     }
+}
+
+fn render_section_header_line(
+    section: SectionId,
+    expanded: bool,
+    summary: &[ReviewerSummaryToken],
+    tree_prefix: &str,
+    out: &mut impl Write,
+    use_color: bool,
+) -> io::Result<()> {
+    let glyph = if expanded { "▾" } else { "▸" };
+    write!(
+        out,
+        "{}{}{} {}{}",
+        dim(use_color),
+        tree_prefix,
+        glyph,
+        section.label(),
+        reset(use_color),
+    )?;
+    if !summary.is_empty() {
+        let tokens: Vec<&str> = summary.iter().map(|t| t.console_label()).collect();
+        write!(
+            out,
+            " {}[{}]{}",
+            dim(use_color),
+            tokens.join(", "),
+            reset(use_color),
+        )?;
+    }
+    writeln!(out)
 }
 
 fn render_release_entry_line(
@@ -926,6 +1105,17 @@ mod tests {
         }
     }
 
+    /// A reviewer who has already reviewed (`requested == false`) with a given
+    /// verdict — used to exercise the response-state summary.
+    fn reviewed(login: &str, state: ReviewState) -> ReviewerStatus {
+        ReviewerStatus {
+            login: login.to_string(),
+            kind: ReviewerKind::User,
+            state,
+            requested: false,
+        }
+    }
+
     #[test]
     fn build_section_reviewing_row_order() {
         let prs = vec![
@@ -1121,11 +1311,12 @@ mod tests {
         let b = pr_refs("o/r", 2, "a", "b");
         let c = pr_refs("o/r", 3, "main", "c");
         let authored = vec![a, b, c];
-        let section = build_section_authored(&authored, "me");
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
         assert_eq!(section.kind, SectionKind::MeAuthored);
         assert_eq!(section.count, 3);
 
-        // Pre-order: header, then A, its child B, then sibling root C.
+        // Pre-order: repo header, A, A's (default-expanded) Stacked PRs header,
+        // its child B, then sibling root C.
         let seq: Vec<String> = section
             .rows
             .iter()
@@ -1133,10 +1324,11 @@ mod tests {
                 Row::RepoHeader(h) => format!("H:{h}"),
                 Row::Pr { pr, .. } => format!("P:{}", pr.number),
                 Row::Reviewer { r, .. } => format!("R:{}", r.login),
+                Row::SectionHeader { section, .. } => format!("S:{}", section.label()),
                 _ => "?".into(),
             })
             .collect();
-        assert_eq!(seq, vec!["H:o/r", "P:1", "P:2", "P:3"]);
+        assert_eq!(seq, vec!["H:o/r", "P:1", "S:Stacked PRs", "P:2", "P:3"]);
 
         // Grab each PR's tree prefix by number.
         let prefix = |num: u64| -> String {
@@ -1175,7 +1367,7 @@ mod tests {
         // Sort within the repo is stable at equal update times, so input order
         // (a, b1, c, b2) is preserved and B1 precedes B2 as A's children.
         let authored = vec![a, b1, c, b2];
-        let section = build_section_authored(&authored, "me");
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
 
         let prefix = |num: u64| -> String {
             section
@@ -1315,6 +1507,7 @@ mod tests {
                 pr: &p,
                 hide_author_if: None,
                 tree_prefix: None,
+                stacked_under: None,
             }
             .is_selectable()
         );
@@ -1353,9 +1546,12 @@ mod tests {
         assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
         assert!(!Row::SubGroupLabel("Authored").is_selectable());
         assert!(!Row::MergedPr { pr: &p, now }.is_selectable());
+        // Section headers are now selectable collapse controls.
         assert!(
-            !Row::SectionHeader {
-                label: "Reviewers",
+            Row::SectionHeader {
+                section: SectionId::Reviewers,
+                expanded: false,
+                summary: vec![ReviewerSummaryToken::Requested],
                 tree_prefix: "  ".to_string(),
             }
             .is_selectable()
@@ -1363,73 +1559,85 @@ mod tests {
     }
 
     #[test]
-    fn build_section_authored_suppresses_lone_header() {
-        // A single PR with only reviewers (one non-empty section) → no header,
-        // reviewers hang directly under the PR.
+    fn build_section_authored_always_emits_reviewers_header_collapsed_by_default() {
+        // A single PR with only reviewers now ALWAYS emits a Reviewers header,
+        // collapsed by default: the header shows (with a non-empty summary) but
+        // no Reviewer rows are emitted.
         let p = pr("o/r", 1, "me", false, 100, vec![user("alice", true)]);
         let authored = vec![p];
-        let section = build_section_authored(&authored, "me");
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
+
+        let header = section.rows.iter().find_map(|r| match r {
+            Row::SectionHeader {
+                section: SectionId::Reviewers,
+                expanded,
+                summary,
+                ..
+            } => Some((*expanded, summary.clone())),
+            _ => None,
+        });
+        let (expanded, summary) = header.expect("reviewers-only PR must emit a Reviewers header");
+        assert!(!expanded, "Reviewers is collapsed by default");
+        assert!(
+            !summary.is_empty(),
+            "summary carries the response-state set"
+        );
         assert!(
             !section
                 .rows
                 .iter()
-                .any(|r| matches!(r, Row::SectionHeader { .. })),
-            "reviewers-only PR must not emit a section header",
+                .any(|r| matches!(r, Row::Reviewer { .. })),
+            "collapsed Reviewers emits no reviewer rows",
         );
-        // The reviewer hangs at the PR's child base with a `└─` connector.
-        let rev_prefix = section.rows.iter().find_map(|r| match r {
-            Row::Reviewer {
-                tree_prefix: Some(tp),
-                ..
-            } => Some(tp.clone()),
-            _ => None,
-        });
-        assert_eq!(rev_prefix.as_deref(), Some("     └─ "));
     }
 
     #[test]
     fn build_section_authored_emits_headers_for_multi_section() {
-        // A PR with reviewers AND open comments (two non-empty sections) →
-        // headers appear, each at the child base with no connector; items hang
-        // below with their own connectors restarting per section.
+        // A PR with reviewers AND open comments → both headers appear at the
+        // child base. Reviewers is collapsed by default (no reviewer rows); Open
+        // comments is expanded by default (comment rows present with connectors).
         let mut p = pr("o/r", 1, "me", false, 100, vec![user("alice", true)]);
         p.unresolved_comments = vec![
             comment("carol", "add a test here", Some("src/foo.rs"), false),
             comment("dave", "nit: rename", None, true),
         ];
         let authored = vec![p];
-        let section = build_section_authored(&authored, "me");
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
 
         // Root PR at the two-space base → child base is "     " (2 + 3).
         let child_base = "     ";
 
-        let headers: Vec<(&str, String)> = section
+        let headers: Vec<(SectionId, bool, String)> = section
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::SectionHeader { label, tree_prefix } => Some((*label, tree_prefix.clone())),
+                Row::SectionHeader {
+                    section,
+                    expanded,
+                    tree_prefix,
+                    ..
+                } => Some((*section, *expanded, tree_prefix.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(
             headers,
             vec![
-                ("Reviewers", child_base.to_string()),
-                ("Open comments", child_base.to_string()),
+                (SectionId::Reviewers, false, child_base.to_string()),
+                (SectionId::Comments, true, child_base.to_string()),
             ],
         );
 
-        // The lone reviewer restarts numbering: `└─`.
-        let rev_prefix = section.rows.iter().find_map(|r| match r {
-            Row::Reviewer {
-                tree_prefix: Some(tp),
-                ..
-            } => Some(tp.clone()),
-            _ => None,
-        });
-        assert_eq!(rev_prefix.as_deref(), Some("     └─ "));
+        // Reviewers collapsed → no reviewer rows.
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Reviewer { .. })),
+            "collapsed Reviewers emits no reviewer rows",
+        );
 
-        // Two comments: first `├─`, second `└─`, both at child base.
+        // Open comments expanded → two comments: first `├─`, second `└─`.
         let comment_prefixes: Vec<String> = section
             .rows
             .iter()
@@ -1442,5 +1650,119 @@ mod tests {
             comment_prefixes,
             vec!["     ├─ ".to_string(), "     └─ ".to_string()],
         );
+    }
+
+    #[test]
+    fn build_section_authored_default_collapse_reveals_comments_and_stacked() {
+        // A root PR with reviewers + comments, plus a stacked child PR. At
+        // defaults: Reviewers collapsed (no reviewer rows), Open comments and
+        // Stacked PRs expanded (comment rows and the nested PR present).
+        let mut a = pr_refs("o/r", 1, "main", "a");
+        a.reviewers = vec![user("alice", true)];
+        a.unresolved_comments = vec![comment("carol", "please fix", Some("src/x.rs"), false)];
+        let b = pr_refs("o/r", 2, "a", "b");
+        let authored = vec![a, b];
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
+
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Reviewer { .. })),
+            "Reviewers collapsed by default",
+        );
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Comment { .. })),
+            "Open comments expanded by default",
+        );
+        // The nested child PR #2 is present (Stacked PRs expanded by default).
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Pr { pr, .. } if pr.number == 2)),
+            "Stacked PRs expanded by default",
+        );
+    }
+
+    #[test]
+    fn build_section_authored_expand_reviewers_reveals_rows() {
+        let p = pr("o/r", 1, "me", false, 100, vec![user("alice", true)]);
+        let authored = vec![p];
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Reviewers, true);
+        let section = build_section_authored(&authored, "me", &toggled);
+
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Reviewer { .. })),
+            "expanding Reviewers reveals reviewer rows",
+        );
+        let expanded = section.rows.iter().any(|r| {
+            matches!(
+                r,
+                Row::SectionHeader {
+                    section: SectionId::Reviewers,
+                    expanded: true,
+                    ..
+                }
+            )
+        });
+        assert!(expanded, "header reflects expanded state");
+    }
+
+    #[test]
+    fn build_section_authored_collapse_comments_hides_rows_keeps_header() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.unresolved_comments = vec![comment("carol", "fix", None, false)];
+        let authored = vec![p];
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Comments, false);
+        let section = build_section_authored(&authored, "me", &toggled);
+
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Comment { .. })),
+            "collapsing Open comments hides comment rows",
+        );
+        assert!(
+            section.rows.iter().any(|r| matches!(
+                r,
+                Row::SectionHeader {
+                    section: SectionId::Comments,
+                    expanded: false,
+                    ..
+                }
+            )),
+            "the Open comments header remains",
+        );
+    }
+
+    #[test]
+    fn reviewer_summary_dedups_and_orders() {
+        let reviewers = vec![
+            user("alice", true),                              // still requested
+            reviewed("bob", ReviewState::Approved),           // approved
+            reviewed("carol", ReviewState::ChangesRequested), // rejection
+            reviewed("dave", ReviewState::Approved),          // duplicate approved
+        ];
+        let summary = reviewer_summary(&reviewers);
+        assert_eq!(
+            summary,
+            vec![
+                ReviewerSummaryToken::Requested,
+                ReviewerSummaryToken::Approved,
+                ReviewerSummaryToken::ChangesRequested,
+            ],
+        );
+        // The rejection signal is present.
+        assert!(summary.contains(&ReviewerSummaryToken::ChangesRequested));
     }
 }

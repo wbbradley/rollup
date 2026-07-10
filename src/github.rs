@@ -329,7 +329,7 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         }
     }
 
-    reviewers.sort_by(|a, b| a.login.to_lowercase().cmp(&b.login.to_lowercase()));
+    reviewers.sort_by_key(|r| r.login.to_lowercase());
 
     let updated_at = node
         .updated_at

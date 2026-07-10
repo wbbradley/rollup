@@ -85,7 +85,7 @@ pub fn group_by_repo(prs: &[Pr]) -> Vec<(String, Vec<&Pr>)> {
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
     }
-    groups.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    groups.sort_by_key(|g| g.0.to_lowercase());
     groups
 }
 
@@ -386,7 +386,7 @@ pub fn human_age(dt: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono
 /// to `cap` entries.
 pub fn recent_merged(prs: &[Pr], cap: usize) -> Vec<&Pr> {
     let mut merged: Vec<&Pr> = prs.iter().filter(|p| p.merged_at.is_some()).collect();
-    merged.sort_by(|a, b| b.merged_at.cmp(&a.merged_at));
+    merged.sort_by_key(|p| std::cmp::Reverse(p.merged_at));
     merged.truncate(cap);
     merged
 }
