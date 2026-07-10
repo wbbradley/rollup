@@ -280,55 +280,63 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_fetch(&tx);
 
+    let mut dirty = true;
     loop {
-        drain_msgs(&rx, &mut state, &tx);
+        let changed = drain_msgs(&rx, &mut state, &tx);
 
-        terminal.draw(|f| ui::draw(f, &mut state))?;
+        if should_redraw(dirty, changed, state.loading) {
+            terminal.draw(|f| ui::draw(f, &mut state))?;
+            dirty = false;
+        }
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Esc => {
-                    if state.mode == ViewMode::People || state.mode == ViewMode::Radar {
-                        state.mode = ViewMode::Me;
-                        state.focus = Focus::Authored;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc => {
+                            if state.mode == ViewMode::People || state.mode == ViewMode::Radar {
+                                state.mode = ViewMode::Me;
+                                state.focus = Focus::Authored;
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            state.mode = ViewMode::People;
+                            state.people_sel = 0;
+                        }
+                        KeyCode::Char('e') => {
+                            state.mode = ViewMode::Radar;
+                            state.focus = Focus::Reviewing;
+                            state.reviewing_sel = 0;
+                            state.releases_sel = 0;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, 1),
+                        KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, -1),
+                        KeyCode::Char('g') => jump(&mut state, true),
+                        KeyCode::Char('G') => jump(&mut state, false),
+                        KeyCode::Tab => {
+                            if state.mode == ViewMode::Radar {
+                                focus_next(&mut state);
+                            }
+                        }
+                        KeyCode::BackTab => {
+                            if state.mode == ViewMode::Radar {
+                                focus_prev(&mut state);
+                            }
+                        }
+                        KeyCode::Enter => open_selected(&state),
+                        KeyCode::Char('r') => {
+                            if !state.loading {
+                                state.loading = true;
+                                spawn_fetch(&tx);
+                            }
+                        }
+                        KeyCode::Char('x') => remove_selected_reviewer(&mut state, &tx),
+                        _ => {}
                     }
+                    dirty = true;
                 }
-                KeyCode::Char('p') => {
-                    state.mode = ViewMode::People;
-                    state.people_sel = 0;
-                }
-                KeyCode::Char('e') => {
-                    state.mode = ViewMode::Radar;
-                    state.focus = Focus::Reviewing;
-                    state.reviewing_sel = 0;
-                    state.releases_sel = 0;
-                }
-                KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, 1),
-                KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, -1),
-                KeyCode::Char('g') => jump(&mut state, true),
-                KeyCode::Char('G') => jump(&mut state, false),
-                KeyCode::Tab => {
-                    if state.mode == ViewMode::Radar {
-                        focus_next(&mut state);
-                    }
-                }
-                KeyCode::BackTab => {
-                    if state.mode == ViewMode::Radar {
-                        focus_prev(&mut state);
-                    }
-                }
-                KeyCode::Enter => open_selected(&state),
-                KeyCode::Char('r') => {
-                    if !state.loading {
-                        state.loading = true;
-                        spawn_fetch(&tx);
-                    }
-                }
-                KeyCode::Char('x') => remove_selected_reviewer(&mut state, &tx),
+                Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }
@@ -336,8 +344,14 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-fn drain_msgs(rx: &Receiver<Msg>, state: &mut AppState, tx: &Sender<Msg>) {
+fn should_redraw(dirty: bool, changed: bool, loading: bool) -> bool {
+    dirty || changed || loading
+}
+
+fn drain_msgs(rx: &Receiver<Msg>, state: &mut AppState, tx: &Sender<Msg>) -> bool {
+    let mut changed = false;
     while let Ok(msg) = rx.try_recv() {
+        changed = true;
         match msg {
             Msg::Fetched(Ok(data)) => state.apply(data),
             Msg::Fetched(Err(e)) => state.fail(format!("{e:#}")),
@@ -355,6 +369,7 @@ fn drain_msgs(rx: &Receiver<Msg>, state: &mut AppState, tx: &Sender<Msg>) {
             },
         }
     }
+    changed
 }
 
 fn spawn_fetch(tx: &Sender<Msg>) {
@@ -570,5 +585,30 @@ mod tests {
         assert_eq!(state.focus, Focus::Reviewing); // Releases skipped, stays put
         focus_prev(&mut state);
         assert_eq!(state.focus, Focus::Reviewing);
+    }
+
+    #[test]
+    fn should_redraw_predicate() {
+        assert!(should_redraw(true, false, false)); // dirty alone
+        assert!(should_redraw(false, true, false)); // changed alone
+        assert!(should_redraw(false, false, true)); // loading alone
+        assert!(!should_redraw(false, false, false)); // idle: skip the draw
+    }
+
+    #[test]
+    fn drain_msgs_reports_change() {
+        let mut state = AppState::new(); // loading: true seed → no fetch spawned
+        let (tx, rx) = mpsc::channel::<Msg>();
+        tx.send(Msg::Action {
+            label: "test".into(),
+            result: Ok(()),
+        })
+        .unwrap();
+
+        assert!(drain_msgs(&rx, &mut state, &tx));
+        assert_eq!(state.status, Some("test: ok".to_string()));
+
+        // Channel is now empty → nothing drained → no change reported.
+        assert!(!drain_msgs(&rx, &mut state, &tx));
     }
 }
