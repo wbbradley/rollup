@@ -24,11 +24,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     match state.mode {
         ViewMode::Me => {
             let sections =
-                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                     .split(top);
             let focus = state.focus;
 
-            let reviewing_col = sections[0];
+            let reviewing_col = sections[1];
             let parts = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(reviewing_col);
             let reviewing_area = parts[0];
@@ -46,7 +46,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             let authored_section = report::build_section_authored(&state.authored, &viewer_str);
             draw_section(
                 f,
-                sections[1],
+                sections[0],
                 &authored_section,
                 state.authored_sel,
                 &mut state.authored_list_state,
@@ -194,10 +194,19 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             tree_prefix.as_deref(),
         )),
         Row::Reviewer { r, tree_prefix } => ListItem::new(reviewer_line(r, tree_prefix.as_deref())),
-        Row::SectionHeader { label, tree_prefix } => ListItem::new(Line::from(Span::styled(
-            format!("{tree_prefix}{label}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ))),
+        Row::SectionHeader { label, tree_prefix } => {
+            let style = if *label == "Open comments" {
+                Style::default()
+                    .fg(Color::Rgb(255, 140, 0))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{tree_prefix}{label}"),
+                style,
+            )))
+        }
         Row::Comment { c, tree_prefix } => ListItem::new(comment_line(c, tree_prefix)),
         Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
