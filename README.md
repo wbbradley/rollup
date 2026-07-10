@@ -2,9 +2,9 @@
 
 A terminal dashboard for your GitHub PR review workload. Panes:
 
-- **Review requested of me** — open PRs waiting on your review.
-- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch).
-- **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Me mode only).
+- **Review requested of me** — open PRs waiting on your review (Radar page, `e`).
+- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch). Fills the full width of the Me view.
+- **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Radar page, `e`).
 - **Recently merged PRs** — recently merged PRs by people in the current view.
 
 Data comes from `gh api graphql`, so auth is whatever `gh` already has.
@@ -32,12 +32,13 @@ rollup
 |-----------------|-------------------------------------------------------|
 | `↑` `↓` `k` `j` | Move selection (PR rows *and* reviewer sub-rows)      |
 | `g` / `G`       | Jump to top / bottom of the pane                      |
-| `Tab`           | Cycle focus between Reviewing / Authored / Releases (Me mode; `Shift+Tab` reverses) |
+| `e`             | Open the Radar page (Review requested + Recent releases) |
+| `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
 | `p`             | Switch to People view                                 |
 | `Enter`         | Open the selected PR (or release/tag page) in your browser |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
-| `Esc`           | Back to Me mode from People view                      |
+| `Esc`           | Back to Me from People **or** Radar                   |
 | `q`             | Quit                                                  |
 
 ## Reviewer rows

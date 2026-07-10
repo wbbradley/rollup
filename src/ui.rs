@@ -23,14 +23,20 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     match state.mode {
         ViewMode::Me => {
-            let sections =
-                Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                    .split(top);
+            let authored_section = report::build_section_authored(&state.authored, &viewer_str);
+            draw_section(
+                f,
+                top,
+                &authored_section,
+                state.authored_sel,
+                &mut state.authored_list_state,
+                true,
+            );
+        }
+        ViewMode::Radar => {
             let focus = state.focus;
-
-            let reviewing_col = sections[1];
             let parts = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(reviewing_col);
+                .split(top);
             let reviewing_area = parts[0];
             let releases_area = parts[1];
 
@@ -42,15 +48,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 state.reviewing_sel,
                 &mut state.reviewing_list_state,
                 focus == Focus::Reviewing,
-            );
-            let authored_section = report::build_section_authored(&state.authored, &viewer_str);
-            draw_section(
-                f,
-                sections[0],
-                &authored_section,
-                state.authored_sel,
-                &mut state.authored_list_state,
-                focus == Focus::Authored,
             );
             let mut releases_section =
                 report::build_section_releases(&state.releases, chrono::Utc::now());
@@ -82,6 +79,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     let allowed: std::collections::BTreeSet<String> = match state.mode {
         ViewMode::Me => report::allowed_authors_me(&viewer_str, &state.reviewing),
+        ViewMode::Radar => report::allowed_authors_me(&viewer_str, &state.reviewing),
         ViewMode::People => {
             report::allowed_authors_people(&state.authored, &state.reviewing, &viewer_str)
         }
@@ -478,10 +476,13 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
 
     let hint = match state.mode {
         ViewMode::Me => {
-            "↑↓ move · Tab switch (incl. releases) · Enter open · x remove reviewer · p people · r refresh · q quit   "
+            "↑↓ move · Enter open · e radar · p people · r refresh · q quit   "
+        }
+        ViewMode::Radar => {
+            "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   "
         }
         ViewMode::People => {
-            "↑↓ move · Esc back · Enter open · x remove reviewer · r refresh · q quit   "
+            "↑↓ move · Esc back · Enter open · x remove reviewer · e radar · r refresh · q quit   "
         }
     };
     let line = Line::from(vec![

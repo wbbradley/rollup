@@ -56,6 +56,7 @@ pub enum Focus {
 pub enum ViewMode {
     Me,
     People,
+    Radar,
 }
 
 pub enum Msg {
@@ -184,12 +185,12 @@ impl AppState {
 
     fn current_section(&self) -> Section<'_> {
         match self.mode {
-            ViewMode::Me => match self.focus {
-                Focus::Authored => self.authored_section(),
-                Focus::Reviewing => self.reviewing_section(),
-                Focus::Releases => self.releases_section(),
-            },
+            ViewMode::Me => self.authored_section(),
             ViewMode::People => self.people_section(),
+            ViewMode::Radar => match self.focus {
+                Focus::Releases => self.releases_section(),
+                _ => self.reviewing_section(),
+            },
         }
     }
 
@@ -199,23 +200,23 @@ impl AppState {
 
     fn current_sel(&self) -> usize {
         match self.mode {
-            ViewMode::Me => match self.focus {
-                Focus::Authored => self.authored_sel,
-                Focus::Reviewing => self.reviewing_sel,
-                Focus::Releases => self.releases_sel,
-            },
+            ViewMode::Me => self.authored_sel,
             ViewMode::People => self.people_sel,
+            ViewMode::Radar => match self.focus {
+                Focus::Releases => self.releases_sel,
+                _ => self.reviewing_sel,
+            },
         }
     }
 
     fn current_sel_mut(&mut self) -> &mut usize {
         match self.mode {
-            ViewMode::Me => match self.focus {
-                Focus::Authored => &mut self.authored_sel,
-                Focus::Reviewing => &mut self.reviewing_sel,
-                Focus::Releases => &mut self.releases_sel,
-            },
+            ViewMode::Me => &mut self.authored_sel,
             ViewMode::People => &mut self.people_sel,
+            ViewMode::Radar => match self.focus {
+                Focus::Releases => &mut self.releases_sel,
+                _ => &mut self.reviewing_sel,
+            },
         }
     }
 }
@@ -291,28 +292,32 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             match key.code {
                 KeyCode::Char('q') => break,
                 KeyCode::Esc => {
-                    if state.mode == ViewMode::People {
+                    if state.mode == ViewMode::People || state.mode == ViewMode::Radar {
                         state.mode = ViewMode::Me;
-                        state.people_sel = 0;
+                        state.focus = Focus::Authored;
                     }
                 }
                 KeyCode::Char('p') => {
-                    if state.mode == ViewMode::Me {
-                        state.mode = ViewMode::People;
-                        state.people_sel = 0;
-                    }
+                    state.mode = ViewMode::People;
+                    state.people_sel = 0;
+                }
+                KeyCode::Char('e') => {
+                    state.mode = ViewMode::Radar;
+                    state.focus = Focus::Reviewing;
+                    state.reviewing_sel = 0;
+                    state.releases_sel = 0;
                 }
                 KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, 1),
                 KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, -1),
                 KeyCode::Char('g') => jump(&mut state, true),
                 KeyCode::Char('G') => jump(&mut state, false),
                 KeyCode::Tab => {
-                    if state.mode == ViewMode::Me {
+                    if state.mode == ViewMode::Radar {
                         focus_next(&mut state);
                     }
                 }
                 KeyCode::BackTab => {
-                    if state.mode == ViewMode::Me {
+                    if state.mode == ViewMode::Radar {
                         focus_prev(&mut state);
                     }
                 }
@@ -378,12 +383,12 @@ fn jump(state: &mut AppState, to_top: bool) {
 }
 
 fn focus_next(state: &mut AppState) {
-    let order = [Focus::Authored, Focus::Reviewing, Focus::Releases];
+    let order = [Focus::Reviewing, Focus::Releases];
     focus_step(state, &order);
 }
 
 fn focus_prev(state: &mut AppState) {
-    let order = [Focus::Authored, Focus::Releases, Focus::Reviewing];
+    let order = [Focus::Releases, Focus::Reviewing];
     focus_step(state, &order);
 }
 
@@ -402,7 +407,7 @@ fn focus_step(state: &mut AppState, order: &[Focus]) {
 }
 
 fn open_selected(state: &AppState) {
-    if state.mode == ViewMode::Me && state.focus == Focus::Releases {
+    if state.mode == ViewMode::Radar && state.focus == Focus::Releases {
         if let Some(url) = selected_release_url(state) {
             let _ = open::that(url);
         }
@@ -531,5 +536,39 @@ mod tests {
         }
         // Out of range → None.
         assert!(selected_row(&section.rows, 3).is_none());
+    }
+
+    fn state_for_radar(with_releases: bool) -> AppState {
+        let mut state = AppState::new();
+        state.mode = ViewMode::Radar;
+        state.focus = Focus::Reviewing;
+        if with_releases {
+            state.releases = vec![RepoReleaseInfo {
+                repo: "o/r".to_string(),
+                recent_releases: Vec::new(),
+                latest_tag: None,
+            }];
+        }
+        state
+    }
+
+    #[test]
+    fn radar_tab_cycles_reviewing_and_releases() {
+        let mut state = state_for_radar(true);
+        focus_next(&mut state);
+        assert_eq!(state.focus, Focus::Releases);
+        focus_next(&mut state);
+        assert_eq!(state.focus, Focus::Reviewing);
+        focus_prev(&mut state); // Shift+Tab reverses
+        assert_eq!(state.focus, Focus::Releases);
+    }
+
+    #[test]
+    fn radar_tab_skips_empty_releases() {
+        let mut state = state_for_radar(false); // releases empty
+        focus_next(&mut state);
+        assert_eq!(state.focus, Focus::Reviewing); // Releases skipped, stays put
+        focus_prev(&mut state);
+        assert_eq!(state.focus, Focus::Reviewing);
     }
 }
