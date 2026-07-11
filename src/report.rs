@@ -1016,6 +1016,9 @@ pub fn run() -> Result<()> {
     if let Some(err) = &data.config_error {
         eprintln!("config: {err}");
     }
+    for w in &data.warnings {
+        eprintln!("warning: {w}");
+    }
     let now = Utc::now();
     let report = build_full_report(
         &data.viewer,

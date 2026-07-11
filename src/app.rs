@@ -130,7 +130,12 @@ impl AppState {
         self.releases = data.releases;
         self.loaded_at = Some(Local::now());
         self.error = None;
-        self.status = data.config_error.map(|err| format!("config: {err}"));
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(err) = data.config_error {
+            notes.push(format!("config: {err}"));
+        }
+        notes.extend(data.warnings.into_iter().map(|w| format!("warning: {w}")));
+        self.status = (!notes.is_empty()).then(|| notes.join(" · "));
         self.loading = false;
         self.clamp_selection();
     }

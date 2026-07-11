@@ -2,7 +2,7 @@ use std::{collections::HashMap, process::Command};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
     config,
@@ -114,6 +114,63 @@ pub struct Data {
     /// If the config file failed to load/parse, the error message is surfaced
     /// here so the UI can report it without crashing the app.
     pub config_error: Option<String>,
+    /// Non-fatal fetch-time warnings (e.g. SAML-blocked orgs). Deduped.
+    pub warnings: Vec<String>,
+}
+
+/// A GraphQL response envelope. Both fields are optional so a partial-success
+/// payload (accessible `data` plus a top-level `errors` array) and an
+/// errors-only payload both still deserialize.
+#[derive(Deserialize)]
+struct GraphQlEnvelope<T> {
+    data: Option<T>,
+    errors: Option<Vec<GraphQlError>>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlError {
+    message: String,
+}
+
+/// Parse a finished `gh api graphql` invocation into its `data` payload plus any
+/// non-fatal warning messages from the top-level `errors` array.
+///
+/// GitHub returns HTTP 200 with a partial `data` object on a SAML block, and
+/// `gh` exits non-zero whenever the response carries any `errors` — but the full
+/// partial JSON is still on stdout. So warnings are surfaced regardless of exit
+/// status, and the only fatal conditions are unparseable stdout or an absent
+/// `data`.
+fn parse_graphql<T: DeserializeOwned>(
+    output: &std::process::Output,
+    label: &str,
+) -> Result<(T, Vec<String>)> {
+    let envelope: GraphQlEnvelope<T> = serde_json::from_slice(&output.stdout).map_err(|e| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if !output.status.success() && !stderr.is_empty() {
+            anyhow!("gh api graphql ({label}) failed: {stderr}")
+        } else {
+            anyhow!("gh api graphql ({label}): parsing response JSON: {e}")
+        }
+    })?;
+    let warnings: Vec<String> = envelope
+        .errors
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.message)
+        .collect();
+    match envelope.data {
+        Some(data) => Ok((data, warnings)),
+        None => {
+            // errors-only / no `data` → genuinely fatal.
+            let detail = if warnings.is_empty() {
+                String::from_utf8_lossy(&output.stderr).trim().to_string()
+            } else {
+                warnings.join("; ")
+            };
+            Err(anyhow!("gh api graphql ({label}) failed: {detail}"))
+        }
+    }
 }
 
 pub fn remove_user_reviewer(owner: &str, repo: &str, pr_number: u64, login: &str) -> Result<()> {
@@ -151,7 +208,9 @@ pub fn fetch() -> Result<Data> {
         Ok(c) => (c, None),
         Err(e) => (config::Config::default(), Some(format!("{e:#}"))),
     };
-    let (viewer, authored, reviewing) = fetch_open()?;
+    let mut warnings: Vec<String> = Vec::new();
+    let (viewer, authored, reviewing, w) = fetch_open()?;
+    warnings.extend(w);
     // One fetch feeds both Me and People views; the render layer filters per
     // view. The fetch set must cover BOTH — `authors_for_people` excludes the
     // viewer, so on its own it would hide the viewer's own merged PRs in Me
@@ -160,13 +219,20 @@ pub fn fetch() -> Result<Data> {
     let merged = if authors.is_empty() {
         Vec::new()
     } else {
-        fetch_merged(&authors, MERGED_AUTHOR_CAP)?
+        let (merged, w) = fetch_merged(&authors, MERGED_AUTHOR_CAP)?;
+        warnings.extend(w);
+        merged
     };
     let releases = if config.repos.is_empty() {
         Vec::new()
     } else {
-        fetch_releases(&config.repos)?
+        let (releases, w) = fetch_releases(&config.repos)?;
+        warnings.extend(w);
+        releases
     };
+    // Dedup identical messages (one SAML line, not N) preserving first-seen order.
+    let mut seen = std::collections::HashSet::new();
+    warnings.retain(|w| seen.insert(w.clone()));
     Ok(Data {
         viewer,
         authored,
@@ -174,48 +240,43 @@ pub fn fetch() -> Result<Data> {
         merged,
         releases,
         config_error,
+        warnings,
     })
 }
 
-fn fetch_open() -> Result<(String, Vec<Pr>, Vec<Pr>)> {
+#[allow(clippy::type_complexity)]
+fn fetch_open() -> Result<(String, Vec<Pr>, Vec<Pr>, Vec<String>)> {
     let output = Command::new("gh")
         .args(["api", "graphql", "-f"])
         .arg(format!("query={QUERY}"))
         .output()
         .context("failed to invoke gh; is it installed and on PATH?")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "gh api graphql failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let root: OpenRoot =
-        serde_json::from_slice(&output.stdout).context("parsing gh response JSON")?;
-    let authored = root
-        .data
+    let (data, warnings) = parse_graphql::<OpenDataResp>(&output, "open")?;
+    let authored = data
         .authored
         .nodes
         .into_iter()
+        .flatten()
         .filter_map(node_to_pr)
         .collect();
-    let reviewing = root
-        .data
+    let reviewing = data
         .reviewing
         .nodes
         .into_iter()
+        .flatten()
         .filter_map(node_to_pr)
         .collect();
-    Ok((root.data.viewer.login, authored, reviewing))
+    Ok((data.viewer.login, authored, reviewing, warnings))
 }
 
-fn fetch_merged(authors: &[String], cap: usize) -> Result<Vec<Pr>> {
+fn fetch_merged(authors: &[String], cap: usize) -> Result<(Vec<Pr>, Vec<String>)> {
     let clauses: Vec<String> = authors
         .iter()
         .take(MERGED_AUTHOR_CAP)
         .map(|a| format!("author:{a}"))
         .collect();
     if clauses.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let q = format!(
         "is:pr is:merged {} archived:false sort:updated-desc",
@@ -228,27 +289,22 @@ fn fetch_merged(authors: &[String], cap: usize) -> Result<Vec<Pr>> {
         .args(["-f", &format!("q={q}")])
         .output()
         .context("failed to invoke gh; is it installed and on PATH?")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "gh api graphql (merged) failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let root: MergedRoot =
-        serde_json::from_slice(&output.stdout).context("parsing gh merged response JSON")?;
-    let all: Vec<Pr> = root
-        .data
+    let (data, warnings) = parse_graphql::<MergedDataResp>(&output, "merged")?;
+    let all: Vec<Pr> = data
         .merged
         .nodes
         .into_iter()
+        .flatten()
         .filter_map(node_to_pr)
         .filter(|p| p.merged_at.is_some())
         .collect();
-    Ok(model::recent_merged(&all, cap)
-        .into_iter()
-        .cloned()
-        .collect())
+    Ok((
+        model::recent_merged(&all, cap)
+            .into_iter()
+            .cloned()
+            .collect(),
+        warnings,
+    ))
 }
 
 fn node_to_pr(node: PrNode) -> Option<Pr> {
@@ -413,20 +469,10 @@ fn excerpt(body: &str) -> String {
 }
 
 #[derive(Deserialize)]
-struct OpenRoot {
-    data: OpenDataResp,
-}
-
-#[derive(Deserialize)]
 struct OpenDataResp {
     viewer: Viewer,
     authored: SearchResp,
     reviewing: SearchResp,
-}
-
-#[derive(Deserialize)]
-struct MergedRoot {
-    data: MergedDataResp,
 }
 
 #[derive(Deserialize)]
@@ -441,7 +487,9 @@ struct Viewer {
 
 #[derive(Deserialize)]
 struct SearchResp {
-    nodes: Vec<PrNode>,
+    /// SAML-blocked search hits arrive as `null` inside `nodes`, so each element
+    /// is optional; callers `.flatten()` before mapping through `node_to_pr`.
+    nodes: Vec<Option<PrNode>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -580,7 +628,7 @@ fragment RR on Repository {
 }
 "#;
 
-fn fetch_releases(repos: &[config::RepoRef]) -> Result<Vec<RepoReleaseInfo>> {
+fn fetch_releases(repos: &[config::RepoRef]) -> Result<(Vec<RepoReleaseInfo>, Vec<String>)> {
     use std::fmt::Write as _;
 
     let mut q = String::from("query {\n");
@@ -603,23 +651,15 @@ fn fetch_releases(repos: &[config::RepoRef]) -> Result<Vec<RepoReleaseInfo>> {
         .args(["api", "graphql", "-f"])
         .arg(format!("query={q}"))
         .output()
-        .context("failed to invoke gh")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "gh api graphql (releases) failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let root: ReleasesRoot =
-        serde_json::from_slice(&output.stdout).context("parsing gh releases response JSON")?;
+        .context("failed to invoke gh; is it installed and on PATH?")?;
+    let (data, warnings) = parse_graphql::<ReleasesData>(&output, "releases")?;
     let mut out = Vec::with_capacity(repos.len());
     for (i, r) in repos.iter().enumerate() {
         let key = format!("r{i}");
-        let node = root.data.aliases.get(&key).and_then(|v| v.as_ref());
+        let node = data.aliases.get(&key).and_then(|v| v.as_ref());
         out.push(node_to_repo_release_info(r, node));
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
 fn escape_graphql_string(s: &str) -> String {
@@ -715,11 +755,6 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.with_timezone(&Utc))
-}
-
-#[derive(Deserialize)]
-struct ReleasesRoot {
-    data: ReleasesData,
 }
 
 #[derive(Deserialize)]
@@ -1051,5 +1086,111 @@ mod tests {
         let e = excerpt(&long);
         assert_eq!(e.chars().count(), COMMENT_EXCERPT_MAX);
         assert!(e.ends_with('…'));
+    }
+
+    /// Build an `Output` with the given exit code and stdout/stderr text. On
+    /// unix, `ExitStatus::from_raw` takes the wait-status word, so the exit code
+    /// goes in the high byte (`code << 8`).
+    #[cfg(unix)]
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    // (a) A partial `authored` payload: `data` present with a leading `null`
+    // node plus a populated `errors` array. `gh` exited non-zero (it carries
+    // errors), but the accessible node survives and the warning is collected.
+    #[cfg(unix)]
+    #[test]
+    fn parse_graphql_partial_payload_keeps_data_and_collects_warning() {
+        let stdout = r#"{
+            "data": {
+                "viewer": { "login": "me" },
+                "authored": { "nodes": [
+                    null,
+                    { "number": 338, "repository": { "nameWithOwner": "o/r" } }
+                ]},
+                "reviewing": { "nodes": [] }
+            },
+            "errors": [
+                { "type": "FORBIDDEN", "path": ["authored", "nodes", 0],
+                  "extensions": { "saml_failure": true },
+                  "message": "Resource protected by organization SAML enforcement." }
+            ]
+        }"#;
+        let out = output(
+            1,
+            stdout,
+            "gh: Resource protected by organization SAML enforcement.",
+        );
+        let (data, warnings) = parse_graphql::<OpenDataResp>(&out, "open").unwrap();
+
+        let authored: Vec<Pr> = data
+            .authored
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(node_to_pr)
+            .collect();
+        assert_eq!(authored.len(), 1);
+        assert_eq!(authored[0].number, 338);
+        assert_eq!(data.viewer.login, "me");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("SAML enforcement"));
+    }
+
+    // (b) An errors-only / no-`data` payload is genuinely fatal.
+    #[cfg(unix)]
+    #[test]
+    fn parse_graphql_errors_only_is_fatal() {
+        let stdout = r#"{
+            "errors": [ { "message": "Resource protected by organization SAML enforcement." } ]
+        }"#;
+        let out = output(1, stdout, "gh: some stderr");
+        let err = match parse_graphql::<OpenDataResp>(&out, "open") {
+            Ok(_) => panic!("errors-only payload must be fatal"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("SAML enforcement"));
+    }
+
+    // (c) `SearchResp` deserializes a `nodes: [null, {...}]` array without error,
+    // and `.flatten()` drops the null.
+    #[test]
+    fn search_resp_tolerates_null_nodes() {
+        let json = r#"{ "nodes": [
+            null,
+            { "number": 7, "repository": { "nameWithOwner": "o/r" } }
+        ]}"#;
+        let resp: SearchResp = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.nodes.len(), 2);
+        let prs: Vec<Pr> = resp
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(node_to_pr)
+            .collect();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 7);
+    }
+
+    // (d) A zero-exit envelope carrying an `errors` array still collects the
+    // warning (partial-success-with-exit-0 path).
+    #[cfg(unix)]
+    #[test]
+    fn parse_graphql_zero_exit_with_errors_collects_warning() {
+        let stdout = r#"{
+            "data": { "viewer": { "login": "me" },
+                      "authored": { "nodes": [] },
+                      "reviewing": { "nodes": [] } },
+            "errors": [ { "message": "partial success warning" } ]
+        }"#;
+        let out = output(0, stdout, "");
+        let (_data, warnings) = parse_graphql::<OpenDataResp>(&out, "open").unwrap();
+        assert_eq!(warnings, vec!["partial success warning".to_string()]);
     }
 }
