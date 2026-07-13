@@ -8,8 +8,11 @@ use ratatui::{
 
 use crate::{
     app::{AppState, Focus, ViewMode},
-    model::{Pr, PrComment, ReleaseInfo, ReviewState, ReviewerStatus, TagInfo, human_age},
-    report::{self, ReviewerSummaryToken, Row, Section, SectionId},
+    model::{
+        CheckState, CheckStatus, ChecksRollup, Pr, PrComment, ReleaseInfo, ReviewState,
+        ReviewerStatus, TagInfo, human_age,
+    },
+    report::{self, ChecksSummary, ReviewerSummaryToken, Row, Section, SectionId},
 };
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
@@ -198,14 +201,17 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             section,
             expanded,
             summary,
+            checks,
             tree_prefix,
         } => ListItem::new(section_header_line(
             *section,
             *expanded,
             summary,
+            checks.as_ref(),
             tree_prefix,
         )),
         Row::Comment { c, tree_prefix } => ListItem::new(comment_line(c, tree_prefix)),
+        Row::Check { c, tree_prefix } => ListItem::new(check_line(c, tree_prefix)),
         Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
         Row::ReleaseTag { tag, now, .. } => ListItem::new(release_tag_line(tag, *now)),
@@ -401,6 +407,7 @@ fn section_header_line(
     section: SectionId,
     expanded: bool,
     summary: &[ReviewerSummaryToken],
+    checks: Option<&ChecksSummary>,
     tree_prefix: &str,
 ) -> Line<'static> {
     let glyph = if expanded { "▾" } else { "▸" };
@@ -422,7 +429,17 @@ fn section_header_line(
         ),
         Span::styled(section.label().to_string(), label_style),
     ];
-    if !summary.is_empty() {
+    if let Some(cs) = checks {
+        // Merge-readiness signal: a colored state glyph + the required ratio.
+        let (glyph, style) = checks_glyph_style(cs.rollup);
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(glyph.to_string(), style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            cs.ratio_text(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    } else if !summary.is_empty() {
         let bracket = Style::default().add_modifier(Modifier::DIM);
         spans.push(Span::styled(" [", bracket));
         for (i, token) in summary.iter().enumerate() {
@@ -435,6 +452,58 @@ fn section_header_line(
             ));
         }
         spans.push(Span::styled("]", bracket));
+    }
+    Line::from(spans)
+}
+
+/// Glyph + style for a checks rollup, reusing the reviewer palette: `✓` green,
+/// `✗` red (bold), `◉` yellow, `○` dim.
+fn checks_glyph_style(rollup: ChecksRollup) -> (&'static str, Style) {
+    match rollup {
+        ChecksRollup::Green => ("✓", Style::default().fg(Color::Green)),
+        ChecksRollup::Red => (
+            "✗",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        ChecksRollup::Pending => ("◉", Style::default().fg(Color::Yellow)),
+        ChecksRollup::Unknown => ("○", Style::default().add_modifier(Modifier::DIM)),
+    }
+}
+
+fn check_line(c: &CheckStatus, tree_prefix: &str) -> Line<'static> {
+    let (glyph, glyph_style) = match c.state {
+        CheckState::Success => ("✓", Style::default().fg(Color::Green)),
+        CheckState::Failure | CheckState::Error => ("✗", Style::default().fg(Color::Red)),
+        CheckState::Pending => ("◉", Style::default().fg(Color::Yellow)),
+        CheckState::Skipped => (
+            "⊘",
+            Style::default()
+                .add_modifier(Modifier::DIM)
+                .add_modifier(Modifier::CROSSED_OUT),
+        ),
+        CheckState::Neutral => ("○", Style::default().add_modifier(Modifier::DIM)),
+    };
+    // Non-required checks are dimmed and tagged, since they never move the
+    // merge-readiness signal.
+    let name_style = if c.required {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let mut spans = vec![
+        Span::styled(
+            tree_prefix.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::raw(" "),
+        Span::styled(c.name.clone(), name_style),
+    ];
+    if !c.required {
+        spans.push(Span::styled(
+            " (not required)",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
     Line::from(spans)
 }

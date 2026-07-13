@@ -7,8 +7,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use crate::{
     config,
     model::{
-        self, Pr, PrComment, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerKind,
-        ReviewerStatus, TagInfo,
+        self, CheckState, CheckStatus, ChecksRollup, Pr, PrComment, ReleaseInfo, RepoReleaseInfo,
+        ReviewState, ReviewerKind, ReviewerStatus, TagInfo,
     },
 };
 
@@ -50,6 +50,23 @@ fragment PrFields on PullRequest {
 
 fragment AuthoredPrFields on PullRequest {
   ...PrFields
+  mergeable
+  commits(last: 1) {
+    nodes {
+      commit {
+        statusCheckRollup {
+          state
+          contexts(first: 100) {
+            nodes {
+              __typename
+              ... on CheckRun { name status conclusion detailsUrl }
+              ... on StatusContext { context state targetUrl }
+            }
+          }
+        }
+      }
+    }
+  }
   reviewThreads(first: 50) {
     nodes {
       isResolved
@@ -209,8 +226,26 @@ pub fn fetch() -> Result<Data> {
         Err(e) => (config::Config::default(), Some(format!("{e:#}"))),
     };
     let mut warnings: Vec<String> = Vec::new();
-    let (viewer, authored, reviewing, w) = fetch_open()?;
+    let (viewer, mut authored, reviewing, w) = fetch_open()?;
     warnings.extend(w);
+    // Second round-trip: learn each authored PR's branch-protection-required
+    // check flags (the bulk `search` query can't compute `isRequired` per PR)
+    // and finalize its checks rollup. A hard failure is non-fatal — surface a
+    // warning and mark the affected PRs Unknown rather than claim a false green.
+    match fetch_required_checks(&authored) {
+        Ok((req_map, w)) => {
+            warnings.extend(w);
+            apply_required_flags(&mut authored, &req_map);
+        }
+        Err(e) => {
+            warnings.push(format!("required checks: {e:#}"));
+            for pr in &mut authored {
+                if !pr.checks.is_empty() {
+                    pr.checks_rollup = ChecksRollup::Unknown;
+                }
+            }
+        }
+    }
     // One fetch feeds both Me and People views; the render layer filters per
     // view. The fetch set must cover BOTH — `authors_for_people` excludes the
     // viewer, so on its own it would hide the viewer's own merged PRs in Me
@@ -430,6 +465,19 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         }
     }
 
+    // Checks: only the authored fragment fetches `commits`/`mergeable`, so
+    // reviewing/merged nodes yield no checks (`rollup_present == false`) and a
+    // provisional Unknown rollup that's never rendered for them. For authored
+    // PRs, `required` is still false here — `apply_required_flags` fills it in
+    // from the second call and recomputes the rollup. `mergeable == UNKNOWN`
+    // (or a missing field) means GitHub is still computing → Unknown.
+    let (checks, rollup_present) = checks_from_commits(&node.commits);
+    let mergeable_unknown = !matches!(
+        node.mergeable.as_deref(),
+        Some("MERGEABLE") | Some("CONFLICTING")
+    );
+    let checks_rollup = model::compute_checks_rollup(&checks, mergeable_unknown, rollup_present);
+
     Some(Pr {
         number,
         title: node.title.unwrap_or_default(),
@@ -446,6 +494,8 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         updated_at,
         merged_at,
         unresolved_comments,
+        checks,
+        checks_rollup,
     })
 }
 
@@ -516,6 +566,11 @@ struct PrNode {
     latest_reviews: Option<LatestReviews>,
     #[serde(rename = "reviewThreads")]
     review_threads: Option<ReviewThreads>,
+    /// `MergeableState`: MERGEABLE | CONFLICTING | UNKNOWN. Only fetched by the
+    /// authored fragment. UNKNOWN/absent means GitHub is still computing.
+    mergeable: Option<String>,
+    /// Last commit's status-check rollup. Only fetched by the authored fragment.
+    commits: Option<CommitsConnection>,
 }
 
 #[derive(Deserialize)]
@@ -592,6 +647,286 @@ struct LatestReviews {
 struct LatestReviewNode {
     author: Option<AuthorNode>,
     state: String,
+}
+
+// --- checks ---
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CommitsConnection {
+    /// `null` node tolerance for SAML-partial payloads.
+    nodes: Vec<Option<CommitNode>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CommitNode {
+    commit: Option<CommitInner>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CommitInner {
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<StatusCheckRollup>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct StatusCheckRollup {
+    // `state` is fetched for parity/debuggability but the rollup is derived from
+    // the required contexts + `mergeable`, so serde just drops it here.
+    contexts: Option<CheckContexts>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CheckContexts {
+    nodes: Vec<Option<CheckContextNode>>,
+}
+
+/// One status-check context. Shared by both the authored fetch (which pulls
+/// `name`/`status`/`conclusion`/`detailsUrl` or `context`/`state`/`targetUrl`)
+/// and the required-checks fetch (which pulls `name`/`context` + `isRequired`);
+/// every field is optional so either payload deserializes.
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum CheckContextNode {
+    CheckRun {
+        name: Option<String>,
+        status: Option<String>,
+        conclusion: Option<String>,
+        #[serde(rename = "detailsUrl")]
+        details_url: Option<String>,
+        #[serde(rename = "isRequired")]
+        is_required: Option<bool>,
+    },
+    StatusContext {
+        context: Option<String>,
+        state: Option<String>,
+        #[serde(rename = "targetUrl")]
+        target_url: Option<String>,
+        #[serde(rename = "isRequired")]
+        is_required: Option<bool>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The last commit's status-check rollup contexts from `commits`. Returns the
+/// normalized checks (with `required` defaulted to false — the second call fills
+/// it in) plus whether a rollup was present at all (false → no checks, so the
+/// Checks section is omitted).
+fn checks_from_commits(commits: &Option<CommitsConnection>) -> (Vec<CheckStatus>, bool) {
+    let rollup = commits
+        .as_ref()
+        .and_then(|c| c.nodes.iter().flatten().next())
+        .and_then(|cn| cn.commit.as_ref())
+        .and_then(|ci| ci.status_check_rollup.as_ref());
+    let Some(rollup) = rollup else {
+        return (Vec::new(), false);
+    };
+    let mut checks = Vec::new();
+    if let Some(contexts) = rollup.contexts.as_ref() {
+        for ctx in contexts.nodes.iter().flatten() {
+            match ctx {
+                CheckContextNode::CheckRun {
+                    name,
+                    status,
+                    conclusion,
+                    details_url,
+                    ..
+                } => {
+                    let Some(name) = name.clone() else { continue };
+                    checks.push(CheckStatus {
+                        name,
+                        state: check_run_state(status.as_deref(), conclusion.as_deref()),
+                        url: details_url.clone().filter(|u| !u.is_empty()),
+                        required: false,
+                    });
+                }
+                CheckContextNode::StatusContext {
+                    context,
+                    state,
+                    target_url,
+                    ..
+                } => {
+                    let Some(name) = context.clone() else {
+                        continue;
+                    };
+                    checks.push(CheckStatus {
+                        name,
+                        state: status_context_state(state.as_deref()),
+                        url: target_url.clone().filter(|u| !u.is_empty()),
+                        required: false,
+                    });
+                }
+                CheckContextNode::Other => {}
+            }
+        }
+    }
+    (checks, true)
+}
+
+/// Map a `CheckRun`'s status/conclusion to a [`CheckState`]. A run that hasn't
+/// completed is Pending; a completed run maps its conclusion, treating anything
+/// that isn't a clean pass/neutral/skip as a failure so it can block a merge.
+fn check_run_state(status: Option<&str>, conclusion: Option<&str>) -> CheckState {
+    match status {
+        // COMPLETED (or an absent status) → decide from the conclusion.
+        Some("COMPLETED") | None => match conclusion {
+            Some("SUCCESS") => CheckState::Success,
+            Some("SKIPPED") => CheckState::Skipped,
+            Some("NEUTRAL") | Some("STALE") => CheckState::Neutral,
+            Some("FAILURE")
+            | Some("TIMED_OUT")
+            | Some("STARTUP_FAILURE")
+            | Some("CANCELLED")
+            | Some("ACTION_REQUIRED") => CheckState::Failure,
+            // Completed but no conclusion yet, or an unknown conclusion.
+            _ => CheckState::Pending,
+        },
+        // QUEUED / IN_PROGRESS / WAITING / PENDING / REQUESTED → still running.
+        Some(_) => CheckState::Pending,
+    }
+}
+
+/// Map a legacy `StatusContext`'s state to a [`CheckState`].
+fn status_context_state(state: Option<&str>) -> CheckState {
+    match state {
+        Some("SUCCESS") => CheckState::Success,
+        Some("FAILURE") => CheckState::Failure,
+        Some("ERROR") => CheckState::Error,
+        // PENDING / EXPECTED / anything unrecognized → not yet resolved.
+        _ => CheckState::Pending,
+    }
+}
+
+/// Maps an authored-PR index to that PR's `check name → required` flags, as
+/// learned by [`fetch_required_checks`].
+type RequiredFlags = HashMap<usize, HashMap<String, bool>>;
+
+/// Second GraphQL round-trip: for each authored PR, learn which of its checks
+/// are branch-protection *required*. `isRequired(pullRequestNumber:)` needs a
+/// literal PR number, which the bulk `search(...)` query can't provide, so we
+/// alias one `repository(...) { pullRequest(number: N) { ... } }` per PR (index
+/// `i` → key `p{i}`), mirroring the aliased-per-repo `fetch_releases` pattern.
+/// Returns a map from authored-PR index to `check name → required`.
+fn fetch_required_checks(authored: &[Pr]) -> Result<(RequiredFlags, Vec<String>)> {
+    use std::fmt::Write as _;
+
+    let mut q = String::from("query {\n");
+    let mut included = 0;
+    for (i, pr) in authored.iter().enumerate() {
+        let Some((owner, name)) = pr.repo.split_once('/') else {
+            continue;
+        };
+        let num = pr.number;
+        writeln!(
+            &mut q,
+            "  p{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ pullRequest(number: {num}) {{ commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ name isRequired(pullRequestNumber: {num}) }} ... on StatusContext {{ context isRequired(pullRequestNumber: {num}) }} }} }} }} }} }} }} }} }}",
+            owner = escape_graphql_string(owner),
+            name = escape_graphql_string(name),
+        )
+        .unwrap();
+        included += 1;
+    }
+    q.push_str("}\n");
+    if included == 0 {
+        return Ok((HashMap::new(), Vec::new()));
+    }
+
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f"])
+        .arg(format!("query={q}"))
+        .output()
+        .context("failed to invoke gh; is it installed and on PATH?")?;
+    let (data, warnings) = parse_graphql::<RequiredChecksData>(&output, "required-checks")?;
+    let mut out: RequiredFlags = HashMap::new();
+    for i in 0..authored.len() {
+        let key = format!("p{i}");
+        // Only record a map when the alias resolved to a real PR node. A missing
+        // or null alias/PR (e.g. a SAML-blocked repo in this call) leaves the PR
+        // absent so `apply_required_flags` can mark it Unknown, not false-green.
+        if let Some(Some(repo)) = data.aliases.get(&key)
+            && let Some(pr_node) = repo.pull_request.as_ref()
+        {
+            out.insert(i, required_map_from_node(pr_node));
+        }
+    }
+    Ok((out, warnings))
+}
+
+/// Build a `check name → required` map from one aliased PR node.
+fn required_map_from_node(node: &ReqPrNode) -> HashMap<String, bool> {
+    let mut map = HashMap::new();
+    let contexts = node
+        .commits
+        .as_ref()
+        .and_then(|c| c.nodes.iter().flatten().next())
+        .and_then(|cn| cn.commit.as_ref())
+        .and_then(|ci| ci.status_check_rollup.as_ref())
+        .and_then(|r| r.contexts.as_ref());
+    if let Some(contexts) = contexts {
+        for ctx in contexts.nodes.iter().flatten() {
+            let (name, is_required) = match ctx {
+                CheckContextNode::CheckRun {
+                    name, is_required, ..
+                } => (name.clone(), is_required),
+                CheckContextNode::StatusContext {
+                    context,
+                    is_required,
+                    ..
+                } => (context.clone(), is_required),
+                CheckContextNode::Other => continue,
+            };
+            if let Some(name) = name {
+                map.insert(name, is_required.unwrap_or(false));
+            }
+        }
+    }
+    map
+}
+
+/// Merge the second call's required flags into each authored PR's checks and
+/// recompute its rollup. A PR already Unknown (mergeable/rollup not yet
+/// computed) stays Unknown. A PR with checks but no entry in `req_map` (its
+/// required flags couldn't be fetched) is marked Unknown rather than claiming a
+/// false green.
+fn apply_required_flags(authored: &mut [Pr], req_map: &RequiredFlags) {
+    for (i, pr) in authored.iter_mut().enumerate() {
+        if pr.checks.is_empty() || pr.checks_rollup == ChecksRollup::Unknown {
+            continue;
+        }
+        match req_map.get(&i) {
+            Some(names) => {
+                for c in &mut pr.checks {
+                    c.required = names.get(&c.name).copied().unwrap_or(false);
+                }
+                pr.checks_rollup = model::rollup_from_required(&pr.checks);
+            }
+            None => pr.checks_rollup = ChecksRollup::Unknown,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RequiredChecksData {
+    #[serde(flatten)]
+    aliases: HashMap<String, Option<ReqRepoNode>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReqRepoNode {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<ReqPrNode>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReqPrNode {
+    commits: Option<CommitsConnection>,
 }
 
 // --- releases / tags ---
@@ -1076,6 +1411,149 @@ mod tests {
         let node: PrNode = serde_json::from_str(json).unwrap();
         let pr = node_to_pr(node).expect("pr parsed");
         assert!(pr.unresolved_comments.is_empty());
+    }
+
+    #[test]
+    fn checks_from_commits_normalizes_contexts() {
+        let json = r#"{
+            "nodes": [{
+                "commit": {
+                    "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": { "nodes": [
+                            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://ci/build" },
+                            { "__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": null, "detailsUrl": "" },
+                            { "__typename": "StatusContext", "context": "legacy", "state": "FAILURE", "targetUrl": "https://ci/legacy" }
+                        ]}
+                    }
+                }
+            }]
+        }"#;
+        let commits: CommitsConnection = serde_json::from_str(json).unwrap();
+        let (checks, present) = checks_from_commits(&Some(commits));
+        assert!(present);
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].name, "build");
+        assert_eq!(checks[0].state, CheckState::Success);
+        assert_eq!(checks[0].url.as_deref(), Some("https://ci/build"));
+        assert!(!checks[0].required);
+        assert_eq!(checks[1].name, "test");
+        assert_eq!(checks[1].state, CheckState::Pending);
+        // Empty detailsUrl collapses to None.
+        assert_eq!(checks[1].url, None);
+        assert_eq!(checks[2].name, "legacy");
+        assert_eq!(checks[2].state, CheckState::Failure);
+    }
+
+    #[test]
+    fn checks_from_commits_absent_rollup_is_no_checks() {
+        let json = r#"{ "nodes": [{ "commit": { "statusCheckRollup": null } }] }"#;
+        let commits: CommitsConnection = serde_json::from_str(json).unwrap();
+        let (checks, present) = checks_from_commits(&Some(commits));
+        assert!(!present);
+        assert!(checks.is_empty());
+        // Entirely absent commits connection is also "no checks".
+        let (checks, present) = checks_from_commits(&None);
+        assert!(!present);
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn required_map_from_node_reads_is_required() {
+        let json = r#"{
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "isRequired": true },
+                { "__typename": "CheckRun", "name": "optional", "isRequired": false },
+                { "__typename": "StatusContext", "context": "legacy", "isRequired": true }
+            ]}}}}]}
+        }"#;
+        let node: ReqPrNode = serde_json::from_str(json).unwrap();
+        let map = required_map_from_node(&node);
+        assert_eq!(map.get("build"), Some(&true));
+        assert_eq!(map.get("optional"), Some(&false));
+        assert_eq!(map.get("legacy"), Some(&true));
+    }
+
+    #[test]
+    fn apply_required_flags_green_when_only_nonrequired_fails() {
+        // Required build passes; non-required lint fails → the signal stays green.
+        let json = r#"{
+            "number": 1,
+            "repository": { "nameWithOwner": "o/r" },
+            "mergeable": "MERGEABLE",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "FAILURE", "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "" },
+                { "__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "" }
+            ]}}}}]}
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).unwrap();
+        assert_eq!(pr.checks.len(), 2);
+        // Provisional: mergeable known, no required flags yet → Green.
+        assert_eq!(pr.checks_rollup, ChecksRollup::Green);
+
+        let mut names = HashMap::new();
+        names.insert("build".to_string(), true);
+        names.insert("lint".to_string(), false);
+        let mut req = HashMap::new();
+        req.insert(0usize, names);
+
+        let mut authored = vec![pr];
+        apply_required_flags(&mut authored, &req);
+        let pr = &authored[0];
+        assert!(
+            pr.checks
+                .iter()
+                .find(|c| c.name == "build")
+                .unwrap()
+                .required
+        );
+        assert!(
+            !pr.checks
+                .iter()
+                .find(|c| c.name == "lint")
+                .unwrap()
+                .required
+        );
+        assert_eq!(pr.checks_rollup, ChecksRollup::Green);
+    }
+
+    #[test]
+    fn apply_required_flags_unknown_when_flags_unavailable() {
+        // A PR with checks and known mergeability but absent from the required
+        // map (its flags couldn't be fetched) must not claim a false green.
+        let json = r#"{
+            "number": 1, "repository": { "nameWithOwner": "o/r" },
+            "mergeable": "MERGEABLE",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "" }
+            ]}}}}]}
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).unwrap();
+        assert_eq!(pr.checks_rollup, ChecksRollup::Green);
+        let mut authored = vec![pr];
+        apply_required_flags(&mut authored, &HashMap::new());
+        assert_eq!(authored[0].checks_rollup, ChecksRollup::Unknown);
+    }
+
+    #[test]
+    fn node_to_pr_mergeable_unknown_yields_unknown_rollup() {
+        let json = r#"{
+            "number": 1, "repository": { "nameWithOwner": "o/r" },
+            "mergeable": "UNKNOWN",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "IN_PROGRESS", "conclusion": null, "detailsUrl": "" }
+            ]}}}}]}
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).unwrap();
+        assert_eq!(pr.checks.len(), 1);
+        assert_eq!(pr.checks_rollup, ChecksRollup::Unknown);
+        // A PR already Unknown is left alone by apply_required_flags.
+        let mut authored = vec![pr];
+        apply_required_flags(&mut authored, &HashMap::new());
+        assert_eq!(authored[0].checks_rollup, ChecksRollup::Unknown);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
     github::{self, Data},
-    model::{Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
+    model::{CheckStatus, Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
     report::{self, Row, Section, SectionId},
     ui,
 };
@@ -240,14 +240,17 @@ enum Selected<'a> {
     // `open_selected` opens the parent PR regardless, so prod code ignores it.
     Section(&'a Pr, #[allow(dead_code)] SectionId),
     Comment(&'a PrComment),
+    /// A check row. Carries its PR so `open_selected` can fall back to the PR
+    /// URL when the check has no details URL.
+    Check(&'a Pr, &'a CheckStatus),
 }
 
 /// Walk `rows`' selectable entries, tracking each PR's parent (so reviewer and
 /// section-header rows can locate their PR), and return the `sel`-th selectable
 /// row as a [`Selected`]. A free function (not an `&self` method) so it borrows
 /// the caller-owned `Section` local, keeping the returned `'a` references tied
-/// to it. It counts Pr, Reviewer, SectionHeader, **and** Comment rows so its
-/// index stays in lock-step with `ui`'s `is_selectable()` count.
+/// to it. It counts Pr, Reviewer, SectionHeader, Comment, **and** Check rows so
+/// its index stays in lock-step with `ui`'s `is_selectable()` count.
 fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
     let mut idx = 0usize;
     let mut current_pr: Option<&'a Pr> = None;
@@ -275,6 +278,12 @@ fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
             Row::Comment { c, .. } => {
                 if idx == sel {
                     return Some(Selected::Comment(c));
+                }
+                idx += 1;
+            }
+            Row::Check { c, .. } => {
+                if idx == sel {
+                    return current_pr.map(|pr| Selected::Check(pr, c));
                 }
                 idx += 1;
             }
@@ -346,6 +355,17 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
                         repo: pr.repo.as_str(),
                         number: pr.number,
                         section: SectionId::Comments,
+                        is_header: false,
+                    });
+                }
+                idx += 1;
+            }
+            Row::Check { .. } => {
+                if idx == sel {
+                    return current_pr.map(|pr| SectionCtx {
+                        repo: pr.repo.as_str(),
+                        number: pr.number,
+                        section: SectionId::Checks,
                         is_header: false,
                     });
                 }
@@ -560,6 +580,13 @@ fn open_selected(state: &AppState) {
         | Some(Selected::Reviewer(pr, _))
         | Some(Selected::Section(pr, _)) => Some(pr.url.clone()),
         Some(Selected::Comment(c)) => Some(c.url.clone()),
+        // A check opens its details/target URL, falling back to the PR.
+        Some(Selected::Check(pr, c)) => Some(
+            c.url
+                .clone()
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| pr.url.clone()),
+        ),
         None => None,
     };
     if let Some(url) = url {
@@ -680,6 +707,8 @@ mod tests {
                 path: Some("src/foo.rs".to_string()),
                 is_outdated: false,
             }],
+            checks: vec![],
+            checks_rollup: crate::model::ChecksRollup::Unknown,
         }
     }
 
@@ -760,6 +789,8 @@ mod tests {
             updated_at: chrono::Utc.timestamp_opt(100, 0).unwrap(),
             merged_at: None,
             unresolved_comments: vec![],
+            checks: vec![],
+            checks_rollup: crate::model::ChecksRollup::Unknown,
         }
     }
 
@@ -867,6 +898,70 @@ mod tests {
                 .any(|r| matches!(r, Row::Pr { pr, .. } if pr.number == 2)),
             "collapsing Stacked hides the nested child PR",
         );
+    }
+
+    fn pr_with_checks(number: u64, checks: Vec<CheckStatus>) -> Pr {
+        Pr {
+            checks,
+            checks_rollup: crate::model::ChecksRollup::Green,
+            ..simple_pr(number, "main", "a", vec![])
+        }
+    }
+
+    fn check(name: &str, url: Option<&str>, required: bool) -> CheckStatus {
+        CheckStatus {
+            name: name.to_string(),
+            state: crate::model::CheckState::Success,
+            url: url.map(str::to_string),
+            required,
+        }
+    }
+
+    #[test]
+    fn section_ctx_check_row_resolves_to_checks_section() {
+        // A PR with checks (collapsed by default). Expand so a Check row exists.
+        let mut state = me_state(vec![pr_with_checks(
+            1,
+            vec![check("build", Some("https://ci/build"), true)],
+        )]);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
+        // Selectable: Pr#1(0), Checks header(1), Check(2).
+        let section = state.authored_section();
+        let ctx = section_ctx_at(&section.rows, 2).expect("check row resolves");
+        assert_eq!(ctx.repo, "o/r");
+        assert_eq!(ctx.number, 1);
+        assert_eq!(ctx.section, SectionId::Checks);
+        assert!(!ctx.is_header);
+
+        match selected_row(&section.rows, 2) {
+            Some(Selected::Check(pr, c)) => {
+                assert_eq!(pr.number, 1);
+                assert_eq!(c.name, "build");
+            }
+            _ => panic!("index 2 should be the check row"),
+        }
+    }
+
+    #[test]
+    fn toggle_h_on_check_collapses_checks_and_reselects_header() {
+        let mut state = me_state(vec![pr_with_checks(
+            1,
+            vec![check("build", Some("https://ci/build"), true)],
+        )]);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
+        // Select the Check row (index 2) and collapse via `h`.
+        state.authored_sel = 2;
+        toggle_section(&mut state, false);
+        assert!(!report::is_expanded(
+            &state.toggled,
+            "o/r",
+            1,
+            SectionId::Checks
+        ));
+        // Cursor moved back to the Checks header (index 1).
+        assert_eq!(state.authored_sel, 1);
+        let section = state.authored_section();
+        assert!(!section.rows.iter().any(|r| matches!(r, Row::Check { .. })));
     }
 
     fn state_for_radar(with_releases: bool) -> AppState {

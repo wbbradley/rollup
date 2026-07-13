@@ -27,6 +27,90 @@ pub struct ReviewerStatus {
     pub requested: bool,
 }
 
+/// The outcome of a single status check / check run on a PR's head commit,
+/// normalized from GitHub's `CheckRun` (status + conclusion) and `StatusContext`
+/// (state) unions into one flat state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Success,
+    Failure,
+    Pending,
+    Neutral,
+    Skipped,
+    Error,
+}
+
+/// One check on a PR, as shown under the Authored pane's "Checks" section.
+#[derive(Debug, Clone)]
+pub struct CheckStatus {
+    pub name: String,
+    pub state: CheckState,
+    /// The check's details/target URL, if any. `Enter` on the row opens this,
+    /// falling back to the PR URL when absent.
+    pub url: Option<String>,
+    /// True iff branch protection requires this check to pass before merge. The
+    /// merge-readiness signal is computed from required checks only.
+    pub required: bool,
+}
+
+/// The at-a-glance merge-readiness signal for a PR's Checks header, computed
+/// from its *branch-protection-required* checks only (see
+/// [`compute_checks_rollup`]). Independent of the review requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksRollup {
+    /// Every required check passed (or there are zero required checks).
+    Green,
+    /// At least one required check failed or errored.
+    Red,
+    /// A required check is still queued/in-progress and none have failed.
+    Pending,
+    /// GitHub hasn't computed mergeability/rollup yet. Resolves on refresh.
+    Unknown,
+}
+
+/// Compute a PR's [`ChecksRollup`] from its checks. `mergeable_unknown` is true
+/// when GitHub reports `mergeable == UNKNOWN` (still computing); `rollup_present`
+/// is false when the head commit had no status-check rollup at all. Either
+/// condition yields [`ChecksRollup::Unknown`]; otherwise the signal is derived
+/// from the required checks via [`rollup_from_required`].
+pub fn compute_checks_rollup(
+    checks: &[CheckStatus],
+    mergeable_unknown: bool,
+    rollup_present: bool,
+) -> ChecksRollup {
+    if mergeable_unknown || !rollup_present {
+        return ChecksRollup::Unknown;
+    }
+    rollup_from_required(checks)
+}
+
+/// The required-checks-only portion of the rollup: Red if any required check
+/// failed/errored, else Pending if any required check is still pending, else
+/// Green (which also covers the zero-required-checks case — nothing can block
+/// the merge via checks). Non-required checks are ignored entirely.
+pub fn rollup_from_required(checks: &[CheckStatus]) -> ChecksRollup {
+    let mut any_required = false;
+    let mut any_failed = false;
+    let mut any_pending = false;
+    for c in checks.iter().filter(|c| c.required) {
+        any_required = true;
+        match c.state {
+            CheckState::Failure | CheckState::Error => any_failed = true,
+            CheckState::Pending => any_pending = true,
+            CheckState::Success | CheckState::Neutral | CheckState::Skipped => {}
+        }
+    }
+    if !any_required {
+        ChecksRollup::Green
+    } else if any_failed {
+        ChecksRollup::Red
+    } else if any_pending {
+        ChecksRollup::Pending
+    } else {
+        ChecksRollup::Green
+    }
+}
+
 /// The first comment of an unresolved review thread on a PR. Surfaced in the
 /// Authored pane's "Open comments" section.
 #[derive(Debug, Clone)]
@@ -64,6 +148,13 @@ pub struct Pr {
     /// First comment of each unresolved review thread. Only populated for the
     /// Authored pane's PRs (the reviewing/merged fetches don't request threads).
     pub unresolved_comments: Vec<PrComment>,
+    /// Head-commit checks. Only populated for the Authored pane's PRs (the
+    /// reviewing/merged fetches don't request the status-check rollup). Empty
+    /// when the PR has no checks, in which case the Checks section is omitted.
+    pub checks: Vec<CheckStatus>,
+    /// Merge-readiness signal derived from `checks` (required only). See
+    /// [`compute_checks_rollup`].
+    pub checks_rollup: ChecksRollup,
 }
 
 /// Group by repo: repos sorted alphabetically at the top level, and within
@@ -422,6 +513,8 @@ mod tests {
             updated_at: ts(updated),
             merged_at: None,
             unresolved_comments: vec![],
+            checks: vec![],
+            checks_rollup: ChecksRollup::Unknown,
         }
     }
 
@@ -749,6 +842,83 @@ mod tests {
         let mut nums: Vec<u64> = flat.iter().map(|(n, _)| *n).collect();
         nums.sort_unstable();
         assert_eq!(nums, vec![1, 2]);
+    }
+
+    fn check(name: &str, state: CheckState, required: bool) -> CheckStatus {
+        CheckStatus {
+            name: name.to_string(),
+            state,
+            url: None,
+            required,
+        }
+    }
+
+    #[test]
+    fn rollup_green_when_all_required_pass() {
+        let checks = vec![
+            check("build", CheckState::Success, true),
+            check("test", CheckState::Neutral, true),
+            check("lint", CheckState::Skipped, true),
+        ];
+        assert_eq!(rollup_from_required(&checks), ChecksRollup::Green);
+    }
+
+    #[test]
+    fn rollup_red_when_a_required_check_fails() {
+        let checks = vec![
+            check("build", CheckState::Success, true),
+            check("test", CheckState::Failure, true),
+        ];
+        assert_eq!(rollup_from_required(&checks), ChecksRollup::Red);
+    }
+
+    #[test]
+    fn rollup_pending_when_a_required_check_pending_and_none_failed() {
+        let checks = vec![
+            check("build", CheckState::Success, true),
+            check("test", CheckState::Pending, true),
+        ];
+        assert_eq!(rollup_from_required(&checks), ChecksRollup::Pending);
+    }
+
+    #[test]
+    fn rollup_green_when_nonrequired_fails_but_required_passes() {
+        // The key semantic: a failing *non-required* check does not turn the
+        // signal red as long as every required check passes.
+        let checks = vec![
+            check("build", CheckState::Success, true),
+            check("optional-lint", CheckState::Failure, false),
+        ];
+        assert_eq!(rollup_from_required(&checks), ChecksRollup::Green);
+    }
+
+    #[test]
+    fn rollup_green_when_zero_required_even_if_nonrequired_fails() {
+        let checks = vec![
+            check("optional-a", CheckState::Failure, false),
+            check("optional-b", CheckState::Pending, false),
+        ];
+        assert_eq!(rollup_from_required(&checks), ChecksRollup::Green);
+    }
+
+    #[test]
+    fn compute_rollup_unknown_when_mergeable_unknown_or_rollup_absent() {
+        let green = vec![check("build", CheckState::Success, true)];
+        // mergeable UNKNOWN forces Unknown even with a passing required check.
+        assert_eq!(
+            compute_checks_rollup(&green, true, true),
+            ChecksRollup::Unknown
+        );
+        // Absent rollup forces Unknown.
+        assert_eq!(
+            compute_checks_rollup(&green, false, false),
+            ChecksRollup::Unknown
+        );
+        // Otherwise it defers to the required-only logic.
+        assert_eq!(
+            compute_checks_rollup(&green, false, true),
+            ChecksRollup::Green
+        );
     }
 
     #[test]

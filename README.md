@@ -36,7 +36,7 @@ rollup
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
 | `p`             | Switch to People view                                 |
-| `Enter`         | Open the selected PR (or release/tag page) in your browser |
+| `Enter`         | Open the selected PR (or comment / check details / release/tag page) in your browser |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
 | `Esc`           | Back to Me from People **or** Radar                   |
@@ -69,27 +69,53 @@ that PR, with `├─`/`└─`/`│` connectors — so stacked PRs read at a gl
 that targets a branch you don't have an open PR for (e.g. `main`) sits at the
 top level under its repo header.
 
-Under each PR its children are grouped into up to three ordered sections:
+Under each PR its children are grouped into up to four ordered sections:
 
-1. **Reviewers** — where each reviewer stands (see the glyph table above).
-2. **Open comments** — the first comment of every *unresolved* review thread
+1. **Checks** — a merge-readiness rollup for the PR's head commit. Collapsed by
+   default; the header shows a glyph + required ratio, e.g. `▸ Checks ✓ 4/4
+   required`. Expanding lists every check, non-required ones dimmed and tagged
+   `(not required)`. `Enter` on a check opens its details page (falling back to
+   the PR). See [Checks signal](#checks-signal) below.
+2. **Reviewers** — where each reviewer stands (see the glyph table above).
+3. **Open comments** — the first comment of every *unresolved* review thread
    (`isResolved == false`), shown as `@author excerpt (path)`. Threads whose
    diff hunk has moved or collapsed are still listed, tagged `[outdated]`.
-3. **Stacked PRs** — PRs stacked on this one, each recursing into its own
+4. **Stacked PRs** — PRs stacked on this one, each recursing into its own
    sections.
 
 Only non-empty sections appear, in that order. Every non-empty section shows a
 selectable `▸`/`▾` header that is also a **collapse control**: `l`/Right expands
-it, `h`/Left collapses it. `h`/Left on a child row (reviewer, comment, or nested
-PR) collapses its enclosing section and moves the cursor back to that section's
-header. **Reviewers is collapsed by default** (the other two start expanded), and
-its header carries a compact response-state summary — e.g. `▸ Reviewers [req, ✗
-changes]` — so a changes-requested review (`✗`) is visible at a glance without
-expanding. Collapse state is per-`(PR, section)` and survives background
-refreshes. `Enter` on a comment opens that comment's permalink; `Enter` on a PR,
-reviewer, or section header opens the PR. The same shape appears in `rollup
-report` (rendered at the default collapse state, with text tokens in the
-summary).
+it, `h`/Left collapses it. `h`/Left on a child row (check, reviewer, comment, or
+nested PR) collapses its enclosing section and moves the cursor back to that
+section's header. **Checks and Reviewers are collapsed by default** (Open
+comments and Stacked PRs start expanded); the Reviewers header carries a compact
+response-state summary — e.g. `▸ Reviewers [req, ✗ changes]` — so a
+changes-requested review (`✗`) is visible at a glance without expanding.
+Collapse state is per-`(PR, section)` and survives background refreshes. `Enter`
+on a comment opens that comment's permalink; `Enter` on a check opens its
+details; `Enter` on a PR, reviewer, or section header opens the PR. The same
+shape appears in `rollup report` (rendered at the default collapse state, with
+text tokens in the summary).
+
+### Checks signal
+
+The Checks header answers one question: *is this PR allowed to merge, ignoring
+the review requirement?* The signal is computed from **branch-protection-required
+checks only**:
+
+| Glyph | Meaning                                                                   |
+|-------|---------------------------------------------------------------------------|
+| `✓`   | Green — every required check passed (or the base branch has none required). |
+| `✗`   | Red — at least one required check failed or errored.                      |
+| `◉`   | Pending — a required check is still queued/running and none have failed.  |
+| `○`   | Unknown — GitHub hasn't computed mergeability/the rollup yet; resolves on refresh. |
+
+A **failing non-required check never turns the signal red** — it still appears in
+the expanded list, dimmed and marked `(not required)`. A PR whose base branch has
+no required checks (common for stacked PRs targeting an unprotected feature
+branch) shows green `no required checks`. A PR with no checks at all omits the
+section entirely. Because it ignores the review requirement, a PR that is only
+waiting on a review but whose required checks all pass shows **green**.
 
 ## Config
 

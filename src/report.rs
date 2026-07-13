@@ -10,9 +10,9 @@ use chrono::{DateTime, Local, Utc};
 use crate::{
     github,
     model::{
-        Pr, PrComment, PrTreeNode, ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerStatus,
-        TagInfo, authored_tree, authors_for_me, authors_for_people, group_by_person, group_by_repo,
-        human_age, merged_fetch_authors,
+        CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrTreeNode, ReleaseInfo,
+        RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo, authored_tree, authors_for_me,
+        authors_for_people, group_by_person, group_by_repo, human_age, merged_fetch_authors,
     },
 };
 
@@ -50,9 +50,10 @@ pub enum SectionKind {
 /// A key present in the set means "opposite of this section's default".
 pub type ToggledSet = std::collections::HashSet<(String, u64, SectionId)>;
 
-/// Identifies one of a PR's three collapsible child sections.
+/// Identifies one of a PR's collapsible child sections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionId {
+    Checks,
     Reviewers,
     Comments,
     Stacked,
@@ -61,16 +62,61 @@ pub enum SectionId {
 impl SectionId {
     pub fn label(self) -> &'static str {
         match self {
+            SectionId::Checks => "Checks",
             SectionId::Reviewers => "Reviewers",
             SectionId::Comments => "Open comments",
             SectionId::Stacked => "Stacked PRs",
         }
     }
 
-    /// Reviewers collapses by default (so a rejection reads from the summary
-    /// without scrolling); the other two start expanded.
+    /// Checks and Reviewers collapse by default (the merge-readiness signal and
+    /// the reviewer summary read from their headers without scrolling); Open
+    /// comments and Stacked PRs start expanded.
     pub fn default_expanded(self) -> bool {
-        !matches!(self, SectionId::Reviewers)
+        !matches!(self, SectionId::Reviewers | SectionId::Checks)
+    }
+}
+
+/// The at-a-glance merge-readiness summary carried on a Checks `SectionHeader`
+/// row: the rollup signal plus the required-check ratio shown while collapsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChecksSummary {
+    pub rollup: ChecksRollup,
+    /// Required checks that have passed (Success/Neutral/Skipped).
+    pub passed_required: usize,
+    /// Total required checks.
+    pub total_required: usize,
+}
+
+impl ChecksSummary {
+    fn of(pr: &Pr) -> Self {
+        let total_required = pr.checks.iter().filter(|c| c.required).count();
+        let passed_required = pr
+            .checks
+            .iter()
+            .filter(|c| {
+                c.required
+                    && matches!(
+                        c.state,
+                        CheckState::Success | CheckState::Neutral | CheckState::Skipped
+                    )
+            })
+            .count();
+        ChecksSummary {
+            rollup: pr.checks_rollup,
+            passed_required,
+            total_required,
+        }
+    }
+
+    /// The collapsed-header ratio text, e.g. `4/4 required`, `no required
+    /// checks`, or `unknown`. The state glyph is rendered separately.
+    pub fn ratio_text(&self) -> String {
+        match self.rollup {
+            ChecksRollup::Unknown => "unknown".to_string(),
+            _ if self.total_required == 0 => "no required checks".to_string(),
+            _ => format!("{}/{} required", self.passed_required, self.total_required),
+        }
     }
 }
 
@@ -172,17 +218,25 @@ pub enum Row<'a> {
     /// A selectable, collapsible section node (e.g. "Reviewers") sitting at a
     /// PR's child indent. `l`/Right expands, `h`/Left collapses; its child rows
     /// are only emitted when `expanded`. The display label comes from
-    /// `section.label()`. `summary` is non-empty only for Reviewers.
+    /// `section.label()`. `summary` is non-empty only for Reviewers; `checks` is
+    /// `Some` only for the Checks header.
     SectionHeader {
         section: SectionId,
         expanded: bool,
         summary: Vec<ReviewerSummaryToken>,
+        checks: Option<ChecksSummary>,
         tree_prefix: String,
     },
     /// An unresolved review-thread comment under a PR. Selectable; Enter opens
     /// the comment's permalink.
     Comment {
         c: &'a PrComment,
+        tree_prefix: String,
+    },
+    /// A single check under a PR's Checks section. Selectable; Enter opens the
+    /// check's details URL (falling back to the PR).
+    Check {
+        c: &'a CheckStatus,
         tree_prefix: String,
     },
     MergedPr {
@@ -209,6 +263,7 @@ impl Row<'_> {
                 | Row::Reviewer { .. }
                 | Row::SectionHeader { .. }
                 | Row::Comment { .. }
+                | Row::Check { .. }
                 | Row::ReleaseEntry { .. }
                 | Row::ReleaseTag { .. }
         )
@@ -271,9 +326,9 @@ pub fn build_section_authored<'a>(
 }
 
 /// Flatten one PR tree node (and its stacked children) into rows. Each PR's
-/// children are grouped into up to three ordered sections — Reviewers, Open
-/// comments, Stacked PRs — drawn with classic `├─`/`└─`/`│` connectors. Every
-/// non-empty section always emits a selectable, collapsible `SectionHeader`;
+/// children are grouped into up to four ordered sections — Checks, Reviewers,
+/// Open comments, Stacked PRs — drawn with classic `├─`/`└─`/`│` connectors.
+/// Every non-empty section always emits a selectable, collapsible `SectionHeader`;
 /// its child rows are emitted only when that `(repo, number, section)` is
 /// expanded per `toggled` (Reviewers collapsed by default, the others
 /// expanded).
@@ -307,6 +362,30 @@ fn push_pr<'a>(
     let repo = node.pr.repo.as_str();
     let number = node.pr.number;
 
+    // Checks section — emitted first, directly under the PR, collapsed by
+    // default. Its header carries the merge-readiness signal (required checks
+    // only). Omitted entirely when the PR has no checks.
+    if !node.pr.checks.is_empty() {
+        let expanded = is_expanded(toggled, repo, number, SectionId::Checks);
+        rows.push(Row::SectionHeader {
+            section: SectionId::Checks,
+            expanded,
+            summary: Vec::new(),
+            checks: Some(ChecksSummary::of(node.pr)),
+            tree_prefix: child_base.clone(),
+        });
+        if expanded {
+            let m = node.pr.checks.len();
+            for (i, c) in node.pr.checks.iter().enumerate() {
+                let conn = if i + 1 == m { "└─ " } else { "├─ " };
+                rows.push(Row::Check {
+                    c,
+                    tree_prefix: format!("{child_base}{conn}"),
+                });
+            }
+        }
+    }
+
     // Reviewers section.
     if !node.pr.reviewers.is_empty() {
         let expanded = is_expanded(toggled, repo, number, SectionId::Reviewers);
@@ -314,6 +393,7 @@ fn push_pr<'a>(
             section: SectionId::Reviewers,
             expanded,
             summary: reviewer_summary(&node.pr.reviewers),
+            checks: None,
             tree_prefix: child_base.clone(),
         });
         if expanded {
@@ -335,6 +415,7 @@ fn push_pr<'a>(
             section: SectionId::Comments,
             expanded,
             summary: Vec::new(),
+            checks: None,
             tree_prefix: child_base.clone(),
         });
         if expanded {
@@ -356,6 +437,7 @@ fn push_pr<'a>(
             section: SectionId::Stacked,
             expanded,
             summary: Vec::new(),
+            checks: None,
             tree_prefix: child_base.clone(),
         });
         if expanded {
@@ -689,9 +771,19 @@ fn render_row(
             section,
             expanded,
             summary,
+            checks,
             tree_prefix,
-        } => render_section_header_line(*section, *expanded, summary, tree_prefix, out, use_color),
+        } => render_section_header_line(
+            *section,
+            *expanded,
+            summary,
+            checks.as_ref(),
+            tree_prefix,
+            out,
+            use_color,
+        ),
         Row::Comment { c, tree_prefix } => render_comment_line(c, tree_prefix, out, use_color),
+        Row::Check { c, tree_prefix } => render_check_line(c, tree_prefix, out, use_color),
         Row::MergedPr { pr, now } => render_merged_pr_line(pr, *now, out, use_color, width),
         Row::ReleaseEntry { release, now } => {
             render_release_entry_line(release, *now, out, use_color)
@@ -706,10 +798,12 @@ fn render_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_section_header_line(
     section: SectionId,
     expanded: bool,
     summary: &[ReviewerSummaryToken],
+    checks: Option<&ChecksSummary>,
     tree_prefix: &str,
     out: &mut impl Write,
     use_color: bool,
@@ -724,7 +818,15 @@ fn render_section_header_line(
         section.label(),
         reset(use_color),
     )?;
-    if !summary.is_empty() {
+    if let Some(cs) = checks {
+        write!(
+            out,
+            " {}[{}]{}",
+            dim(use_color),
+            checks_console_summary(cs),
+            reset(use_color),
+        )?;
+    } else if !summary.is_empty() {
         let tokens: Vec<&str> = summary.iter().map(|t| t.console_label()).collect();
         write!(
             out,
@@ -735,6 +837,65 @@ fn render_section_header_line(
         )?;
     }
     writeln!(out)
+}
+
+/// Glyph-free checks summary for `rollup report`, e.g. `4/4 required`,
+/// `3/4 required failing`, `2/4 required pending`, `no required checks`,
+/// `unknown`.
+fn checks_console_summary(cs: &ChecksSummary) -> String {
+    let ratio = cs.ratio_text();
+    match cs.rollup {
+        ChecksRollup::Red => format!("{ratio} failing"),
+        ChecksRollup::Pending => format!("{ratio} pending"),
+        ChecksRollup::Green | ChecksRollup::Unknown => ratio,
+    }
+}
+
+fn render_check_line(
+    c: &CheckStatus,
+    tree_prefix: &str,
+    out: &mut impl Write,
+    use_color: bool,
+) -> io::Result<()> {
+    write!(out, "{}{}{}", dim(use_color), tree_prefix, reset(use_color))?;
+    let (glyph, glyph_color) = check_glyph(c.state);
+    if let Some(code) = glyph_color {
+        write!(
+            out,
+            "{}{}{} ",
+            fg_named(use_color, code),
+            glyph,
+            reset(use_color),
+        )?;
+    } else {
+        write!(out, "{}{}{} ", dim(use_color), glyph, reset(use_color))?;
+    }
+    // Non-required checks are de-emphasized (dim name + suffix) since they
+    // never affect the merge-readiness signal.
+    if c.required {
+        write!(out, "{}", c.name)?;
+        writeln!(out)
+    } else {
+        writeln!(
+            out,
+            "{}{} (not required){}",
+            dim(use_color),
+            c.name,
+            reset(use_color),
+        )
+    }
+}
+
+/// Console glyph + optional ANSI color code for a check state, reusing the
+/// reviewer palette (`✓` green, `✗` red, `◉` yellow, `○`/`⊘` dim).
+fn check_glyph(state: CheckState) -> (&'static str, Option<u8>) {
+    match state {
+        CheckState::Success => ("✓", Some(32)),
+        CheckState::Failure | CheckState::Error => ("✗", Some(31)),
+        CheckState::Pending => ("◉", Some(33)),
+        CheckState::Skipped => ("⊘", None),
+        CheckState::Neutral => ("○", None),
+    }
 }
 
 fn render_release_entry_line(
@@ -1070,6 +1231,17 @@ mod tests {
             updated_at: ts(updated),
             merged_at: None,
             unresolved_comments: vec![],
+            checks: vec![],
+            checks_rollup: ChecksRollup::Unknown,
+        }
+    }
+
+    fn check(name: &str, state: CheckState, required: bool) -> CheckStatus {
+        CheckStatus {
+            name: name.to_string(),
+            state,
+            url: Some(format!("https://ci/{name}")),
+            required,
         }
     }
 
@@ -1555,6 +1727,15 @@ mod tests {
                 section: SectionId::Reviewers,
                 expanded: false,
                 summary: vec![ReviewerSummaryToken::Requested],
+                checks: None,
+                tree_prefix: "  ".to_string(),
+            }
+            .is_selectable()
+        );
+        let ck = check("build", CheckState::Success, true);
+        assert!(
+            Row::Check {
+                c: &ck,
                 tree_prefix: "  ".to_string(),
             }
             .is_selectable()
@@ -1746,6 +1927,151 @@ mod tests {
             )),
             "the Open comments header remains",
         );
+    }
+
+    #[test]
+    fn build_section_authored_emits_checks_first_collapsed_by_default() {
+        // A PR with checks AND reviewers → the Checks header appears before the
+        // Reviewers header, collapsed by default (no Check rows), carrying the
+        // merge-readiness summary.
+        let mut p = pr("o/r", 1, "me", false, 100, vec![user("alice", true)]);
+        p.checks = vec![
+            check("build", CheckState::Success, true),
+            check("test", CheckState::Success, true),
+            check("lint", CheckState::Failure, false),
+        ];
+        p.checks_rollup = ChecksRollup::Green;
+        let authored = vec![p];
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
+
+        // Header order: Checks before Reviewers.
+        let header_ids: Vec<SectionId> = section
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::SectionHeader { section, .. } => Some(*section),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(header_ids, vec![SectionId::Checks, SectionId::Reviewers]);
+
+        // Checks header: collapsed, with a Green 2/2-required summary.
+        let cs = section
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::SectionHeader {
+                    section: SectionId::Checks,
+                    expanded,
+                    checks: Some(cs),
+                    ..
+                } => Some((*expanded, *cs)),
+                _ => None,
+            })
+            .expect("Checks header present");
+        assert!(!cs.0, "Checks collapsed by default");
+        assert_eq!(cs.1.rollup, ChecksRollup::Green);
+        assert_eq!(cs.1.passed_required, 2);
+        assert_eq!(cs.1.total_required, 2);
+        assert_eq!(cs.1.ratio_text(), "2/2 required");
+
+        // Collapsed → no Check rows.
+        assert!(!section.rows.iter().any(|r| matches!(r, Row::Check { .. })));
+    }
+
+    #[test]
+    fn build_section_authored_omits_checks_when_none() {
+        let p = pr("o/r", 1, "me", false, 100, vec![]);
+        let authored = vec![p];
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
+        assert!(
+            !section.rows.iter().any(|r| matches!(
+                r,
+                Row::SectionHeader {
+                    section: SectionId::Checks,
+                    ..
+                }
+            )),
+            "a PR with no checks emits no Checks header",
+        );
+    }
+
+    #[test]
+    fn build_section_authored_expand_checks_reveals_rows() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![
+            check("build", CheckState::Success, true),
+            check("lint", CheckState::Failure, false),
+        ];
+        p.checks_rollup = ChecksRollup::Green;
+        let authored = vec![p];
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Checks, true);
+        let section = build_section_authored(&authored, "me", &toggled);
+
+        let check_names: Vec<&str> = section
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Check { c, .. } => Some(c.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(check_names, vec!["build", "lint"]);
+    }
+
+    #[test]
+    fn checks_summary_ratio_text_variants() {
+        let pending = ChecksSummary {
+            rollup: ChecksRollup::Pending,
+            passed_required: 2,
+            total_required: 4,
+        };
+        assert_eq!(pending.ratio_text(), "2/4 required");
+        assert_eq!(checks_console_summary(&pending), "2/4 required pending");
+
+        let red = ChecksSummary {
+            rollup: ChecksRollup::Red,
+            passed_required: 3,
+            total_required: 4,
+        };
+        assert_eq!(checks_console_summary(&red), "3/4 required failing");
+
+        let zero = ChecksSummary {
+            rollup: ChecksRollup::Green,
+            passed_required: 0,
+            total_required: 0,
+        };
+        assert_eq!(zero.ratio_text(), "no required checks");
+
+        let unknown = ChecksSummary {
+            rollup: ChecksRollup::Unknown,
+            passed_required: 0,
+            total_required: 2,
+        };
+        assert_eq!(unknown.ratio_text(), "unknown");
+    }
+
+    #[test]
+    fn console_render_checks_header_and_rows() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![
+            check("build", CheckState::Success, true),
+            check("optional", CheckState::Failure, false),
+        ];
+        p.checks_rollup = ChecksRollup::Green;
+        let authored = vec![p];
+        // Expand so the Check rows render too.
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Checks, true);
+        let section = build_section_authored(&authored, "me", &toggled);
+        let mut out: Vec<u8> = Vec::new();
+        render_section(&section, &mut out, false, 120).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("Checks"), "{s}");
+        assert!(s.contains("[1/1 required]"), "{s}");
+        assert!(s.contains("build"), "{s}");
+        assert!(s.contains("optional (not required)"), "{s}");
     }
 
     #[test]
