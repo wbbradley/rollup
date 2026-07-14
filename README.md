@@ -124,8 +124,8 @@ changes-requested review (`✗`) is visible at a glance without expanding.
 Collapse state is per-`(PR, section)` and survives background refreshes. `Enter`
 on a comment opens that comment's permalink; `Enter` on a check opens its
 details; `Enter` on a PR, reviewer, or section header opens the PR. The same
-shape appears in `rollup report` (rendered at the default collapse state, with
-text tokens in the summary).
+shape appears in `rollup report`, with every section expanded so all details
+are visible (and with text tokens in the summary).
 
 Press `/` in the Me view to start an incremental Authored-tree search. The
 footer changes to `inc search: <query>`, and every printable character or

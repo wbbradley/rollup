@@ -925,9 +925,21 @@ pub fn build_full_report<'a>(
     let allowed: BTreeSet<String> = merged_fetch_authors(viewer, authored, reviewing)
         .into_iter()
         .collect();
-    // The console has no interactive state, so it renders at defaults:
-    // Reviewers collapsed, Open comments / Stacked PRs expanded.
-    let toggled = ToggledSet::new();
+    // The console has no interactive controls, so make every section visible.
+    // Checks and Reviewers are collapsed by default in the TUI and therefore
+    // need an explicit deviation here; Comments and Stacked already default
+    // to expanded.
+    let mut toggled = ToggledSet::new();
+    for pr in authored {
+        set_expanded(&mut toggled, &pr.repo, pr.number, SectionId::Checks, true);
+        set_expanded(
+            &mut toggled,
+            &pr.repo,
+            pr.number,
+            SectionId::Reviewers,
+            true,
+        );
+    }
     Report {
         viewer,
         loaded_at,
@@ -1951,6 +1963,48 @@ mod tests {
         ] {
             assert!(s.contains(title), "missing {title:?} in:\n{s}");
         }
+    }
+
+    #[test]
+    fn full_console_report_expands_every_authored_section() {
+        let viewer = "me";
+        let mut p = pr("o/r", 1, viewer, false, 100, vec![user("alice", true)]);
+        p.checks = vec![check("build", CheckState::Success, true)];
+        p.checks_rollup = ChecksRollup::Green;
+        p.unresolved_comments = vec![comment("bob", "please fix", None, false)];
+        let authored = vec![p];
+        let report = build_full_report(viewer, &authored, &[], &[], &[], ts_utc(1_000_000), None);
+        let section = report
+            .sections
+            .iter()
+            .find(|section| section.kind == SectionKind::MeAuthored)
+            .unwrap();
+
+        assert!(section.rows.iter().all(|row| !matches!(
+            row,
+            Row::SectionHeader {
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Reviewer { .. }))
+        );
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Comment { .. }))
+        );
     }
 
     #[test]
