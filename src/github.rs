@@ -59,7 +59,7 @@ fragment AuthoredPrFields on PullRequest {
           contexts(first: 100) {
             nodes {
               __typename
-              ... on CheckRun { name status conclusion detailsUrl }
+              ... on CheckRun { name status conclusion startedAt detailsUrl }
               ... on StatusContext { context state targetUrl }
             }
           }
@@ -696,6 +696,8 @@ enum CheckContextNode {
         name: Option<String>,
         status: Option<String>,
         conclusion: Option<String>,
+        #[serde(rename = "startedAt")]
+        started_at: Option<String>,
         #[serde(rename = "detailsUrl")]
         details_url: Option<String>,
         #[serde(rename = "isRequired")]
@@ -727,6 +729,12 @@ fn checks_from_commits(commits: &Option<CommitsConnection>) -> (Vec<CheckStatus>
         return (Vec::new(), false);
     };
     let mut checks = Vec::new();
+    // A retried/re-run workflow leaves the superseded CheckRun in the rollup
+    // alongside its replacement. Keep one run per check name, selected by its
+    // start time, so an older failure/cancellation cannot mask a newer result.
+    // StatusContext nodes are not CheckRun instances and GitHub already rolls
+    // them up by context, so they remain untouched.
+    let mut check_run_indices: HashMap<String, (usize, Option<String>)> = HashMap::new();
     if let Some(contexts) = rollup.contexts.as_ref() {
         for ctx in contexts.nodes.iter().flatten() {
             match ctx {
@@ -734,16 +742,27 @@ fn checks_from_commits(commits: &Option<CommitsConnection>) -> (Vec<CheckStatus>
                     name,
                     status,
                     conclusion,
+                    started_at,
                     details_url,
                     ..
                 } => {
                     let Some(name) = name.clone() else { continue };
-                    checks.push(CheckStatus {
-                        name,
+                    let check = CheckStatus {
+                        name: name.clone(),
                         state: check_run_state(status.as_deref(), conclusion.as_deref()),
                         url: details_url.clone().filter(|u| !u.is_empty()),
                         required: false,
-                    });
+                    };
+                    if let Some((index, previous_started_at)) = check_run_indices.get_mut(&name) {
+                        if check_run_is_newer(started_at.as_deref(), previous_started_at.as_deref())
+                        {
+                            checks[*index] = check;
+                            *previous_started_at = started_at.clone();
+                        }
+                    } else {
+                        check_run_indices.insert(name, (checks.len(), started_at.clone()));
+                        checks.push(check);
+                    }
                 }
                 CheckContextNode::StatusContext {
                     context,
@@ -766,6 +785,20 @@ fn checks_from_commits(commits: &Option<CommitsConnection>) -> (Vec<CheckStatus>
         }
     }
     (checks, true)
+}
+
+/// Whether a duplicate check run should replace the instance currently kept.
+/// `startedAt` is an RFC 3339 timestamp, whose normalized GitHub representation
+/// sorts chronologically as text. Missing timestamps only arise in malformed or
+/// partial payloads; prefer a timestamped run, then the later payload entry as a
+/// deterministic fallback when both are missing.
+fn check_run_is_newer(candidate: Option<&str>, current: Option<&str>) -> bool {
+    match (candidate, current) {
+        (Some(candidate), Some(current)) => candidate >= current,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
 }
 
 /// Map a `CheckRun`'s status/conclusion to a [`CheckState`]. A run that hasn't
@@ -1443,6 +1476,37 @@ mod tests {
         assert_eq!(checks[1].url, None);
         assert_eq!(checks[2].name, "legacy");
         assert_eq!(checks[2].state, CheckState::Failure);
+    }
+
+    #[test]
+    fn checks_from_commits_keeps_latest_duplicate_check_run() {
+        // GitHub returns superseded workflow jobs alongside their replacements.
+        // Deliberately put the newest run first to prove selection is based on
+        // startedAt rather than response order.
+        let json = r#"{
+            "nodes": [{
+                "commit": {
+                    "statusCheckRollup": {
+                        "contexts": { "nodes": [
+                            { "__typename": "CheckRun", "name": "validate-openapi", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-07-14T17:58:08Z", "detailsUrl": "https://ci/new" },
+                            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-07-14T17:58:05Z", "detailsUrl": "https://ci/build" },
+                            { "__typename": "CheckRun", "name": "validate-openapi", "status": "COMPLETED", "conclusion": "CANCELLED", "startedAt": "2026-07-14T17:58:03Z", "detailsUrl": "https://ci/old" }
+                        ]}
+                    }
+                }
+            }]
+        }"#;
+        let commits: CommitsConnection = serde_json::from_str(json).unwrap();
+        let (checks, present) = checks_from_commits(&Some(commits));
+        assert!(present);
+        assert_eq!(checks.len(), 2);
+
+        let validate = checks
+            .iter()
+            .find(|check| check.name == "validate-openapi")
+            .unwrap();
+        assert_eq!(validate.state, CheckState::Success);
+        assert_eq!(validate.url.as_deref(), Some("https://ci/new"));
     }
 
     #[test]

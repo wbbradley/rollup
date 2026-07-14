@@ -103,7 +103,8 @@ Under each PR its children are grouped into up to four ordered sections:
    default; the header shows a glyph + required ratio, e.g. `▸ Checks ✓ 4/4
    required`. Expanding lists every check, non-required ones dimmed and tagged
    `(not required)`, ordered with failures and incomplete checks first and
-   successful checks last. `Enter` on a check opens its details page (falling back to
+   successful checks last. When a check has been retried or re-run, only its
+   latest run is shown. `Enter` on a check opens its details page (falling back to
    the PR). See [Checks signal](#checks-signal) below.
 2. **Reviewers** — where each reviewer stands (see the glyph table above).
 3. **Open comments** — the first comment of every *unresolved* review thread
