@@ -2075,6 +2075,22 @@ mod tests {
     }
 
     #[test]
+    fn console_render_marks_only_outdated_comments() {
+        let current = comment("alice", "still applies", None, false);
+        let outdated = comment("bob", "the diff moved", None, true);
+        let mut out = Vec::new();
+
+        render_comment_line(&current, "", &mut out, false).unwrap();
+        render_comment_line(&outdated, "", &mut out, false).unwrap();
+
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(
+            lines,
+            ["@alice still applies", "@bob the diff moved [outdated]"]
+        );
+    }
+
+    #[test]
     fn reviewer_summary_dedups_and_orders() {
         let reviewers = vec![
             user("alice", true),                              // still requested
