@@ -822,6 +822,58 @@ mod tests {
             .collect()
     }
 
+    /// Read one HTTP response using its Content-Length as the completion
+    /// signal. Waiting for connection teardown instead makes the test depend on
+    /// whether the OS reports the peer's close as EOF or ConnectionReset.
+    fn read_http_response(stream: &mut TcpStream) -> io::Result<String> {
+        let mut response = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let count = stream.read(&mut chunk)?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before HTTP headers completed",
+                ));
+            }
+            response.extend_from_slice(&chunk[..count]);
+            if let Some(end) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&response[..header_end])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>())
+            })
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+            })?;
+        let response_end = header_end + content_length;
+        while response.len() < response_end {
+            let remaining = response_end - response.len();
+            let mut chunk = [0_u8; 1024];
+            let count = stream.read(&mut chunk[..remaining.min(1024)])?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before HTTP body completed",
+                ));
+            }
+            response.extend_from_slice(&chunk[..count]);
+        }
+        response.truncate(response_end);
+        String::from_utf8(response)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
     #[test]
     fn authored_renders_sorted_nested_sections_and_safe_links() {
         let html = render_authored(&rich_snapshot());
@@ -1032,8 +1084,10 @@ mod tests {
         stream
             .write_all(b"GET /merged HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        // Explicitly signal that the request is complete, then synchronize on
+        // the response's protocol framing rather than the server socket's drop.
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let response = read_http_response(&mut stream).unwrap();
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
             "unexpected response: {response:?}"
