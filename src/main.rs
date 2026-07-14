@@ -4,6 +4,7 @@ mod github;
 mod model;
 mod report;
 mod ui;
+mod web;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();

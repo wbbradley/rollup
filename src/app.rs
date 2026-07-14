@@ -13,7 +13,7 @@ use crate::{
     github::{self, Data},
     model::{CheckStatus, Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
     report::{self, Row, Section, SectionId},
-    ui,
+    ui, web,
 };
 
 fn selected_release_url(state: &AppState) -> Option<String> {
@@ -443,20 +443,28 @@ fn count_selectable(section: &Section<'_>) -> usize {
 }
 
 pub fn run() -> Result<()> {
+    // Bind before entering raw terminal mode so a port conflict returns a clean
+    // contextual error without requiring terminal restoration.
+    let web_server = web::start(web::DEFAULT_ADDRESS)?;
+    let web_snapshots = web_server.snapshots();
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal);
+    let result = run_app(&mut terminal, &web_snapshots);
     ratatui::restore();
     result
 }
 
-fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
+fn run_app(terminal: &mut DefaultTerminal, web_snapshots: &web::SnapshotStore) -> Result<()> {
     let mut state = AppState::new();
+    web_snapshots.publish(web::WebSnapshot::from_app(&state));
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_fetch(&tx);
 
     let mut dirty = true;
     loop {
         let changed = drain_msgs(&rx, &mut state, &tx);
+        if changed {
+            web_snapshots.publish(web::WebSnapshot::from_app(&state));
+        }
 
         if should_redraw(dirty, changed, state.loading) {
             terminal.draw(|f| ui::draw(f, &mut state))?;
@@ -527,6 +535,9 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         KeyCode::Char('h') | KeyCode::Left => toggle_section(&mut state, false),
                         _ => {}
                     }
+                    // This includes the transition to loading on manual `r`,
+                    // so browsers reflect refresh state before the fetch ends.
+                    web_snapshots.publish(web::WebSnapshot::from_app(&state));
                     dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,

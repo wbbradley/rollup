@@ -89,7 +89,7 @@ pub struct ChecksSummary {
 }
 
 impl ChecksSummary {
-    fn of(pr: &Pr) -> Self {
+    pub fn of(pr: &Pr) -> Self {
         let total_required = pr.checks.iter().filter(|c| c.required).count();
         let passed_required = pr
             .checks
@@ -174,7 +174,7 @@ pub fn set_expanded(t: &mut ToggledSet, repo: &str, number: u64, id: SectionId, 
 /// first (any reviewer still requested), then, for reviewers who have reviewed,
 /// each distinct verdict in the order approved, changes, commented, dismissed.
 /// `NoReview` contributes nothing on its own (only via `requested`).
-fn reviewer_summary(reviewers: &[ReviewerStatus]) -> Vec<ReviewerSummaryToken> {
+pub fn reviewer_summary(reviewers: &[ReviewerStatus]) -> Vec<ReviewerSummaryToken> {
     let mut out: Vec<ReviewerSummaryToken> = Vec::new();
     if reviewers.iter().any(|r| r.requested) {
         out.push(ReviewerSummaryToken::Requested);
@@ -823,7 +823,7 @@ fn render_section_header_line(
             out,
             " {}[{}]{}",
             dim(use_color),
-            checks_console_summary(cs),
+            checks_summary_text(cs),
             reset(use_color),
         )?;
     } else if !summary.is_empty() {
@@ -842,7 +842,7 @@ fn render_section_header_line(
 /// Glyph-free checks summary for `rollup report`, e.g. `4/4 required`,
 /// `3/4 required failing`, `2/4 required pending`, `no required checks`,
 /// `unknown`.
-fn checks_console_summary(cs: &ChecksSummary) -> String {
+pub fn checks_summary_text(cs: &ChecksSummary) -> String {
     let ratio = cs.ratio_text();
     match cs.rollup {
         ChecksRollup::Red => format!("{ratio} failing"),
@@ -2028,14 +2028,14 @@ mod tests {
             total_required: 4,
         };
         assert_eq!(pending.ratio_text(), "2/4 required");
-        assert_eq!(checks_console_summary(&pending), "2/4 required pending");
+        assert_eq!(checks_summary_text(&pending), "2/4 required pending");
 
         let red = ChecksSummary {
             rollup: ChecksRollup::Red,
             passed_required: 3,
             total_required: 4,
         };
-        assert_eq!(checks_console_summary(&red), "3/4 required failing");
+        assert_eq!(checks_summary_text(&red), "3/4 required failing");
 
         let zero = ChecksSummary {
             rollup: ChecksRollup::Green,
