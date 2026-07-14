@@ -15,7 +15,10 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::{
     app::{AppState, Msg},
-    model::{CheckState, ChecksRollup, Pr, PrTreeNode, ReviewState, authored_tree, group_by_repo},
+    model::{
+        CheckState, ChecksRollup, Pr, PrTreeNode, ReviewState, authored_tree,
+        checks_by_display_priority, group_by_repo,
+    },
     report::{
         self, ChecksSummary, Row, build_section_merged, checks_summary_text, reviewer_summary,
     },
@@ -418,7 +421,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     out.push_str("<li class=\"pr\"><article><h3>");
     let _ = write!(
         out,
-        "<a href=\"{}\"><span class=\"number\">#{}</span> {}</a>{}",
+        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span> {}</a>{}",
         escape(&pr.url),
         pr.number,
         escape(&pr.title),
@@ -440,7 +443,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
         };
         let _ = write!(
             out,
-            "<details class=\"pr-section checks\" data-state-key=\"{}\"><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            "<details class=\"pr-section checks\" data-state-key=\"{}\"><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
             escape(&section_state_key(pr, "checks")),
             class,
             escape(&format!(
@@ -450,7 +453,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             )),
             escape(&pr.url)
         );
-        for check in &pr.checks {
+        for check in checks_by_display_priority(&pr.checks) {
             let target = check
                 .url
                 .as_deref()
@@ -458,15 +461,16 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
                 .unwrap_or(&pr.url);
             let _ = write!(
                 out,
-                "<li><a href=\"{}\"><span class=\"state\">{} {}</span> {}{}</a></li>",
+                "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"state {}\" aria-hidden=\"true\">{}</span><span class=\"check-state-label\">{}</span> {}{}</a></li>",
                 escape(target),
+                check_state_class(check.state),
                 check_state_symbol(check.state),
                 check_state_label(check.state),
                 escape(&check.name),
                 if check.required {
-                    ""
+                    " <span class=\"required-marker\" title=\"Required check\" aria-label=\"required check\">◆</span>"
                 } else {
-                    " <span class=\"muted\">(not required)</span>"
+                    ""
                 }
             );
         }
@@ -481,7 +485,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             .join(", ");
         let _ = write!(
             out,
-            "<details class=\"pr-section reviewers\" data-state-key=\"{}\"><summary>Reviewers <span class=\"muted\">[{}]</span></summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            "<details class=\"pr-section reviewers\" data-state-key=\"{}\"><summary>Reviewers <span class=\"muted\">[{}]</span></summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
             escape(&section_state_key(pr, "reviewers")),
             escape(&summary),
             escape(&pr.url)
@@ -494,7 +498,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             };
             let _ = write!(
                 out,
-                "<li><span class=\"state\">{}</span> {} <span class=\"muted\">{} {}</span> <a class=\"row-link\" href=\"{}\">PR</a></li>",
+                "<li><span class=\"state\">{}</span> {} <span class=\"muted\">{} {}</span> <a class=\"row-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">PR</a></li>",
                 review_state_symbol(reviewer.state),
                 escape(&reviewer.login),
                 review_state_label(reviewer.state),
@@ -508,7 +512,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     if !pr.unresolved_comments.is_empty() {
         let _ = write!(
             out,
-            "<details class=\"pr-section comments\" data-state-key=\"{}\" open><summary>Open comments</summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            "<details class=\"pr-section comments\" data-state-key=\"{}\" open><summary>Open comments</summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
             escape(&section_state_key(pr, "comments")),
             escape(&pr.url)
         );
@@ -525,7 +529,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             };
             let _ = write!(
                 out,
-                "<li><a href=\"{}\">@{} — {}{}{}</a></li>",
+                "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">@{} — {}{}{}</a></li>",
                 escape(&comment.url),
                 escape(&comment.author),
                 escape(&comment.body),
@@ -539,7 +543,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     if !node.children.is_empty() {
         let _ = write!(
             out,
-            "<details class=\"pr-section stacked\" data-state-key=\"{}\" open><summary>Stacked PRs</summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul class=\"pr-tree\">",
+            "<details class=\"pr-section stacked\" data-state-key=\"{}\" open><summary>Stacked PRs</summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul class=\"pr-tree\">",
             escape(&section_state_key(pr, "stacked")),
             escape(&pr.url)
         );
@@ -575,7 +579,7 @@ fn render_merged(snapshot: &WebSnapshot, now: DateTime<Utc>) -> String {
                     .unwrap_or_default();
                 let _ = write!(
                     out,
-                    "<li><a href=\"{}\"><span class=\"number\">#{}</span> {}</a><div class=\"meta\">{} · {} · @{}</div></li>",
+                    "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span> {}</a><div class=\"meta\">{} · {} · @{}</div></li>",
                     escape(&pr.url),
                     pr.number,
                     escape(&pr.title),
@@ -628,6 +632,15 @@ fn check_state_symbol(state: CheckState) -> &'static str {
         CheckState::Pending => "◉",
         CheckState::Skipped => "⊘",
         CheckState::Neutral => "○",
+    }
+}
+
+fn check_state_class(state: CheckState) -> &'static str {
+    match state {
+        CheckState::Success => "ok",
+        CheckState::Failure | CheckState::Error => "bad",
+        CheckState::Pending => "pending",
+        CheckState::Skipped | CheckState::Neutral => "muted",
     }
 }
 
@@ -708,7 +721,7 @@ const SCRIPT: &str = r#"
 "#;
 
 const CSS: &str = r#"
-:root{color-scheme:light dark;--bg:#f7f7f4;--panel:#fff;--text:#20221f;--muted:#686d66;--line:#d8dbd5;--link:#145ea8;--ok:#17813d;--bad:#ba2b2b;--pending:#987000}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,sans-serif}body>header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem max(1rem,calc((100% - 960px)/2));background:var(--panel);border-bottom:1px solid var(--line)}nav{display:flex;gap:.4rem}nav a{padding:.35rem .6rem;border-radius:.4rem;text-decoration:none}nav a[aria-current=page]{background:var(--link);color:#fff}.viewer,.muted,.meta,.loaded{color:var(--muted)}.viewer{margin-left:.6rem}main{max-width:960px;margin:0 auto;padding:1.4rem 1rem 4rem}.status{padding:.7rem 1rem;margin-bottom:1rem;border:1px solid var(--line);border-radius:.5rem;background:var(--panel)}.status p{margin:.2rem 0}.error,.bad{color:var(--bad)}.warning,.pending{color:var(--pending)}.ok{color:var(--ok)}.page-title{display:flex;justify-content:space-between;align-items:end;gap:1rem}.page-title h1{margin:0}.page-title p{margin:.15rem 0 0;color:var(--muted)}.refresh button{padding:.45rem .8rem;border:1px solid var(--line);border-radius:.4rem;background:var(--panel);color:var(--text);font:inherit;cursor:pointer}.refresh button:hover:not(:disabled){border-color:var(--link);color:var(--link)}.refresh button:disabled{cursor:wait;color:var(--muted)}.repo{margin-top:1.6rem}.repo h2{font-size:1rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:.35rem}.pr-tree,.pr-section ul{list-style:none;padding-left:1rem}.pr{position:relative;margin:.55rem 0;padding-left:.8rem;border-left:2px solid var(--line)}.pr article>h3{font-size:1rem;margin:.2rem 0}.pr a,.merged-list a{color:var(--link)}.number{font-variant-numeric:tabular-nums}.badge{display:inline-block;padding:.05rem .35rem;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.78rem}.pr-section{margin:.35rem 0 .35rem .2rem}.pr-section>summary{cursor:pointer;font-weight:600}.pr-section ul{margin:.3rem 0}.pr-section li{margin:.25rem 0}.context-link{margin:.25rem 0 .25rem 1rem;font-size:.85rem}.row-link{margin-left:.35rem}.state{display:inline-block;min-width:1.2rem}.merged-list{padding:0;list-style:none}.merged-list li{padding:.8rem 1rem;margin:.65rem 0;background:var(--panel);border:1px solid var(--line);border-radius:.5rem}.meta{font-size:.85rem;margin-top:.2rem}.empty{padding:2rem;text-align:center;color:var(--muted)}@media(max-width:600px){body>header{position:static;display:block}nav{margin-top:.6rem;overflow-x:auto}.pr-tree,.pr-section ul{padding-left:.45rem}.pr{padding-left:.55rem}main{padding-top:1rem}}@media(prefers-color-scheme:dark){:root{--bg:#151715;--panel:#1e211e;--text:#e5e8e3;--muted:#a4aaa1;--line:#3b403a;--link:#75b7ff;--ok:#66ce84;--bad:#ff8585;--pending:#e9c45d}}
+:root{color-scheme:light dark;--bg:#f7f7f4;--panel:#fff;--text:#20221f;--muted:#686d66;--line:#d8dbd5;--link:#145ea8;--ok:#17813d;--bad:#ba2b2b;--pending:#987000}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,sans-serif}body>header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem max(1rem,calc((100% - 960px)/2));background:var(--panel);border-bottom:1px solid var(--line)}nav{display:flex;gap:.4rem}nav a{padding:.35rem .6rem;border-radius:.4rem;text-decoration:none}nav a[aria-current=page]{background:var(--link);color:#fff}.viewer,.muted,.meta,.loaded{color:var(--muted)}.viewer{margin-left:.6rem}main{max-width:960px;margin:0 auto;padding:1.4rem 1rem 4rem}.status{padding:.7rem 1rem;margin-bottom:1rem;border:1px solid var(--line);border-radius:.5rem;background:var(--panel)}.status p{margin:.2rem 0}.error,.bad{color:var(--bad)}.warning,.pending{color:var(--pending)}.ok{color:var(--ok)}.page-title{display:flex;justify-content:space-between;align-items:end;gap:1rem}.page-title h1{margin:0}.page-title p{margin:.15rem 0 0;color:var(--muted)}.refresh button{padding:.45rem .8rem;border:1px solid var(--line);border-radius:.4rem;background:var(--panel);color:var(--text);font:inherit;cursor:pointer}.refresh button:hover:not(:disabled){border-color:var(--link);color:var(--link)}.refresh button:disabled{cursor:wait;color:var(--muted)}.repo{margin-top:1.6rem}.repo h2{font-size:1rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:.35rem}.pr-tree,.pr-section ul{list-style:none;padding-left:1rem}.pr{position:relative;margin:.55rem 0;padding-left:.8rem;border-left:2px solid var(--line)}.pr article>h3{font-size:1rem;margin:.2rem 0}.pr a,.merged-list a{color:var(--link)}.number{font-variant-numeric:tabular-nums}.badge{display:inline-block;padding:.05rem .35rem;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.78rem}.pr-section{margin:.35rem 0 .35rem .2rem}.pr-section>summary{cursor:pointer;font-weight:600}.pr-section ul{margin:.3rem 0}.pr-section li{margin:.25rem 0}.context-link{margin:.25rem 0 .25rem 1rem;font-size:.85rem}.row-link{margin-left:.35rem}.state{display:inline-block;min-width:1.2rem}.required-marker{color:var(--muted);font-size:.7em;vertical-align:.15em}.merged-list{padding:0;list-style:none}.merged-list li{padding:.8rem 1rem;margin:.65rem 0;background:var(--panel);border:1px solid var(--line);border-radius:.5rem}.meta{font-size:.85rem;margin-top:.2rem}.empty{padding:2rem;text-align:center;color:var(--muted)}@media(max-width:600px){body>header{position:static;display:block}nav{margin-top:.6rem;overflow-x:auto}.pr-tree,.pr-section ul{padding-left:.45rem}.pr{padding-left:.55rem}main{padding-top:1rem}}@media(prefers-color-scheme:dark){:root{--bg:#151715;--panel:#1e211e;--text:#e5e8e3;--muted:#a4aaa1;--line:#3b403a;--link:#75b7ff;--ok:#66ce84;--bad:#ff8585;--pending:#e9c45d}}
 "#;
 
 #[cfg(test)]
@@ -819,13 +832,29 @@ mod tests {
         assert!(html.contains("<details class=\"pr-section comments\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section stacked\" data-state-key="));
         assert!(html.contains("green — 1/1 required"));
-        assert!(html.contains("✓ success"));
-        assert!(html.contains("(not required)"));
+        assert!(html.contains(
+            "<span class=\"state ok\" aria-hidden=\"true\">✓</span><span class=\"check-state-label\">success</span>"
+        ));
+        assert!(html.contains(
+            "<span class=\"state bad\" aria-hidden=\"true\">✗</span><span class=\"check-state-label\">failure</span>"
+        ));
+        assert!(
+            html.find(" optional</a>").unwrap() < html.find(" required &amp; good <span").unwrap()
+        );
+        assert_eq!(html.matches("class=\"required-marker\"").count(), 1);
+        assert!(html.contains("aria-label=\"required check\">◆</span>"));
+        assert!(!html.contains("(not required)"));
         assert!(html.contains("changes requested (reviewed)"));
         assert!(html.contains("approved [req]"));
         assert!(html.contains("outdated"));
         assert!(html.contains("href=\"https://checks.test/?x=1&amp;y=2\""));
         assert!(html.contains("href=\"https://example.test/?a=1&amp;b=&quot;two&quot;\""));
+        assert_eq!(
+            html.matches("href=\"https").count(),
+            html.matches("target=\"_blank\" rel=\"noopener noreferrer\"")
+                .count()
+        );
+        assert!(!html.contains("href=\"/\" target=\"_blank\""));
         assert!(!html.contains("alice<script>"));
         assert!(!html.contains("eve<img>"));
         assert!(html.contains("say &lt;hello&gt; &amp; goodbye"));
@@ -941,6 +970,11 @@ mod tests {
         assert!(!html.contains("#4</span>"));
         assert!(html.contains("r/m"));
         assert!(html.contains("@bob"));
+        assert_eq!(
+            html.matches("href=\"https").count(),
+            html.matches("target=\"_blank\" rel=\"noopener noreferrer\"")
+                .count()
+        );
     }
 
     #[test]

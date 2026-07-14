@@ -53,6 +53,20 @@ pub struct CheckStatus {
     pub required: bool,
 }
 
+/// Return checks in attention-first display order while preserving GitHub's
+/// order within each state group.
+pub fn checks_by_display_priority(checks: &[CheckStatus]) -> Vec<&CheckStatus> {
+    let mut ordered: Vec<&CheckStatus> = checks.iter().collect();
+    ordered.sort_by_key(|check| match check.state {
+        CheckState::Failure | CheckState::Error => 0,
+        CheckState::Pending => 1,
+        CheckState::Neutral => 2,
+        CheckState::Skipped => 3,
+        CheckState::Success => 4,
+    });
+    ordered
+}
+
 /// The at-a-glance merge-readiness signal for a PR's Checks header, computed
 /// from its *branch-protection-required* checks only (see
 /// [`compute_checks_rollup`]). Independent of the review requirement.
@@ -851,6 +865,36 @@ mod tests {
             url: None,
             required,
         }
+    }
+
+    #[test]
+    fn checks_display_failures_then_incomplete_then_completed() {
+        let checks = vec![
+            check("success-a", CheckState::Success, true),
+            check("skipped", CheckState::Skipped, false),
+            check("pending", CheckState::Pending, true),
+            check("error", CheckState::Error, true),
+            check("neutral", CheckState::Neutral, false),
+            check("failure", CheckState::Failure, true),
+            check("success-b", CheckState::Success, false),
+        ];
+
+        let names: Vec<&str> = checks_by_display_priority(&checks)
+            .into_iter()
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "error",
+                "failure",
+                "pending",
+                "neutral",
+                "skipped",
+                "success-a",
+                "success-b",
+            ]
+        );
     }
 
     #[test]

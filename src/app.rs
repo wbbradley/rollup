@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
@@ -59,6 +59,23 @@ pub enum ViewMode {
     Radar,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AuthoredSearch {
+    #[default]
+    Normal,
+    Editing(String),
+    Filtered(String),
+}
+
+impl AuthoredSearch {
+    pub fn query(&self) -> Option<&str> {
+        match self {
+            Self::Normal => None,
+            Self::Editing(query) | Self::Filtered(query) => Some(query),
+        }
+    }
+}
+
 pub enum Msg {
     Fetched(Result<Data>),
     Action { label: String, result: Result<()> },
@@ -89,6 +106,11 @@ pub struct AppState {
     /// default are stored. Not reset by `apply`, so collapse state survives
     /// background refetches.
     pub toggled: report::ToggledSet,
+    /// Incremental/committed filter state for the TUI's Authored pane.
+    pub authored_search: AuthoredSearch,
+    /// Temporary folds made inside a committed filtered tree. Kept separate
+    /// from `toggled` so clearing search restores the prior collapse state.
+    pub search_collapsed: report::ToggledSet,
     /// Persisted across frames so scroll offset is sticky — `ui` only moves
     /// the viewport when the selection crosses a scroll-margin boundary.
     pub authored_list_state: ListState,
@@ -123,6 +145,8 @@ impl AppState {
             releases_sel: 0,
             releases: Vec::new(),
             toggled: report::ToggledSet::new(),
+            authored_search: AuthoredSearch::Normal,
+            search_collapsed: report::ToggledSet::new(),
             authored_list_state: ListState::default(),
             reviewing_list_state: ListState::default(),
             people_list_state: ListState::default(),
@@ -195,7 +219,21 @@ impl AppState {
     }
 
     pub fn authored_section(&self) -> Section<'_> {
-        report::build_section_authored(&self.authored, self.viewer_str(), &self.toggled)
+        match self
+            .authored_search
+            .query()
+            .filter(|query| !query.is_empty())
+        {
+            Some(query) => report::build_section_authored_filtered(
+                &self.authored,
+                self.viewer_str(),
+                query,
+                &self.search_collapsed,
+            ),
+            None => {
+                report::build_section_authored(&self.authored, self.viewer_str(), &self.toggled)
+            }
+        }
     }
 
     pub fn people_section(&self) -> Section<'_> {
@@ -480,6 +518,11 @@ fn run_app(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if handle_authored_search_key(&mut state, key) {
+                        web_snapshots.publish(web::WebSnapshot::from_app(&state));
+                        dirty = true;
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Esc => {
@@ -549,6 +592,72 @@ fn run_app(
         }
     }
     Ok(())
+}
+
+/// Handle Authored search before global bindings. While editing, every key is
+/// consumed so query characters such as `q`, `r`, `p`, and `e` cannot trigger
+/// application commands.
+fn handle_authored_search_key(state: &mut AppState, key: KeyEvent) -> bool {
+    if state.mode != ViewMode::Me {
+        return false;
+    }
+
+    let editing = matches!(state.authored_search, AuthoredSearch::Editing(_));
+    let filtered = matches!(state.authored_search, AuthoredSearch::Filtered(_));
+    let plain_char = !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT);
+
+    if editing {
+        match key.code {
+            KeyCode::Esc => state.authored_search = AuthoredSearch::Normal,
+            KeyCode::Enter => {
+                let query = match std::mem::take(&mut state.authored_search) {
+                    AuthoredSearch::Editing(query) => query,
+                    _ => unreachable!("editing state checked above"),
+                };
+                state.authored_search = if query.is_empty() {
+                    AuthoredSearch::Normal
+                } else {
+                    AuthoredSearch::Filtered(query)
+                };
+            }
+            KeyCode::Backspace => {
+                if let AuthoredSearch::Editing(query) = &mut state.authored_search {
+                    query.pop();
+                }
+            }
+            KeyCode::Char(character) if plain_char => {
+                if let AuthoredSearch::Editing(query) = &mut state.authored_search {
+                    query.push(character);
+                }
+            }
+            _ => {}
+        }
+        reset_authored_search_layout(state);
+        return true;
+    }
+
+    if filtered && key.code == KeyCode::Esc {
+        state.authored_search = AuthoredSearch::Normal;
+        state.search_collapsed.clear();
+        reset_authored_search_layout(state);
+        return true;
+    }
+
+    if key.code == KeyCode::Char('/') && plain_char {
+        state.authored_search = AuthoredSearch::Editing(String::new());
+        state.search_collapsed.clear();
+        reset_authored_search_layout(state);
+        return true;
+    }
+
+    false
+}
+
+fn reset_authored_search_layout(state: &mut AppState) {
+    let len = count_selectable(&state.authored_section());
+    state.authored_sel = state.authored_sel.min(len.saturating_sub(1));
+    *state.authored_list_state.offset_mut() = 0;
 }
 
 fn should_redraw(dirty: bool, changed: bool, loading: bool) -> bool {
@@ -716,7 +825,16 @@ fn toggle_section(state: &mut AppState, expand: bool) {
     if expand && !is_header {
         return;
     }
-    report::set_expanded(&mut state.toggled, &repo, number, sec, expand);
+    if matches!(state.authored_search, AuthoredSearch::Filtered(_)) {
+        let key = (repo.clone(), number, sec);
+        if expand {
+            state.search_collapsed.remove(&key);
+        } else {
+            state.search_collapsed.insert(key);
+        }
+    } else {
+        report::set_expanded(&mut state.toggled, &repo, number, sec, expand);
+    }
     // Land the cursor on the toggled section's header in the rebuilt rows.
     let section = state.authored_section();
     if let Some(idx) = header_sel_index(&section.rows, &repo, number, sec) {
@@ -1221,5 +1339,145 @@ mod tests {
         second_acknowledgment.try_recv().unwrap();
         assert!(snapshots.load().is_loading());
         assert_eq!(launches.get(), 1);
+    }
+
+    fn press(state: &mut AppState, code: KeyCode) -> bool {
+        handle_authored_search_key(state, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn slash_starts_search_only_in_me_and_editing_consumes_global_key_characters() {
+        let mut state = me_state(vec![simple_pr(1, "main", "a", vec![])]);
+        assert!(press(&mut state, KeyCode::Char('/')));
+        assert_eq!(
+            state.authored_search,
+            AuthoredSearch::Editing(String::new())
+        );
+
+        for character in ['q', 'r', 'p', 'e', 'j'] {
+            assert!(press(&mut state, KeyCode::Char(character)));
+        }
+        assert_eq!(
+            state.authored_search,
+            AuthoredSearch::Editing("qrpej".into())
+        );
+        assert_eq!(state.mode, ViewMode::Me);
+        assert!(!state.loading);
+        assert_eq!(state.authored_sel, 0);
+
+        let mut radar = state_for_radar(false);
+        assert!(!press(&mut radar, KeyCode::Char('/')));
+        assert_eq!(radar.authored_search, AuthoredSearch::Normal);
+    }
+
+    #[test]
+    fn search_updates_incrementally_backspaces_unicode_and_resets_stale_layout() {
+        let mut first = simple_pr(1, "main", "a", vec![]);
+        first.title = "ordinary".into();
+        let mut second = simple_pr(2, "main", "b", vec![]);
+        second.title = "café".into();
+        let mut state = me_state(vec![first, second]);
+        state.authored_sel = 1;
+        *state.authored_list_state.offset_mut() = 7;
+
+        press(&mut state, KeyCode::Char('/'));
+        for character in "café".chars() {
+            press(&mut state, KeyCode::Char(character));
+        }
+        assert_eq!(
+            state.authored_search,
+            AuthoredSearch::Editing("café".into())
+        );
+        assert_eq!(state.authored_section().count, 1);
+        assert_eq!(state.authored_sel, 0);
+        assert_eq!(state.authored_list_state.offset(), 0);
+
+        press(&mut state, KeyCode::Backspace);
+        assert_eq!(state.authored_search, AuthoredSearch::Editing("caf".into()));
+        assert_eq!(state.authored_section().count, 1);
+    }
+
+    #[test]
+    fn enter_commits_empty_enter_clears_and_escape_cancels_or_clears() {
+        let mut state = me_state(vec![simple_pr(1, "main", "a", vec![])]);
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Char('t'));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(state.authored_search, AuthoredSearch::Filtered("t".into()));
+
+        assert!(press(&mut state, KeyCode::Esc));
+        assert_eq!(state.authored_search, AuthoredSearch::Normal);
+
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Char('x'));
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.authored_search, AuthoredSearch::Normal);
+
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(state.authored_search, AuthoredSearch::Normal);
+    }
+
+    #[test]
+    fn slash_replaces_committed_query_and_filter_survives_refresh() {
+        let mut state = me_state(vec![simple_pr(1, "main", "a", vec![])]);
+        state.authored_search = AuthoredSearch::Filtered("old".into());
+        press(&mut state, KeyCode::Char('/'));
+        assert_eq!(
+            state.authored_search,
+            AuthoredSearch::Editing(String::new())
+        );
+        press(&mut state, KeyCode::Char('n'));
+        press(&mut state, KeyCode::Enter);
+
+        let mut refreshed_pr = simple_pr(2, "main", "new", vec![]);
+        refreshed_pr.title = "new result".into();
+        state.apply(Data {
+            viewer: "me".into(),
+            authored: vec![refreshed_pr],
+            reviewing: vec![],
+            merged: vec![],
+            releases: vec![],
+            config_error: None,
+            warnings: vec![],
+        });
+        assert_eq!(state.authored_search, AuthoredSearch::Filtered("n".into()));
+        assert_eq!(state.authored_section().count, 1);
+    }
+
+    #[test]
+    fn committed_filter_collapse_is_temporary_and_prior_state_is_restored() {
+        let mut state = me_state(vec![simple_pr(
+            1,
+            "main",
+            "a",
+            vec![requested_user("needle")],
+        )]);
+        // Persistently expand Reviewers before searching.
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Reviewers, true);
+        state.authored_search = AuthoredSearch::Filtered("needle".into());
+        state.authored_sel = 2; // matching reviewer under the exposed header
+        toggle_section(&mut state, false);
+        assert!(
+            state
+                .search_collapsed
+                .contains(&("o/r".into(), 1, SectionId::Reviewers))
+        );
+        assert!(report::is_expanded(
+            &state.toggled,
+            "o/r",
+            1,
+            SectionId::Reviewers
+        ));
+
+        press(&mut state, KeyCode::Esc);
+        assert!(state.search_collapsed.is_empty());
+        let section = state.authored_section();
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Reviewer { .. }))
+        );
     }
 }

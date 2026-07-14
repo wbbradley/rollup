@@ -63,10 +63,11 @@ a later refresh fails. `rollup report` does not start the listener.
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
 | `p`             | Switch to People view                                 |
+| `/`             | Incrementally search/filter the Authored tree (Me view) |
 | `Enter`         | Open the selected PR (or comment / check details / release/tag page) in your browser |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
-| `Esc`           | Back to Me from People **or** Radar                   |
+| `Esc`           | Cancel/clear Authored search, or return to Me from People/Radar |
 | `q`             | Quit                                                  |
 
 ## Reviewer rows
@@ -101,7 +102,8 @@ Under each PR its children are grouped into up to four ordered sections:
 1. **Checks** — a merge-readiness rollup for the PR's head commit. Collapsed by
    default; the header shows a glyph + required ratio, e.g. `▸ Checks ✓ 4/4
    required`. Expanding lists every check, non-required ones dimmed and tagged
-   `(not required)`. `Enter` on a check opens its details page (falling back to
+   `(not required)`, ordered with failures and incomplete checks first and
+   successful checks last. `Enter` on a check opens its details page (falling back to
    the PR). See [Checks signal](#checks-signal) below.
 2. **Reviewers** — where each reviewer stands (see the glyph table above).
 3. **Open comments** — the first comment of every *unresolved* review thread
@@ -123,6 +125,19 @@ on a comment opens that comment's permalink; `Enter` on a check opens its
 details; `Enter` on a PR, reviewer, or section header opens the PR. The same
 shape appears in `rollup report` (rendered at the default collapse state, with
 text tokens in the summary).
+
+Press `/` in the Me view to start an incremental Authored-tree search. The
+footer changes to `inc search: <query>`, and every printable character or
+Backspace immediately recomputes the tree. Matching is case-insensitive over
+visible text: repository and PR labels, section labels and summaries,
+reviewers, comments, and checks. URLs and branch metadata are not searched.
+Only matching rows and the ancestor path needed to reach them remain; matches
+inside normally collapsed sections are temporarily exposed without changing
+your saved collapse state. Enter commits the filter so navigation, opening,
+and temporary `h`/`l` folding continue to work. Esc cancels an edit or clears a
+committed filter and restores the full tree and its prior folds. An empty Enter
+means no filter, and `/` while filtered starts a replacement query. The filter
+survives background refreshes; `rollup report` and the web UI remain unfiltered.
 
 ### Checks signal
 

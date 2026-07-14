@@ -12,7 +12,8 @@ use crate::{
     model::{
         CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrTreeNode, ReleaseInfo,
         RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo, authored_tree, authors_for_me,
-        authors_for_people, group_by_person, group_by_repo, human_age, merged_fetch_authors,
+        authors_for_people, checks_by_display_priority, group_by_person, group_by_repo, human_age,
+        merged_fetch_authors,
     },
 };
 
@@ -325,6 +326,348 @@ pub fn build_section_authored<'a>(
     }
 }
 
+/// Build the TUI's filtered Authored tree. Unlike [`build_section_authored`],
+/// this walks every logical descendant regardless of collapse state and emits
+/// only matching rows plus the repo/PR/section path needed to reach them.
+/// Persistent `ToggledSet` state is deliberately absent: `search_collapsed`
+/// contains only temporary folds made while a committed filter is active.
+pub fn build_section_authored_filtered<'a>(
+    authored: &'a [Pr],
+    viewer: &str,
+    query: &str,
+    search_collapsed: &ToggledSet,
+) -> Section<'a> {
+    let query = query.to_lowercase();
+    let mut rows: Vec<Row<'a>> = Vec::new();
+    let mut count = 0;
+
+    for (repo, group_prs) in group_by_repo(authored) {
+        let tree = authored_tree(&group_prs);
+        let matching_roots: Vec<&PrTreeNode<'_>> = tree
+            .iter()
+            .filter(|node| filtered_pr_matches(node, viewer, &query))
+            .collect();
+        if visible_text_matches(&repo, &query) || !matching_roots.is_empty() {
+            rows.push(Row::RepoHeader(repo));
+            count += matching_roots
+                .iter()
+                .map(|node| count_filtered_prs(node, viewer, &query))
+                .sum::<usize>();
+            let root_count = matching_roots.len();
+            for (index, node) in matching_roots.into_iter().enumerate() {
+                push_filtered_pr(
+                    &mut rows,
+                    node,
+                    viewer,
+                    &query,
+                    "  ",
+                    index + 1 == root_count,
+                    None,
+                    search_collapsed,
+                );
+            }
+        }
+    }
+
+    Section {
+        title: "Authored by me".to_string(),
+        subtitle: Some(format!("@{viewer}")),
+        count,
+        kind: SectionKind::MeAuthored,
+        rows,
+        empty_message: Some("(no matches)"),
+    }
+}
+
+fn count_filtered_prs(node: &PrTreeNode<'_>, viewer: &str, query: &str) -> usize {
+    1 + node
+        .children
+        .iter()
+        .filter(|child| filtered_pr_matches(child, viewer, query))
+        .map(|child| count_filtered_prs(child, viewer, query))
+        .sum::<usize>()
+}
+
+fn visible_text_matches(text: &str, query: &str) -> bool {
+    text.to_lowercase().contains(query)
+}
+
+fn pr_visible_text(pr: &Pr, viewer: &str) -> String {
+    let draft = if pr.is_draft { " [draft]" } else { "" };
+    let author = if pr.author == viewer {
+        String::new()
+    } else {
+        format!(" @{}", pr.author)
+    };
+    format!("#{}{}{} {}", pr.number, draft, author, pr.title)
+}
+
+fn reviewer_visible_text(reviewer: &ReviewerStatus) -> String {
+    let glyph = match reviewer.state {
+        ReviewState::Approved => "✓",
+        ReviewState::ChangesRequested => "✗",
+        ReviewState::Commented => "◉",
+        ReviewState::NoReview => "○",
+        ReviewState::Dismissed => "⊘",
+    };
+    let badge = if reviewer.requested {
+        "[req]"
+    } else {
+        "(reviewed)"
+    };
+    format!("{glyph} {} {badge}", reviewer.login)
+}
+
+fn comment_visible_text(comment: &PrComment) -> String {
+    format!(
+        "@{} {} {} {}",
+        comment.author,
+        comment.body,
+        comment.path.as_deref().unwrap_or(""),
+        if comment.is_outdated {
+            "[outdated]"
+        } else {
+            ""
+        }
+    )
+}
+
+fn check_visible_text(check: &CheckStatus) -> String {
+    let glyph = match check.state {
+        CheckState::Success => "✓",
+        CheckState::Failure | CheckState::Error => "✗",
+        CheckState::Pending => "◉",
+        CheckState::Skipped => "⊘",
+        CheckState::Neutral => "○",
+    };
+    format!(
+        "{glyph} {} {}",
+        check.name,
+        if check.required { "" } else { "(not required)" }
+    )
+}
+
+fn section_visible_text(section: SectionId, pr: &Pr) -> String {
+    match section {
+        SectionId::Checks => {
+            let summary = ChecksSummary::of(pr);
+            let glyph = match summary.rollup {
+                ChecksRollup::Green => "✓",
+                ChecksRollup::Red => "✗",
+                ChecksRollup::Pending => "◉",
+                ChecksRollup::Unknown => "○",
+            };
+            format!("{} {glyph} {}", section.label(), summary.ratio_text())
+        }
+        SectionId::Reviewers => {
+            let summary = reviewer_summary(&pr.reviewers)
+                .into_iter()
+                .map(ReviewerSummaryToken::tui_label)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} {summary}", section.label())
+        }
+        SectionId::Comments | SectionId::Stacked => section.label().to_string(),
+    }
+}
+
+fn filtered_pr_matches(node: &PrTreeNode<'_>, viewer: &str, query: &str) -> bool {
+    let pr = node.pr;
+    visible_text_matches(&pr_visible_text(pr, viewer), query)
+        || (!pr.checks.is_empty()
+            && (visible_text_matches(&section_visible_text(SectionId::Checks, pr), query)
+                || pr
+                    .checks
+                    .iter()
+                    .any(|check| visible_text_matches(&check_visible_text(check), query))))
+        || (!pr.reviewers.is_empty()
+            && (visible_text_matches(&section_visible_text(SectionId::Reviewers, pr), query)
+                || pr
+                    .reviewers
+                    .iter()
+                    .any(|reviewer| visible_text_matches(&reviewer_visible_text(reviewer), query))))
+        || (!pr.unresolved_comments.is_empty()
+            && (visible_text_matches(&section_visible_text(SectionId::Comments, pr), query)
+                || pr
+                    .unresolved_comments
+                    .iter()
+                    .any(|comment| visible_text_matches(&comment_visible_text(comment), query))))
+        || (!node.children.is_empty()
+            && (visible_text_matches(&section_visible_text(SectionId::Stacked, pr), query)
+                || node
+                    .children
+                    .iter()
+                    .any(|child| filtered_pr_matches(child, viewer, query))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_filtered_pr<'a>(
+    rows: &mut Vec<Row<'a>>,
+    node: &PrTreeNode<'a>,
+    viewer: &str,
+    query: &str,
+    prefix: &str,
+    is_last: bool,
+    stacked_under: Option<u64>,
+    search_collapsed: &ToggledSet,
+) {
+    let connector = if is_last { "└─ " } else { "├─ " };
+    rows.push(Row::Pr {
+        pr: node.pr,
+        hide_author_if: Some(viewer.to_string()),
+        tree_prefix: Some(format!("{prefix}{connector}")),
+        stacked_under,
+    });
+    let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
+    let pr = node.pr;
+
+    if !pr.checks.is_empty() {
+        let section_matches =
+            visible_text_matches(&section_visible_text(SectionId::Checks, pr), query);
+        let matching: Vec<&CheckStatus> = checks_by_display_priority(&pr.checks)
+            .into_iter()
+            .filter(|check| visible_text_matches(&check_visible_text(check), query))
+            .collect();
+        if section_matches || !matching.is_empty() {
+            let collapsed =
+                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Checks));
+            rows.push(Row::SectionHeader {
+                section: SectionId::Checks,
+                expanded: !collapsed && !matching.is_empty(),
+                summary: Vec::new(),
+                checks: Some(ChecksSummary::of(pr)),
+                tree_prefix: child_base.clone(),
+            });
+            if !collapsed {
+                let count = matching.len();
+                for (index, check) in matching.into_iter().enumerate() {
+                    rows.push(Row::Check {
+                        c: check,
+                        tree_prefix: format!(
+                            "{child_base}{}",
+                            if index + 1 == count {
+                                "└─ "
+                            } else {
+                                "├─ "
+                            }
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    if !pr.reviewers.is_empty() {
+        let section_matches =
+            visible_text_matches(&section_visible_text(SectionId::Reviewers, pr), query);
+        let matching: Vec<&ReviewerStatus> = pr
+            .reviewers
+            .iter()
+            .filter(|reviewer| visible_text_matches(&reviewer_visible_text(reviewer), query))
+            .collect();
+        if section_matches || !matching.is_empty() {
+            let collapsed =
+                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Reviewers));
+            rows.push(Row::SectionHeader {
+                section: SectionId::Reviewers,
+                expanded: !collapsed && !matching.is_empty(),
+                summary: reviewer_summary(&pr.reviewers),
+                checks: None,
+                tree_prefix: child_base.clone(),
+            });
+            if !collapsed {
+                let count = matching.len();
+                for (index, reviewer) in matching.into_iter().enumerate() {
+                    rows.push(Row::Reviewer {
+                        r: reviewer,
+                        tree_prefix: Some(format!(
+                            "{child_base}{}",
+                            if index + 1 == count {
+                                "└─ "
+                            } else {
+                                "├─ "
+                            }
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
+    if !pr.unresolved_comments.is_empty() {
+        let section_matches =
+            visible_text_matches(&section_visible_text(SectionId::Comments, pr), query);
+        let matching: Vec<&PrComment> = pr
+            .unresolved_comments
+            .iter()
+            .filter(|comment| visible_text_matches(&comment_visible_text(comment), query))
+            .collect();
+        if section_matches || !matching.is_empty() {
+            let collapsed =
+                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Comments));
+            rows.push(Row::SectionHeader {
+                section: SectionId::Comments,
+                expanded: !collapsed && !matching.is_empty(),
+                summary: Vec::new(),
+                checks: None,
+                tree_prefix: child_base.clone(),
+            });
+            if !collapsed {
+                let count = matching.len();
+                for (index, comment) in matching.into_iter().enumerate() {
+                    rows.push(Row::Comment {
+                        c: comment,
+                        tree_prefix: format!(
+                            "{child_base}{}",
+                            if index + 1 == count {
+                                "└─ "
+                            } else {
+                                "├─ "
+                            }
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    if !node.children.is_empty() {
+        let section_matches =
+            visible_text_matches(&section_visible_text(SectionId::Stacked, pr), query);
+        let matching: Vec<&PrTreeNode<'_>> = node
+            .children
+            .iter()
+            .filter(|child| filtered_pr_matches(child, viewer, query))
+            .collect();
+        if section_matches || !matching.is_empty() {
+            let collapsed =
+                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Stacked));
+            rows.push(Row::SectionHeader {
+                section: SectionId::Stacked,
+                expanded: !collapsed && !matching.is_empty(),
+                summary: Vec::new(),
+                checks: None,
+                tree_prefix: child_base.clone(),
+            });
+            if !collapsed {
+                let count = matching.len();
+                for (index, child) in matching.into_iter().enumerate() {
+                    push_filtered_pr(
+                        rows,
+                        child,
+                        viewer,
+                        query,
+                        &child_base,
+                        index + 1 == count,
+                        Some(pr.number),
+                        search_collapsed,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Flatten one PR tree node (and its stacked children) into rows. Each PR's
 /// children are grouped into up to four ordered sections — Checks, Reviewers,
 /// Open comments, Stacked PRs — drawn with classic `├─`/`└─`/`│` connectors.
@@ -375,8 +718,9 @@ fn push_pr<'a>(
             tree_prefix: child_base.clone(),
         });
         if expanded {
-            let m = node.pr.checks.len();
-            for (i, c) in node.pr.checks.iter().enumerate() {
+            let checks = checks_by_display_priority(&node.pr.checks);
+            let m = checks.len();
+            for (i, c) in checks.into_iter().enumerate() {
                 let conn = if i + 1 == m { "└─ " } else { "├─ " };
                 rows.push(Row::Check {
                     c,
@@ -2017,7 +2361,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(check_names, vec!["build", "lint"]);
+        assert_eq!(check_names, vec!["lint", "build"]);
     }
 
     #[test]
@@ -2109,5 +2453,162 @@ mod tests {
         );
         // The rejection signal is present.
         assert!(summary.contains(&ReviewerSummaryToken::ChangesRequested));
+    }
+
+    #[test]
+    fn filtered_authored_matches_pr_text_case_insensitively_and_prunes_siblings() {
+        let mut matching = pr("o/keep", 1, "me", false, 300, vec![]);
+        matching.title = "Repair Unicode Search".into();
+        let mut sibling = pr("o/keep", 2, "me", false, 200, vec![]);
+        sibling.title = "unrelated work".into();
+        let other_repo = pr("o/drop", 3, "me", false, 100, vec![]);
+
+        let authored = vec![matching, sibling, other_repo];
+        let section =
+            build_section_authored_filtered(&authored, "me", "UNICODE", &ToggledSet::new());
+
+        assert_eq!(section.count, 1);
+        assert_eq!(section.empty_message, Some("(no matches)"));
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::RepoHeader(repo) if repo == "o/keep"))
+        );
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::RepoHeader(repo) if repo == "o/drop"))
+        );
+        let numbers: Vec<u64> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Pr { pr, .. } => Some(pr.number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![1]);
+    }
+
+    #[test]
+    fn filtered_authored_descendant_matches_retain_ancestors_and_ignore_normal_collapse() {
+        let mut authored_pr = pr(
+            "o/r",
+            1,
+            "me",
+            false,
+            100,
+            vec![user("NeedleReviewer", true)],
+        );
+        authored_pr.checks = vec![check("NeedleCheck", CheckState::Pending, true)];
+        authored_pr.unresolved_comments = vec![comment(
+            "alice",
+            "NeedleComment",
+            Some("src/search.rs"),
+            false,
+        )];
+        // Checks and Reviewers are normally collapsed, but search must expose
+        // their matching descendants without consulting persistent toggles.
+        let normal_authored = vec![authored_pr.clone()];
+        let normal = build_section_authored(&normal_authored, "me", &ToggledSet::new());
+        assert!(
+            !normal
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
+        assert!(
+            !normal
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Reviewer { .. }))
+        );
+
+        for (query, expected_section) in [
+            ("needlereviewer", SectionId::Reviewers),
+            ("needlecheck", SectionId::Checks),
+            ("needlecomment", SectionId::Comments),
+        ] {
+            let section = build_section_authored_filtered(
+                std::slice::from_ref(&authored_pr),
+                "me",
+                query,
+                &ToggledSet::new(),
+            );
+            assert_eq!(section.count, 1);
+            assert!(matches!(section.rows[0], Row::RepoHeader(_)));
+            assert!(matches!(section.rows[1], Row::Pr { .. }));
+            assert!(matches!(
+                section.rows[2],
+                Row::SectionHeader {
+                    section,
+                    expanded: true,
+                    ..
+                } if section == expected_section
+            ));
+            assert!(section.rows[3].is_selectable());
+        }
+    }
+
+    #[test]
+    fn filtered_authored_nested_match_recomputes_connectors_and_count() {
+        let mut root = pr("o/r", 1, "me", false, 300, vec![]);
+        root.head_ref = "stack-base".into();
+        let mut unmatched_child = pr("o/r", 2, "me", false, 200, vec![]);
+        unmatched_child.base_ref = "stack-base".into();
+        unmatched_child.title = "skip me".into();
+        let mut matching_child = pr("o/r", 3, "me", false, 100, vec![]);
+        matching_child.base_ref = "stack-base".into();
+        matching_child.title = "deep needle".into();
+
+        let authored = vec![root, unmatched_child, matching_child];
+        let section =
+            build_section_authored_filtered(&authored, "me", "needle", &ToggledSet::new());
+        assert_eq!(section.count, 2, "matching PR plus its PR ancestor");
+        let prs: Vec<(u64, String)> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Pr {
+                    pr, tree_prefix, ..
+                } => Some((pr.number, tree_prefix.clone().unwrap())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prs, vec![(1, "  └─ ".into()), (3, "     └─ ".into())]);
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Stacked,
+                expanded: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn filtered_authored_uses_temporary_collapse_without_changing_match_count() {
+        let authored = vec![pr("o/r", 1, "me", false, 100, vec![user("needle", true)])];
+        let mut search_collapsed = ToggledSet::new();
+        search_collapsed.insert(("o/r".into(), 1, SectionId::Reviewers));
+        let section = build_section_authored_filtered(&authored, "me", "needle", &search_collapsed);
+
+        assert_eq!(section.count, 1);
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Reviewers,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Reviewer { .. }))
+        );
     }
 }

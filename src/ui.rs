@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, Focus, ViewMode},
+    app::{AppState, AuthoredSearch, Focus, ViewMode},
     model::{
         CheckState, CheckStatus, ChecksRollup, Pr, PrComment, ReleaseInfo, ReviewState,
         ReviewerStatus, TagInfo, human_age,
@@ -26,8 +26,21 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     match state.mode {
         ViewMode::Me => {
-            let authored_section =
-                report::build_section_authored(&state.authored, &viewer_str, &state.toggled);
+            let authored_section = match state
+                .authored_search
+                .query()
+                .filter(|query| !query.is_empty())
+            {
+                Some(query) => report::build_section_authored_filtered(
+                    &state.authored,
+                    &viewer_str,
+                    query,
+                    &state.search_collapsed,
+                ),
+                None => {
+                    report::build_section_authored(&state.authored, &viewer_str, &state.toggled)
+                }
+            };
             state.authored_page = draw_section(
                 f,
                 top,
@@ -569,6 +582,14 @@ fn spinner_frame() -> &'static str {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
+    f.render_widget(Paragraph::new(footer_line(state)), area);
+}
+
+fn footer_line(state: &AppState) -> Line<'static> {
+    if let AuthoredSearch::Editing(query) = &state.authored_search {
+        return Line::from(format!("inc search: {query}"));
+    }
+
     let status = if let Some(err) = &state.error {
         Span::styled(
             format!("error: {err}"),
@@ -602,22 +623,18 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::raw("")
     };
 
-    let hint = match state.mode {
-        ViewMode::Me => {
-            "↑↓ move · h/l collapse/expand · Enter open · e radar · p people · r refresh · q quit   "
-        }
-        ViewMode::Radar => {
-            "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   "
-        }
-        ViewMode::People => {
-            "↑↓ move · Esc back · Enter open · x remove reviewer · e radar · r refresh · q quit   "
-        }
+    let hint = match (&state.mode, &state.authored_search) {
+        (ViewMode::Me, AuthoredSearch::Filtered(query)) => format!(
+            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open   "
+        ),
+        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · e radar · p people · r refresh · q quit   ".to_string(),
+        (ViewMode::Radar, _) => "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   ".to_string(),
+        (ViewMode::People, _) => "↑↓ move · Esc back · Enter open · x remove reviewer · e radar · r refresh · q quit   ".to_string(),
     };
-    let line = Line::from(vec![
+    Line::from(vec![
         Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         Span::raw("["),
         status,
         Span::raw("]"),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ])
 }
