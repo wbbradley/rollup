@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 
 use crate::{
-    app::AppState,
+    app::{AppState, Msg},
     model::{CheckState, ChecksRollup, Pr, PrTreeNode, ReviewState, authored_tree, group_by_repo},
     report::{
         self, ChecksSummary, Row, build_section_merged, checks_summary_text, reviewer_summary,
@@ -63,13 +63,18 @@ impl WebSnapshot {
             loading: state.loading,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading
+    }
 }
 
 #[derive(Clone)]
 pub struct SnapshotStore(Arc<RwLock<Arc<WebSnapshot>>>);
 
 impl SnapshotStore {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(RwLock::new(Arc::new(WebSnapshot::default()))))
     }
 
@@ -78,7 +83,7 @@ impl SnapshotStore {
         *current = Arc::new(snapshot);
     }
 
-    fn load(&self) -> Arc<WebSnapshot> {
+    pub(crate) fn load(&self) -> Arc<WebSnapshot> {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -111,7 +116,7 @@ impl Drop for WebServer {
     }
 }
 
-pub fn start(address: &str) -> Result<WebServer> {
+pub fn start(address: &str, refresh_requests: Sender<Msg>) -> Result<WebServer> {
     let listener = TcpListener::bind(address)
         .with_context(|| format!("could not bind web dashboard at {address}"))?;
     listener
@@ -129,13 +134,14 @@ pub fn start(address: &str) -> Result<WebServer> {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let snapshot = worker_snapshots.load();
-                    let _ = serve_connection(stream, &snapshot);
+                    let _ = serve_connection(stream, &snapshot, &refresh_requests);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if shutdown_rx.recv_timeout(Duration::from_millis(25)).is_ok() {
                         break;
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -154,52 +160,159 @@ struct Response {
     status: &'static str,
     content_type: &'static str,
     body: String,
+    headers: Vec<(&'static str, String)>,
 }
 
-fn serve_connection(mut stream: TcpStream, snapshot: &WebSnapshot) -> io::Result<()> {
+#[derive(Debug)]
+struct Request {
+    method: String,
+    target: String,
+    host: Option<String>,
+    origin: Option<String>,
+    fetch_site: Option<String>,
+}
+
+fn serve_connection(
+    mut stream: TcpStream,
+    snapshot: &WebSnapshot,
+    refresh_requests: &Sender<Msg>,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let mut request = [0_u8; 8192];
-    let read = stream.read(&mut request)?;
-    let first_line = String::from_utf8_lossy(&request[..read]);
-    let path = first_line
-        .lines()
-        .next()
-        .and_then(|line| {
-            let mut parts = line.split_whitespace();
-            (parts.next() == Some("GET"))
-                .then(|| parts.next())
-                .flatten()
-        })
-        .unwrap_or("");
-    let response = route(snapshot, path);
+    let mut bytes = [0_u8; 8192];
+    let mut read = 0;
+    while read < bytes.len() {
+        let count = stream.read(&mut bytes[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+        if bytes[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let response = match parse_request(&bytes[..read]) {
+        Some(request) => route(snapshot, &request, refresh_requests),
+        None => text_response("400 Bad Request", "bad request\n"),
+    };
     write!(
         stream,
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n",
         response.status,
         response.content_type,
         response.body.len(),
-        response.body
     )?;
+    for (name, value) in response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n{}", response.body)?;
     stream.flush()
 }
 
-fn route(snapshot: &WebSnapshot, path: &str) -> Response {
-    match path {
-        "/" => Response {
+fn parse_request(bytes: &[u8]) -> Option<Request> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if !text.contains("\r\n\r\n") {
+        return None;
+    }
+    let mut lines = text.split("\r\n");
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let target = request_line.next()?.to_string();
+    if request_line.next()? != "HTTP/1.1" || request_line.next().is_some() {
+        return None;
+    }
+    let mut request = Request {
+        method,
+        target,
+        host: None,
+        origin: None,
+        fetch_site: None,
+    };
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let (name, value) = line.split_once(':')?;
+        match name.trim().to_ascii_lowercase().as_str() {
+            "host" => request.host = Some(value.trim().to_string()),
+            "origin" => request.origin = Some(value.trim().to_string()),
+            "sec-fetch-site" => request.fetch_site = Some(value.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    Some(request)
+}
+
+fn route(snapshot: &WebSnapshot, request: &Request, refresh_requests: &Sender<Msg>) -> Response {
+    match (request.method.as_str(), request.target.as_str()) {
+        ("GET", "/") => Response {
             status: "200 OK",
             content_type: "text/html; charset=utf-8",
             body: render_authored(snapshot),
+            headers: Vec::new(),
         },
-        "/merged" => Response {
+        ("GET", "/merged") => Response {
             status: "200 OK",
             content_type: "text/html; charset=utf-8",
             body: render_merged(snapshot, Utc::now()),
+            headers: Vec::new(),
         },
-        _ => Response {
-            status: "404 Not Found",
-            content_type: "text/plain; charset=utf-8",
-            body: "404 not found\n".to_string(),
-        },
+        ("POST", "/refresh?return=%2F") | ("POST", "/refresh?return=%2Fmerged") => {
+            if !same_origin(request) {
+                return text_response("403 Forbidden", "cross-origin refresh rejected\n");
+            }
+            let return_to = if request.target.ends_with("%2Fmerged") {
+                "/merged"
+            } else {
+                "/"
+            };
+            let (acknowledged, acknowledgment) = mpsc::channel();
+            if refresh_requests
+                .send(Msg::WebRefresh { acknowledged })
+                .is_err()
+                || acknowledgment.recv_timeout(Duration::from_secs(2)).is_err()
+            {
+                return text_response("503 Service Unavailable", "refresh unavailable\n");
+            }
+            Response {
+                status: "303 See Other",
+                content_type: "text/plain; charset=utf-8",
+                body: String::new(),
+                headers: vec![("Location", return_to.to_string())],
+            }
+        }
+        ("GET", target) if target.starts_with("/refresh") => method_not_allowed("POST"),
+        ("POST", "/") | ("POST", "/merged") => method_not_allowed("GET"),
+        (_, target) if target == "/" || target == "/merged" || target.starts_with("/refresh") => {
+            method_not_allowed(if target.starts_with("/refresh") {
+                "POST"
+            } else {
+                "GET"
+            })
+        }
+        _ => text_response("404 Not Found", "404 not found\n"),
+    }
+}
+
+fn same_origin(request: &Request) -> bool {
+    if request.fetch_site.as_deref() == Some("cross-site") {
+        return false;
+    }
+    match (&request.origin, &request.host) {
+        (None, _) => true,
+        (Some(origin), Some(host)) => origin.trim_end_matches('/') == format!("http://{host}"),
+        (Some(_), None) => false,
+    }
+}
+
+fn method_not_allowed(allow: &'static str) -> Response {
+    let mut response = text_response("405 Method Not Allowed", "method not allowed\n");
+    response.headers.push(("Allow", allow.to_string()));
+    response
+}
+
+fn text_response(status: &'static str, body: &str) -> Response {
+    Response {
+        status,
+        content_type: "text/plain; charset=utf-8",
+        body: body.to_string(),
+        headers: Vec::new(),
     }
 }
 
@@ -207,9 +320,10 @@ fn page_start(title: &str, current: &str, snapshot: &WebSnapshot) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{} · rollup</title><style>{}</style></head><body><header><div><strong>rollup</strong><span class=\"viewer\">{}</span></div><nav aria-label=\"Dashboard\"><a href=\"/\"{}>Authored by me</a><a href=\"/merged\"{}>Recently merged</a></nav></header><main>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{} · rollup</title><style>{}</style></head><body data-loading=\"{}\"><header><div><strong>rollup</strong><span class=\"viewer\">{}</span></div><nav aria-label=\"Dashboard\"><a href=\"/\"{}>Authored by me</a><a href=\"/merged\"{}>Recently merged</a></nav></header><main>",
         escape(title),
         CSS,
+        snapshot.loading,
         if snapshot.viewer.is_empty() {
             String::new()
         } else {
@@ -270,7 +384,7 @@ fn render_authored(snapshot: &WebSnapshot) -> String {
     let mut out = page_start("Authored by me", "/", snapshot);
     let _ = write!(
         out,
-        "<div class=\"page-title\"><div><h1>Authored by me</h1><p>{} open pull request{}</p></div></div>",
+        "<div class=\"page-title\"><div><h1>Authored by me</h1><p>{} open pull request{}</p></div>",
         snapshot.authored.len(),
         if snapshot.authored.len() == 1 {
             ""
@@ -278,6 +392,8 @@ fn render_authored(snapshot: &WebSnapshot) -> String {
             "s"
         }
     );
+    render_refresh(&mut out, "/", snapshot.loading);
+    out.push_str("</div>");
     if snapshot.authored.is_empty() {
         out.push_str("<p class=\"empty\">No open authored pull requests.</p>");
     } else {
@@ -293,7 +409,7 @@ fn render_authored(snapshot: &WebSnapshot) -> String {
             out.push_str("</ul></section>");
         }
     }
-    out.push_str("</main></body></html>");
+    page_end(&mut out);
     out
 }
 
@@ -324,7 +440,8 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
         };
         let _ = write!(
             out,
-            "<details class=\"pr-section checks\"><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            "<details class=\"pr-section checks\" data-state-key=\"{}\"><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            escape(&section_state_key(pr, "checks")),
             class,
             escape(&format!(
                 "{} — {}",
@@ -364,7 +481,8 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             .join(", ");
         let _ = write!(
             out,
-            "<details class=\"pr-section reviewers\"><summary>Reviewers <span class=\"muted\">[{}]</span></summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            "<details class=\"pr-section reviewers\" data-state-key=\"{}\"><summary>Reviewers <span class=\"muted\">[{}]</span></summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            escape(&section_state_key(pr, "reviewers")),
             escape(&summary),
             escape(&pr.url)
         );
@@ -390,7 +508,8 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     if !pr.unresolved_comments.is_empty() {
         let _ = write!(
             out,
-            "<details class=\"pr-section comments\" open><summary>Open comments</summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            "<details class=\"pr-section comments\" data-state-key=\"{}\" open><summary>Open comments</summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul>",
+            escape(&section_state_key(pr, "comments")),
             escape(&pr.url)
         );
         for comment in &pr.unresolved_comments {
@@ -420,7 +539,8 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     if !node.children.is_empty() {
         let _ = write!(
             out,
-            "<details class=\"pr-section stacked\" open><summary>Stacked PRs</summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul class=\"pr-tree\">",
+            "<details class=\"pr-section stacked\" data-state-key=\"{}\" open><summary>Stacked PRs</summary><p class=\"context-link\"><a href=\"{}\">Open PR</a></p><ul class=\"pr-tree\">",
+            escape(&section_state_key(pr, "stacked")),
             escape(&pr.url)
         );
         for child in &node.children {
@@ -437,10 +557,12 @@ fn render_merged(snapshot: &WebSnapshot, now: DateTime<Utc>) -> String {
     let section = build_section_merged(&snapshot.merged, &allowed, report::MERGED_PANE_CAP, now);
     let _ = write!(
         out,
-        "<div class=\"page-title\"><div><h1>Recently merged PRs</h1><p>{} pull request{}</p></div></div>",
+        "<div class=\"page-title\"><div><h1>Recently merged PRs</h1><p>{} pull request{}</p></div>",
         section.count,
         if section.count == 1 { "" } else { "s" }
     );
+    render_refresh(&mut out, "/merged", snapshot.loading);
+    out.push_str("</div>");
     if section.rows.is_empty() {
         out.push_str("<p class=\"empty\">No recently merged PRs.</p>");
     } else {
@@ -465,8 +587,38 @@ fn render_merged(snapshot: &WebSnapshot, now: DateTime<Utc>) -> String {
         }
         out.push_str("</ol>");
     }
-    out.push_str("</main></body></html>");
+    page_end(&mut out);
     out
+}
+
+fn render_refresh(out: &mut String, return_to: &str, loading: bool) {
+    let encoded_return = if return_to == "/merged" {
+        "%2Fmerged"
+    } else {
+        "%2F"
+    };
+    let _ = write!(
+        out,
+        "<form class=\"refresh\" method=\"post\" action=\"/refresh?return={}\"><button type=\"submit\"{}{}>{}</button></form>",
+        encoded_return,
+        if loading { " disabled" } else { "" },
+        if loading {
+            " aria-disabled=\"true\" aria-busy=\"true\""
+        } else {
+            ""
+        },
+        if loading { "Refreshing…" } else { "Refresh" }
+    );
+}
+
+fn section_state_key(pr: &Pr, section: &str) -> String {
+    format!("repo:{}:pr:{}:section:{section}", pr.repo, pr.number)
+}
+
+fn page_end(out: &mut String) {
+    out.push_str("</main><script>");
+    out.push_str(SCRIPT);
+    out.push_str("</script></body></html>");
 }
 
 fn check_state_symbol(state: CheckState) -> &'static str {
@@ -534,8 +686,29 @@ fn escape(value: &str) -> String {
     out
 }
 
+const SCRIPT: &str = r#"
+(() => {
+  const prefix = "rollup:details:";
+  for (const details of document.querySelectorAll("details[data-state-key]")) {
+    const storageKey = prefix + details.dataset.stateKey;
+    try {
+      const stored = sessionStorage.getItem(storageKey);
+      if (stored !== null) details.open = stored === "open";
+    } catch (_) {}
+    details.addEventListener("toggle", () => {
+      try {
+        sessionStorage.setItem(storageKey, details.open ? "open" : "closed");
+      } catch (_) {}
+    });
+  }
+  if (document.body.dataset.loading === "true") {
+    window.setTimeout(() => window.location.reload(), 750);
+  }
+})();
+"#;
+
 const CSS: &str = r#"
-:root{color-scheme:light dark;--bg:#f7f7f4;--panel:#fff;--text:#20221f;--muted:#686d66;--line:#d8dbd5;--link:#145ea8;--ok:#17813d;--bad:#ba2b2b;--pending:#987000}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,sans-serif}body>header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem max(1rem,calc((100% - 960px)/2));background:var(--panel);border-bottom:1px solid var(--line)}nav{display:flex;gap:.4rem}nav a{padding:.35rem .6rem;border-radius:.4rem;text-decoration:none}nav a[aria-current=page]{background:var(--link);color:#fff}.viewer,.muted,.meta,.loaded{color:var(--muted)}.viewer{margin-left:.6rem}main{max-width:960px;margin:0 auto;padding:1.4rem 1rem 4rem}.status{padding:.7rem 1rem;margin-bottom:1rem;border:1px solid var(--line);border-radius:.5rem;background:var(--panel)}.status p{margin:.2rem 0}.error,.bad{color:var(--bad)}.warning,.pending{color:var(--pending)}.ok{color:var(--ok)}.page-title{display:flex;justify-content:space-between;align-items:end}.page-title h1{margin:0}.page-title p{margin:.15rem 0 0;color:var(--muted)}.repo{margin-top:1.6rem}.repo h2{font-size:1rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:.35rem}.pr-tree,.pr-section ul{list-style:none;padding-left:1rem}.pr{position:relative;margin:.55rem 0;padding-left:.8rem;border-left:2px solid var(--line)}.pr article>h3{font-size:1rem;margin:.2rem 0}.pr a,.merged-list a{color:var(--link)}.number{font-variant-numeric:tabular-nums}.badge{display:inline-block;padding:.05rem .35rem;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.78rem}.pr-section{margin:.35rem 0 .35rem .2rem}.pr-section>summary{cursor:pointer;font-weight:600}.pr-section ul{margin:.3rem 0}.pr-section li{margin:.25rem 0}.context-link{margin:.25rem 0 .25rem 1rem;font-size:.85rem}.row-link{margin-left:.35rem}.state{display:inline-block;min-width:1.2rem}.merged-list{padding:0;list-style:none}.merged-list li{padding:.8rem 1rem;margin:.65rem 0;background:var(--panel);border:1px solid var(--line);border-radius:.5rem}.meta{font-size:.85rem;margin-top:.2rem}.empty{padding:2rem;text-align:center;color:var(--muted)}@media(max-width:600px){body>header{position:static;display:block}nav{margin-top:.6rem;overflow-x:auto}.pr-tree,.pr-section ul{padding-left:.45rem}.pr{padding-left:.55rem}main{padding-top:1rem}}@media(prefers-color-scheme:dark){:root{--bg:#151715;--panel:#1e211e;--text:#e5e8e3;--muted:#a4aaa1;--line:#3b403a;--link:#75b7ff;--ok:#66ce84;--bad:#ff8585;--pending:#e9c45d}}
+:root{color-scheme:light dark;--bg:#f7f7f4;--panel:#fff;--text:#20221f;--muted:#686d66;--line:#d8dbd5;--link:#145ea8;--ok:#17813d;--bad:#ba2b2b;--pending:#987000}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,sans-serif}body>header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem max(1rem,calc((100% - 960px)/2));background:var(--panel);border-bottom:1px solid var(--line)}nav{display:flex;gap:.4rem}nav a{padding:.35rem .6rem;border-radius:.4rem;text-decoration:none}nav a[aria-current=page]{background:var(--link);color:#fff}.viewer,.muted,.meta,.loaded{color:var(--muted)}.viewer{margin-left:.6rem}main{max-width:960px;margin:0 auto;padding:1.4rem 1rem 4rem}.status{padding:.7rem 1rem;margin-bottom:1rem;border:1px solid var(--line);border-radius:.5rem;background:var(--panel)}.status p{margin:.2rem 0}.error,.bad{color:var(--bad)}.warning,.pending{color:var(--pending)}.ok{color:var(--ok)}.page-title{display:flex;justify-content:space-between;align-items:end;gap:1rem}.page-title h1{margin:0}.page-title p{margin:.15rem 0 0;color:var(--muted)}.refresh button{padding:.45rem .8rem;border:1px solid var(--line);border-radius:.4rem;background:var(--panel);color:var(--text);font:inherit;cursor:pointer}.refresh button:hover:not(:disabled){border-color:var(--link);color:var(--link)}.refresh button:disabled{cursor:wait;color:var(--muted)}.repo{margin-top:1.6rem}.repo h2{font-size:1rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:.35rem}.pr-tree,.pr-section ul{list-style:none;padding-left:1rem}.pr{position:relative;margin:.55rem 0;padding-left:.8rem;border-left:2px solid var(--line)}.pr article>h3{font-size:1rem;margin:.2rem 0}.pr a,.merged-list a{color:var(--link)}.number{font-variant-numeric:tabular-nums}.badge{display:inline-block;padding:.05rem .35rem;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.78rem}.pr-section{margin:.35rem 0 .35rem .2rem}.pr-section>summary{cursor:pointer;font-weight:600}.pr-section ul{margin:.3rem 0}.pr-section li{margin:.25rem 0}.context-link{margin:.25rem 0 .25rem 1rem;font-size:.85rem}.row-link{margin-left:.35rem}.state{display:inline-block;min-width:1.2rem}.merged-list{padding:0;list-style:none}.merged-list li{padding:.8rem 1rem;margin:.65rem 0;background:var(--panel);border:1px solid var(--line);border-radius:.5rem}.meta{font-size:.85rem;margin-top:.2rem}.empty{padding:2rem;text-align:center;color:var(--muted)}@media(max-width:600px){body>header{position:static;display:block}nav{margin-top:.6rem;overflow-x:auto}.pr-tree,.pr-section ul{padding-left:.45rem}.pr{padding-left:.55rem}main{padding-top:1rem}}@media(prefers-color-scheme:dark){:root{--bg:#151715;--panel:#1e211e;--text:#e5e8e3;--muted:#a4aaa1;--line:#3b403a;--link:#75b7ff;--ok:#66ce84;--bad:#ff8585;--pending:#e9c45d}}
 "#;
 
 #[cfg(test)]
@@ -619,15 +792,32 @@ mod tests {
         }
     }
 
+    fn request(method: &str, target: &str) -> Request {
+        Request {
+            method: method.to_string(),
+            target: target.to_string(),
+            host: Some("127.0.0.1:7011".to_string()),
+            origin: None,
+            fetch_site: None,
+        }
+    }
+
+    fn state_keys(html: &str) -> Vec<&str> {
+        html.split("data-state-key=\"")
+            .skip(1)
+            .map(|rest| rest.split_once('"').unwrap().0)
+            .collect()
+    }
+
     #[test]
     fn authored_renders_sorted_nested_sections_and_safe_links() {
         let html = render_authored(&rich_snapshot());
         assert!(html.find("A/repo").unwrap() < html.find("z/repo").unwrap());
         assert!(html.find("Parent &lt;fix&gt;").unwrap() < html.find("title 2").unwrap());
-        assert!(html.contains("<details class=\"pr-section checks\"><summary>"));
-        assert!(html.contains("<details class=\"pr-section reviewers\"><summary>"));
-        assert!(html.contains("<details class=\"pr-section comments\" open>"));
-        assert!(html.contains("<details class=\"pr-section stacked\" open>"));
+        assert!(html.contains("<details class=\"pr-section checks\" data-state-key="));
+        assert!(html.contains("<details class=\"pr-section reviewers\" data-state-key="));
+        assert!(html.contains("<details class=\"pr-section comments\" data-state-key="));
+        assert!(html.contains("<details class=\"pr-section stacked\" data-state-key="));
         assert!(html.contains("green — 1/1 required"));
         assert!(html.contains("✓ success"));
         assert!(html.contains("(not required)"));
@@ -636,9 +826,61 @@ mod tests {
         assert!(html.contains("outdated"));
         assert!(html.contains("href=\"https://checks.test/?x=1&amp;y=2\""));
         assert!(html.contains("href=\"https://example.test/?a=1&amp;b=&quot;two&quot;\""));
-        assert!(!html.contains("<script>"));
-        assert!(!html.contains("<img>"));
+        assert!(!html.contains("alice<script>"));
+        assert!(!html.contains("eve<img>"));
         assert!(html.contains("say &lt;hello&gt; &amp; goodbye"));
+    }
+
+    #[test]
+    fn both_pages_render_refresh_and_loading_disables_it() {
+        let ready = rich_snapshot();
+        let authored = render_authored(&ready);
+        let merged = render_merged(&ready, Utc::now());
+        assert!(authored.contains(
+            "method=\"post\" action=\"/refresh?return=%2F\"><button type=\"submit\">Refresh"
+        ));
+        assert!(merged.contains(
+            "method=\"post\" action=\"/refresh?return=%2Fmerged\"><button type=\"submit\">Refresh"
+        ));
+
+        let loading = render_authored(&WebSnapshot::default());
+        assert!(loading.contains("<button type=\"submit\" disabled"));
+        assert!(loading.contains("aria-busy=\"true\""));
+        assert!(loading.contains("Refreshing…"));
+        assert!(loading.contains("window.location.reload()"));
+    }
+
+    #[test]
+    fn section_state_keys_are_unique_semantic_stable_and_escaped() {
+        let first = render_authored(&rich_snapshot());
+        let first_keys = state_keys(&first);
+        let unique: std::collections::BTreeSet<_> = first_keys.iter().copied().collect();
+        assert_eq!(first_keys.len(), unique.len());
+        assert!(unique.contains("repo:z/repo:pr:1:section:checks"));
+        assert!(unique.contains("repo:z/repo:pr:1:section:stacked"));
+
+        let mut changed = rich_snapshot();
+        changed.authored.reverse();
+        changed.authored[0].title = "new title and content".to_string();
+        for pr in &mut changed.authored {
+            pr.updated_at += chrono::Duration::seconds(1_000);
+        }
+        let second = render_authored(&changed);
+        let second_keys: std::collections::BTreeSet<_> = state_keys(&second).into_iter().collect();
+        assert_eq!(unique, second_keys);
+
+        let mut unsafe_snapshot = rich_snapshot();
+        unsafe_snapshot.authored[0].repo = "bad\" data-injected=\"yes".to_string();
+        let escaped = render_authored(&unsafe_snapshot);
+        assert!(escaped.contains("repo:bad&quot; data-injected=&quot;yes:pr:1"));
+        assert!(!escaped.contains("data-state-key=\"repo:bad\" data-injected="));
+    }
+
+    #[test]
+    fn browser_state_script_restores_explicit_open_and_closed_values() {
+        assert!(SCRIPT.contains("if (stored !== null) details.open = stored === \"open\""));
+        assert!(SCRIPT.contains("details.open ? \"open\" : \"closed\""));
+        assert!(SCRIPT.contains("sessionStorage"));
     }
 
     #[test]
@@ -655,6 +897,16 @@ mod tests {
         assert!(html.contains("warning: partial &amp; stale"));
         assert!(html.contains("Latest successful refresh"));
         assert!(html.contains("No open authored pull requests"));
+    }
+
+    #[test]
+    fn refresh_error_keeps_last_good_data_visible() {
+        let mut snapshot = rich_snapshot();
+        snapshot.error = Some("network down".to_string());
+        let html = render_authored(&snapshot);
+        assert!(html.contains("Refresh failed: network down"));
+        assert!(html.contains("Parent &lt;fix&gt;"));
+        assert!(!html.contains("aria-busy=\"true\""));
     }
 
     #[test]
@@ -693,15 +945,54 @@ mod tests {
 
     #[test]
     fn unknown_route_is_plain_404() {
-        let response = route(&WebSnapshot::default(), "/nope");
+        let (tx, _rx) = mpsc::channel();
+        let response = route(&WebSnapshot::default(), &request("GET", "/nope"), &tx);
         assert_eq!(response.status, "404 Not Found");
         assert_eq!(response.content_type, "text/plain; charset=utf-8");
         assert_eq!(response.body, "404 not found\n");
     }
 
     #[test]
+    fn refresh_route_signals_and_redirects_to_originating_page() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            route(
+                &WebSnapshot::default(),
+                &request("POST", "/refresh?return=%2Fmerged"),
+                &tx,
+            )
+        });
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            Msg::WebRefresh { acknowledged } => acknowledged.send(()).unwrap(),
+            _ => panic!("listener sent the wrong app message"),
+        }
+        let response = worker.join().unwrap();
+        assert_eq!(response.status, "303 See Other");
+        assert_eq!(response.headers, vec![("Location", "/merged".to_string())]);
+    }
+
+    #[test]
+    fn refresh_route_rejects_cross_origin_and_unsupported_methods() {
+        let (tx, rx) = mpsc::channel();
+        let mut cross_origin = request("POST", "/refresh?return=%2F");
+        cross_origin.origin = Some("http://evil.example".to_string());
+        let response = route(&WebSnapshot::default(), &cross_origin, &tx);
+        assert_eq!(response.status, "403 Forbidden");
+        assert!(rx.try_recv().is_err());
+
+        let response = route(
+            &WebSnapshot::default(),
+            &request("GET", "/refresh?return=%2F"),
+            &tx,
+        );
+        assert_eq!(response.status, "405 Method Not Allowed");
+        assert_eq!(response.headers, vec![("Allow", "POST".to_string())]);
+    }
+
+    #[test]
     fn ephemeral_listener_serves_published_snapshot() {
-        let server = start("127.0.0.1:0").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let server = start("127.0.0.1:0", tx).unwrap();
         server.snapshots().publish(rich_snapshot());
         let mut stream = TcpStream::connect(server.local_addr()).unwrap();
         stream
@@ -709,15 +1000,19 @@ mod tests {
             .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response:?}"
+        );
         assert!(response.contains("Recently merged PRs"));
     }
 
     #[test]
     fn bind_failure_names_the_requested_address() {
-        let server = start("127.0.0.1:0").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let server = start("127.0.0.1:0", tx.clone()).unwrap();
         let address = server.local_addr().to_string();
-        let error = start(&address).err().expect("second bind should fail");
+        let error = start(&address, tx).err().expect("second bind should fail");
         assert!(format!("{error:#}").contains(&address));
     }
 }

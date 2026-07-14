@@ -62,6 +62,7 @@ pub enum ViewMode {
 pub enum Msg {
     Fetched(Result<Data>),
     Action { label: String, result: Result<()> },
+    WebRefresh { acknowledged: Sender<()> },
 }
 
 pub struct AppState {
@@ -443,25 +444,30 @@ fn count_selectable(section: &Section<'_>) -> usize {
 }
 
 pub fn run() -> Result<()> {
+    let (tx, rx) = mpsc::channel::<Msg>();
     // Bind before entering raw terminal mode so a port conflict returns a clean
     // contextual error without requiring terminal restoration.
-    let web_server = web::start(web::DEFAULT_ADDRESS)?;
+    let web_server = web::start(web::DEFAULT_ADDRESS, tx.clone())?;
     let web_snapshots = web_server.snapshots();
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, &web_snapshots);
+    let result = run_app(&mut terminal, &web_snapshots, &tx, &rx);
     ratatui::restore();
     result
 }
 
-fn run_app(terminal: &mut DefaultTerminal, web_snapshots: &web::SnapshotStore) -> Result<()> {
+fn run_app(
+    terminal: &mut DefaultTerminal,
+    web_snapshots: &web::SnapshotStore,
+    tx: &Sender<Msg>,
+    rx: &Receiver<Msg>,
+) -> Result<()> {
     let mut state = AppState::new();
     web_snapshots.publish(web::WebSnapshot::from_app(&state));
-    let (tx, rx) = mpsc::channel::<Msg>();
-    spawn_fetch(&tx);
+    spawn_fetch(tx);
 
     let mut dirty = true;
     loop {
-        let changed = drain_msgs(&rx, &mut state, &tx);
+        let changed = drain_msgs(rx, &mut state, tx, web_snapshots, &mut spawn_fetch);
         if changed {
             web_snapshots.publish(web::WebSnapshot::from_app(&state));
         }
@@ -525,12 +531,9 @@ fn run_app(terminal: &mut DefaultTerminal, web_snapshots: &web::SnapshotStore) -
                         }
                         KeyCode::Enter => open_selected(&state),
                         KeyCode::Char('r') => {
-                            if !state.loading {
-                                state.loading = true;
-                                spawn_fetch(&tx);
-                            }
+                            request_refresh(&mut state, web_snapshots, || spawn_fetch(tx));
                         }
-                        KeyCode::Char('x') => remove_selected_reviewer(&mut state, &tx),
+                        KeyCode::Char('x') => remove_selected_reviewer(&mut state, tx),
                         KeyCode::Char('l') | KeyCode::Right => toggle_section(&mut state, true),
                         KeyCode::Char('h') | KeyCode::Left => toggle_section(&mut state, false),
                         _ => {}
@@ -552,28 +555,67 @@ fn should_redraw(dirty: bool, changed: bool, loading: bool) -> bool {
     dirty || changed || loading
 }
 
-fn drain_msgs(rx: &Receiver<Msg>, state: &mut AppState, tx: &Sender<Msg>) -> bool {
+fn drain_msgs<F>(
+    rx: &Receiver<Msg>,
+    state: &mut AppState,
+    tx: &Sender<Msg>,
+    web_snapshots: &web::SnapshotStore,
+    launch_fetch: &mut F,
+) -> bool
+where
+    F: FnMut(&Sender<Msg>),
+{
     let mut changed = false;
     while let Ok(msg) = rx.try_recv() {
-        changed = true;
         match msg {
-            Msg::Fetched(Ok(data)) => state.apply(data),
-            Msg::Fetched(Err(e)) => state.fail(format!("{e:#}")),
+            Msg::Fetched(Ok(data)) => {
+                state.apply(data);
+                changed = true;
+            }
+            Msg::Fetched(Err(e)) => {
+                state.fail(format!("{e:#}"));
+                changed = true;
+            }
             Msg::Action { label, result } => match result {
                 Ok(()) => {
                     state.status = Some(format!("{label}: ok"));
-                    if !state.loading {
-                        state.loading = true;
-                        spawn_fetch(tx);
-                    }
+                    request_refresh(state, web_snapshots, || launch_fetch(tx));
+                    changed = true;
                 }
                 Err(e) => {
                     state.status = Some(format!("{label}: {e:#}"));
+                    changed = true;
                 }
             },
+            Msg::WebRefresh { acknowledged } => {
+                changed |= request_refresh(state, web_snapshots, || launch_fetch(tx));
+                // `request_refresh` publishes the loading snapshot before it
+                // returns, so the listener can now safely redirect the browser.
+                let _ = acknowledged.send(());
+            }
         }
     }
     changed
+}
+
+/// Start a full GitHub refresh if one is not already running. Publishing the
+/// loading snapshot is part of the transition so every caller has the same
+/// ordering guarantee.
+fn request_refresh<F>(
+    state: &mut AppState,
+    web_snapshots: &web::SnapshotStore,
+    launch_fetch: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    if state.loading {
+        return false;
+    }
+    state.loading = true;
+    web_snapshots.publish(web::WebSnapshot::from_app(state));
+    launch_fetch();
+    true
 }
 
 fn spawn_fetch(tx: &Sender<Msg>) {
@@ -735,6 +777,8 @@ fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use chrono::TimeZone;
 
     use super::*;
@@ -1115,16 +1159,67 @@ mod tests {
     fn drain_msgs_reports_change() {
         let mut state = AppState::new(); // loading: true seed → no fetch spawned
         let (tx, rx) = mpsc::channel::<Msg>();
+        let snapshots = web::SnapshotStore::new();
         tx.send(Msg::Action {
             label: "test".into(),
             result: Ok(()),
         })
         .unwrap();
 
-        assert!(drain_msgs(&rx, &mut state, &tx));
+        assert!(drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {}));
         assert_eq!(state.status, Some("test: ok".to_string()));
 
         // Channel is now empty → nothing drained → no change reported.
-        assert!(!drain_msgs(&rx, &mut state, &tx));
+        assert!(!drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {}));
+    }
+
+    #[test]
+    fn shared_refresh_transition_publishes_loading_and_is_single_flight() {
+        let mut state = AppState::new();
+        state.loading = false;
+        let snapshots = web::SnapshotStore::new();
+        snapshots.publish(web::WebSnapshot::from_app(&state));
+        let launches = Cell::new(0);
+
+        assert!(request_refresh(&mut state, &snapshots, || {
+            assert!(snapshots.load().is_loading());
+            launches.set(launches.get() + 1);
+        }));
+        assert!(state.loading);
+        assert_eq!(launches.get(), 1);
+
+        assert!(!request_refresh(&mut state, &snapshots, || {
+            launches.set(launches.get() + 1);
+        }));
+        assert_eq!(launches.get(), 1);
+    }
+
+    #[test]
+    fn web_refresh_is_acknowledged_after_publication_and_duplicates_do_not_launch() {
+        let mut state = AppState::new();
+        state.loading = false;
+        let snapshots = web::SnapshotStore::new();
+        snapshots.publish(web::WebSnapshot::from_app(&state));
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let (first_ack, first_acknowledgment) = mpsc::channel();
+        let (second_ack, second_acknowledgment) = mpsc::channel();
+        tx.send(Msg::WebRefresh {
+            acknowledged: first_ack,
+        })
+        .unwrap();
+        tx.send(Msg::WebRefresh {
+            acknowledged: second_ack,
+        })
+        .unwrap();
+        let launches = Cell::new(0);
+
+        assert!(drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
+            assert!(snapshots.load().is_loading());
+            launches.set(launches.get() + 1);
+        }));
+        first_acknowledgment.try_recv().unwrap();
+        second_acknowledgment.try_recv().unwrap();
+        assert!(snapshots.load().is_loading());
+        assert_eq!(launches.get(), 1);
     }
 }

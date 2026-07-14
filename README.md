@@ -12,20 +12,22 @@ Data comes from `gh api graphql`, so auth is whatever `gh` already has.
 There's also a non-interactive `rollup report` subcommand that prints the same
 data to stdout.
 
-While the interactive dashboard is running, it also serves a read-only web UI:
+While the interactive dashboard is running, it also serves a web companion UI:
 
 - <http://127.0.0.1:7011/> — **Authored by me**, with the same repository,
   merge-target, checks, reviewers, comments, and stacked-PR hierarchy.
 - <http://127.0.0.1:7011/merged> — the Me view's **Recently merged PRs**.
 
 The server binds only to loopback, starts and stops with the TUI, and never
-opens a browser automatically. Browser requests use the latest successful TUI
-fetch rather than contacting GitHub themselves; pressing `r` updates both
-interfaces, and a failed refresh leaves the last good data visible alongside
-the current error. A port conflict at `127.0.0.1:7011` exits cleanly before the
-terminal enters raw mode. The web UI's initial scope intentionally excludes the
-Reviewing, Releases, People, and reviewer-removal interfaces; those remain in
-the TUI and `rollup report`.
+opens a browser automatically. Use **Refresh** on either page (or press `r` in
+the TUI) to start one shared GitHub fetch for both interfaces. The browser shows
+loading progress, reloads when the fetch finishes, and keeps each PR section's
+expanded or folded state within that tab. A failed refresh leaves the last good
+data visible alongside the current error. Refresh only reads GitHub data; the
+web UI has no GitHub mutation actions. A port conflict at
+`127.0.0.1:7011` exits cleanly before the terminal enters raw mode. The web UI's
+scope intentionally excludes the Reviewing, Releases, People, and
+reviewer-removal interfaces; those remain in the TUI and `rollup report`.
 
 ## Install
 
@@ -45,10 +47,11 @@ Then use the TUI directly or visit <http://127.0.0.1:7011/> in a browser.
 
 The interactive process owns three concurrent pieces: a TUI event loop, worker
 threads that fetch GitHub data, and a small synchronous loopback HTTP listener.
-After every fetch result, the event loop atomically publishes an immutable web
-snapshot. This keeps HTTP rendering independent of GitHub latency and preserves
-the last successful snapshot when a later refresh fails. `rollup report` does
-not start the listener.
+The listener sends browser refresh requests to the event loop, which atomically
+publishes an immutable loading snapshot before acknowledging the request and
+starting the fetch. This keeps HTTP rendering independent of GitHub latency,
+prevents overlapping refreshes, and preserves the last successful snapshot when
+a later refresh fails. `rollup report` does not start the listener.
 
 ## Keys
 
