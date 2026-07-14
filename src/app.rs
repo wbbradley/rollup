@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
@@ -94,6 +94,13 @@ pub struct AppState {
     pub reviewing_list_state: ListState,
     pub people_list_state: ListState,
     pub releases_list_state: ListState,
+    /// Each interactive pane's visible inner height (rows), recorded by `ui`
+    /// during the last draw. Used to size half-page jumps (`PageUp`/`PageDown`,
+    /// `Ctrl-U`/`Ctrl-D`). Zero until the first frame is drawn.
+    pub authored_page: usize,
+    pub reviewing_page: usize,
+    pub people_page: usize,
+    pub releases_page: usize,
 }
 
 impl AppState {
@@ -119,6 +126,10 @@ impl AppState {
             reviewing_list_state: ListState::default(),
             people_list_state: ListState::default(),
             releases_list_state: ListState::default(),
+            authored_page: 0,
+            reviewing_page: 0,
+            people_page: 0,
+            releases_page: 0,
         }
     }
 
@@ -229,6 +240,25 @@ impl AppState {
                 _ => &mut self.reviewing_sel,
             },
         }
+    }
+
+    /// Visible inner height of the pane the selection currently drives, as last
+    /// recorded by `ui`. Mirrors `current_sel`'s routing.
+    fn current_page(&self) -> usize {
+        match self.mode {
+            ViewMode::Me => self.authored_page,
+            ViewMode::People => self.people_page,
+            ViewMode::Radar => match self.focus {
+                Focus::Releases => self.releases_page,
+                _ => self.reviewing_page,
+            },
+        }
+    }
+
+    /// Selection delta for a half-page jump: half the focused pane's visible
+    /// height, floored at 1 so the cursor always moves even in a tiny pane.
+    fn page_step(&self) -> i32 {
+        (self.current_page() / 2).max(1) as i32
     }
 }
 
@@ -456,6 +486,23 @@ fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         }
                         KeyCode::Char('j') | KeyCode::Down => move_selection(&mut state, 1),
                         KeyCode::Char('k') | KeyCode::Up => move_selection(&mut state, -1),
+                        // Half-page jumps sized to the focused pane's height.
+                        KeyCode::PageDown => {
+                            let step = state.page_step();
+                            move_selection(&mut state, step);
+                        }
+                        KeyCode::PageUp => {
+                            let step = state.page_step();
+                            move_selection(&mut state, -step);
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let step = state.page_step();
+                            move_selection(&mut state, step);
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let step = state.page_step();
+                            move_selection(&mut state, -step);
+                        }
                         KeyCode::Char('g') => jump(&mut state, true),
                         KeyCode::Char('G') => jump(&mut state, false),
                         KeyCode::Tab => {
@@ -1004,6 +1051,53 @@ mod tests {
         assert!(should_redraw(false, true, false)); // changed alone
         assert!(should_redraw(false, false, true)); // loading alone
         assert!(!should_redraw(false, false, false)); // idle: skip the draw
+    }
+
+    #[test]
+    fn half_page_jump_moves_by_half_pane_height_and_clamps() {
+        // A list longer than the pane, so jumps have room to move.
+        let prs: Vec<Pr> = (1..=20)
+            .map(|n| simple_pr(n, "main", &format!("f{n}"), vec![]))
+            .collect();
+        let mut state = me_state(prs);
+        let len = state.current_len();
+        assert!(len >= 12, "expected a long list, got {len}");
+
+        // Pane shows 10 rows → half-page jump is 5 (what PageDown/Ctrl-D use).
+        state.authored_page = 10;
+        assert_eq!(state.page_step(), 5);
+
+        state.authored_sel = 0;
+        let step = state.page_step();
+        move_selection(&mut state, step); // PageDown
+        assert_eq!(state.authored_sel, 5);
+        let step = state.page_step();
+        move_selection(&mut state, step);
+        assert_eq!(state.authored_sel, 10);
+
+        let step = state.page_step();
+        move_selection(&mut state, -step); // PageUp
+        assert_eq!(state.authored_sel, 5);
+
+        // Overshooting either edge clamps instead of wrapping.
+        state.authored_sel = len - 2;
+        let step = state.page_step();
+        move_selection(&mut state, step);
+        assert_eq!(state.authored_sel, len - 1);
+
+        state.authored_sel = 1;
+        let step = state.page_step();
+        move_selection(&mut state, -step);
+        assert_eq!(state.authored_sel, 0);
+    }
+
+    #[test]
+    fn page_step_floors_at_one() {
+        let mut state = me_state(vec![simple_pr(1, "main", "f1", vec![])]);
+        state.authored_page = 0; // before the first frame records a height
+        assert_eq!(state.page_step(), 1);
+        state.authored_page = 1; // tiny pane: 1/2 == 0, floored to 1
+        assert_eq!(state.page_step(), 1);
     }
 
     #[test]

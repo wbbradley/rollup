@@ -28,7 +28,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         ViewMode::Me => {
             let authored_section =
                 report::build_section_authored(&state.authored, &viewer_str, &state.toggled);
-            draw_section(
+            state.authored_page = draw_section(
                 f,
                 top,
                 &authored_section,
@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             let releases_area = parts[1];
 
             let reviewing_section = report::build_section_reviewing(&state.reviewing);
-            draw_section(
+            state.reviewing_page = draw_section(
                 f,
                 reviewing_area,
                 &reviewing_section,
@@ -58,7 +58,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             if state.releases.is_empty() && state.loaded_at.is_none() {
                 releases_section.empty_message = Some("Loading…");
             }
-            draw_section(
+            state.releases_page = draw_section(
                 f,
                 releases_area,
                 &releases_section,
@@ -70,7 +70,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         ViewMode::People => {
             let people_section =
                 report::build_section_people(&state.authored, &state.reviewing, &viewer_str);
-            draw_section(
+            state.people_page = draw_section(
                 f,
                 top,
                 &people_section,
@@ -104,6 +104,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
 const SCROLL_MARGIN: usize = 4;
 
+/// Draws an interactive section into `area` and returns the pane's visible
+/// inner height (rows, excluding the border). Callers persist that height so
+/// half-page keys (`PageUp`/`PageDown`, `Ctrl-U`/`Ctrl-D`) can size their jump.
 fn draw_section(
     f: &mut Frame,
     area: Rect,
@@ -111,7 +114,7 @@ fn draw_section(
     selection: usize,
     list_state: &mut ListState,
     focused: bool,
-) {
+) -> usize {
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -126,6 +129,8 @@ fn draw_section(
         .borders(Borders::ALL)
         .border_style(border_style);
 
+    let inner_h = block.inner(area).height as usize;
+
     if section.rows.is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -134,7 +139,7 @@ fn draw_section(
             Style::default().add_modifier(Modifier::DIM),
         ));
         f.render_widget(msg, inner);
-        return;
+        return inner_h;
     }
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -149,7 +154,6 @@ fn draw_section(
     let highlighted_row = row_of_sel.get(selection).copied();
     list_state.select(highlighted_row);
 
-    let inner_h = block.inner(area).height as usize;
     apply_scroll_margin(list_state, highlighted_row, items.len(), inner_h);
 
     let highlight_style = if focused {
@@ -166,6 +170,7 @@ fn draw_section(
         .highlight_symbol(if focused { "▶ " } else { "  " });
 
     f.render_stateful_widget(list, area, list_state);
+    inner_h
 }
 
 fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
