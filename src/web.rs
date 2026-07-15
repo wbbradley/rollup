@@ -421,10 +421,15 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     out.push_str("<li class=\"pr\"><article><h3>");
     let _ = write!(
         out,
-        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span> {}</a>{}",
+        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span> {}{}</a>{}",
         escape(&pr.url),
         pr.number,
         escape(&pr.title),
+        if pr.head_ref.is_empty() {
+            String::new()
+        } else {
+            format!(" <span class=\"muted\">[{}]</span>", escape(&pr.head_ref))
+        },
         if pr.is_draft {
             " <span class=\"badge\">draft</span>"
         } else {
@@ -910,6 +915,26 @@ mod tests {
         assert!(!html.contains("alice<script>"));
         assert!(!html.contains("eve<img>"));
         assert!(html.contains("say &lt;hello&gt; &amp; goodbye"));
+        assert!(html.contains("Parent &lt;fix&gt; <span class=\"muted\">[branch-1]</span>"));
+        assert!(html.contains("title 2 <span class=\"muted\">[branch-2]</span>"));
+    }
+
+    #[test]
+    fn authored_head_ref_is_escaped_and_empty_head_ref_is_omitted() {
+        let mut snapshot = WebSnapshot {
+            viewer: "me".to_string(),
+            ..WebSnapshot::default()
+        };
+        let mut unsafe_branch = pr("o/r", 1, "me", 1);
+        unsafe_branch.head_ref = "feature/<script>&\"quote\"".to_string();
+        let mut empty_branch = pr("o/r", 2, "me", 2);
+        empty_branch.head_ref.clear();
+        snapshot.authored = vec![unsafe_branch, empty_branch];
+
+        let html = render_authored(&snapshot);
+        assert!(html.contains("[feature/&lt;script&gt;&amp;&quot;quote&quot;]</span>"));
+        assert!(html.contains("<span class=\"number\">#2</span> title 2</a>"));
+        assert!(!html.contains("title 2 <span class=\"muted\">["));
     }
 
     #[test]

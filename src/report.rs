@@ -203,6 +203,9 @@ pub enum Row<'a> {
     Pr {
         pr: &'a Pr,
         hide_author_if: Option<String>,
+        /// Whether to append the PR's non-empty head branch as a secondary
+        /// label. True only for rows built for the Authored pane/report.
+        show_head_ref: bool,
         /// Full leading indent string for tree rendering (with `├`/`└`/`│`
         /// connectors). `None` in flat panes, which fall back to a fixed indent.
         tree_prefix: Option<String>,
@@ -279,6 +282,7 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
             rows.push(Row::Pr {
                 pr,
                 hide_author_if: None,
+                show_head_ref: false,
                 tree_prefix: None,
                 stacked_under: None,
             });
@@ -399,7 +403,12 @@ fn pr_visible_text(pr: &Pr, viewer: &str) -> String {
     } else {
         format!(" @{}", pr.author)
     };
-    format!("#{}{}{} {}", pr.number, draft, author, pr.title)
+    let head_ref = if pr.head_ref.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", pr.head_ref)
+    };
+    format!("#{}{}{} {}{head_ref}", pr.number, draft, author, pr.title)
 }
 
 fn reviewer_visible_text(reviewer: &ReviewerStatus) -> String {
@@ -515,6 +524,7 @@ fn push_filtered_pr<'a>(
     rows.push(Row::Pr {
         pr: node.pr,
         hide_author_if: Some(viewer.to_string()),
+        show_head_ref: true,
         tree_prefix: Some(format!("{prefix}{connector}")),
         stacked_under,
     });
@@ -698,6 +708,7 @@ fn push_pr<'a>(
     rows.push(Row::Pr {
         pr: node.pr,
         hide_author_if: Some(viewer.to_string()),
+        show_head_ref: true,
         tree_prefix: Some(format!("{prefix}{connector}")),
         stacked_under,
     });
@@ -817,6 +828,7 @@ pub fn build_section_people<'a>(
                 rows.push(Row::Pr {
                     pr,
                     hide_author_if: Some(person.login.clone()),
+                    show_head_ref: false,
                     tree_prefix: None,
                     stacked_under: None,
                 });
@@ -834,6 +846,7 @@ pub fn build_section_people<'a>(
                 rows.push(Row::Pr {
                     pr,
                     hide_author_if: None,
+                    show_head_ref: false,
                     tree_prefix: None,
                     stacked_under: None,
                 });
@@ -1110,11 +1123,13 @@ fn render_row(
         Row::Pr {
             pr,
             hide_author_if,
+            show_head_ref,
             tree_prefix,
             ..
         } => render_pr_line(
             pr,
             hide_author_if.as_deref(),
+            *show_head_ref,
             tree_prefix.as_deref(),
             out,
             use_color,
@@ -1296,6 +1311,7 @@ fn render_release_tag_line(
 fn render_pr_line(
     pr: &Pr,
     hide_author_if: Option<&str>,
+    show_head_ref: bool,
     tree_prefix: Option<&str>,
     out: &mut impl Write,
     use_color: bool,
@@ -1342,8 +1358,23 @@ fn render_pr_line(
         prefix.push_str(&reset(use_color));
     }
 
-    let title = truncate_title(&pr.title, width, plain_prefix_cols);
-    writeln!(out, "{prefix}{title}")
+    let suffix = show_head_ref
+        .then_some(pr.head_ref.as_str())
+        .filter(|head_ref| !head_ref.is_empty())
+        .map(|head_ref| format!(" [{head_ref}]"));
+    let budget = width.saturating_sub(plain_prefix_cols);
+    let (title, suffix) = match suffix {
+        Some(suffix) if suffix.chars().count() < budget => {
+            let title_budget = budget - suffix.chars().count();
+            (truncate_text(&pr.title, title_budget), Some(suffix))
+        }
+        _ => (truncate_text(&pr.title, budget), None),
+    };
+    write!(out, "{prefix}{title}")?;
+    if let Some(suffix) = suffix {
+        write!(out, "{}{}{}", dim(use_color), suffix, reset(use_color))?;
+    }
+    writeln!(out)
 }
 
 fn render_reviewer_line(
@@ -1474,17 +1505,20 @@ fn render_merged_pr_line(
 }
 
 fn truncate_title(title: &str, width: usize, prefix_cols: usize) -> String {
-    if prefix_cols + 1 >= width {
-        return title.to_string();
+    truncate_text(title, width.saturating_sub(prefix_cols))
+}
+
+fn truncate_text(text: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
     }
-    let budget = width - prefix_cols;
-    if title.chars().count() <= budget {
-        return title.to_string();
+    if text.chars().count() <= budget {
+        return text.to_string();
     }
     if budget <= 1 {
         return "…".to_string();
     }
-    let mut s: String = title.chars().take(budget - 1).collect();
+    let mut s: String = text.chars().take(budget - 1).collect();
     s.push('…');
     s
 }
@@ -1883,6 +1917,65 @@ mod tests {
         // B is A's only child: one continuation bar under A (A is not last),
         // then a `└─` connector.
         assert_eq!(prefix(2), "  │  └─ ");
+
+        assert!(
+            section
+                .rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::Pr { show_head_ref, .. } => Some(show_head_ref),
+                    _ => None,
+                })
+                .all(|show_head_ref| *show_head_ref)
+        );
+    }
+
+    #[test]
+    fn non_authored_pr_rows_do_not_enable_head_ref_labels() {
+        let authored = vec![pr("o/r", 1, "alice", false, 100, vec![])];
+        let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
+        let sections = [
+            build_section_reviewing(&reviewing),
+            build_section_people(&authored, &reviewing, "me"),
+        ];
+
+        for section in sections {
+            assert!(
+                section
+                    .rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        Row::Pr { show_head_ref, .. } => Some(show_head_ref),
+                        _ => None,
+                    })
+                    .all(|show_head_ref| !*show_head_ref)
+            );
+        }
+    }
+
+    #[test]
+    fn authored_console_head_ref_is_dimmed_width_safe_and_omits_empty_ref() {
+        let mut labeled = pr("o/r", 1, "me", false, 100, vec![]);
+        labeled.title = "A deliberately long title".to_string();
+        labeled.head_ref = "feature/foo".to_string();
+        let mut empty = pr("o/r", 2, "me", false, 90, vec![]);
+        empty.head_ref.clear();
+        let authored = vec![labeled, empty];
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
+
+        let mut plain = Vec::new();
+        render_section(&section, &mut plain, false, 30).unwrap();
+        let plain = String::from_utf8(plain).unwrap();
+        let labeled_line = plain.lines().find(|line| line.contains("#1 ")).unwrap();
+        let empty_line = plain.lines().find(|line| line.contains("#2 ")).unwrap();
+        assert!(labeled_line.ends_with(" [feature/foo]"), "{labeled_line}");
+        assert!(labeled_line.chars().count() <= 30, "{labeled_line}");
+        assert!(!empty_line.contains(" []"), "{empty_line}");
+
+        let mut colored = Vec::new();
+        render_section(&section, &mut colored, true, 120).unwrap();
+        let colored = String::from_utf8(colored).unwrap();
+        assert!(colored.contains("\x1b[2m [feature/foo]\x1b[0m"));
     }
 
     #[test]
@@ -2079,6 +2172,7 @@ mod tests {
             Row::Pr {
                 pr: &p,
                 hide_author_if: None,
+                show_head_ref: false,
                 tree_prefix: None,
                 stacked_under: None,
             }
@@ -2544,6 +2638,32 @@ mod tests {
             })
             .collect();
         assert_eq!(numbers, vec![1]);
+    }
+
+    #[test]
+    fn filtered_authored_matches_head_ref_and_retains_stacked_ancestor() {
+        let mut root = pr_refs("o/r", 1, "main", "stack-base");
+        root.title = "root".to_string();
+        let mut child = pr_refs("o/r", 2, "stack-base", "Feature/Search-Needle");
+        child.title = "child".to_string();
+        let authored = vec![root, child];
+
+        let section =
+            build_section_authored_filtered(&authored, "me", "search-needle", &ToggledSet::new());
+        let numbers: Vec<u64> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Pr {
+                    pr,
+                    show_head_ref: true,
+                    ..
+                } => Some(pr.number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(section.count, 2);
+        assert_eq!(numbers, vec![1, 2]);
     }
 
     #[test]

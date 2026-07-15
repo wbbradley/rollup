@@ -207,11 +207,13 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
         Row::Pr {
             pr,
             hide_author_if,
+            show_head_ref,
             tree_prefix,
             ..
         } => ListItem::new(pr_line(
             pr,
             hide_author_if.as_deref(),
+            *show_head_ref,
             tree_prefix.as_deref(),
         )),
         Row::Reviewer { r, tree_prefix } => ListItem::new(reviewer_line(r, tree_prefix.as_deref())),
@@ -348,7 +350,12 @@ fn merged_pr_line(pr: &Pr, now: chrono::DateTime<chrono::Utc>) -> Line<'static> 
     Line::from(spans)
 }
 
-fn pr_line(pr: &Pr, hide_author_if: Option<&str>, tree_prefix: Option<&str>) -> Line<'static> {
+fn pr_line(
+    pr: &Pr,
+    hide_author_if: Option<&str>,
+    show_head_ref: bool,
+    tree_prefix: Option<&str>,
+) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     match tree_prefix {
         Some(tp) => spans.push(Span::styled(
@@ -375,6 +382,12 @@ fn pr_line(pr: &Pr, hide_author_if: Option<&str>, tree_prefix: Option<&str>) -> 
         ));
     }
     spans.push(Span::raw(pr.title.clone()));
+    if show_head_ref && !pr.head_ref.is_empty() {
+        spans.push(Span::styled(
+            format!(" [{}]", pr.head_ref),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -637,4 +650,51 @@ fn footer_line(state: &AppState) -> Line<'static> {
         status,
         Span::raw("]"),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::model::ChecksRollup;
+
+    fn test_pr(head_ref: &str) -> Pr {
+        Pr {
+            number: 7,
+            title: "Improve rendering".to_string(),
+            url: "https://github.com/o/r/pull/7".to_string(),
+            is_draft: false,
+            repo: "o/r".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: head_ref.to_string(),
+            author: "me".to_string(),
+            reviewers: Vec::new(),
+            updated_at: Utc.timestamp_opt(1, 0).unwrap(),
+            merged_at: None,
+            unresolved_comments: Vec::new(),
+            checks: Vec::new(),
+            checks_rollup: ChecksRollup::Unknown,
+        }
+    }
+
+    #[test]
+    fn pr_line_dims_head_ref_only_when_enabled_and_non_empty() {
+        let line = pr_line(&test_pr("feature/render"), Some("me"), true, None);
+        let suffix = line.spans.last().unwrap();
+        assert_eq!(suffix.content.as_ref(), " [feature/render]");
+        assert!(suffix.style.add_modifier.contains(Modifier::DIM));
+
+        let disabled = pr_line(&test_pr("feature/render"), Some("me"), false, None);
+        assert_eq!(
+            disabled.spans.last().unwrap().content.as_ref(),
+            "Improve rendering"
+        );
+
+        let empty = pr_line(&test_pr(""), Some("me"), true, None);
+        assert_eq!(
+            empty.spans.last().unwrap().content.as_ref(),
+            "Improve rendering"
+        );
+    }
 }

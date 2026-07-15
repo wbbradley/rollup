@@ -3,7 +3,7 @@
 A terminal dashboard for your GitHub PR review workload. Panes:
 
 - **Review requested of me** — open PRs waiting on your review (Radar page, `e`).
-- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch). Fills the full width of the Me view.
+- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch), with each source branch shown as a muted `[branch/name]` suffix. Fills the full width of the Me view.
 - **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Radar page, `e`).
 - **Recently merged PRs** — recently merged PRs by people in the current view.
 
@@ -95,7 +95,8 @@ Within each repo, the `Authored by me` pane nests your PRs by **merge target**:
 a PR whose base branch is another of your PRs' branch is drawn as a child of
 that PR, with `├─`/`└─`/`│` connectors — so stacked PRs read at a glance. A PR
 that targets a branch you don't have an open PR for (e.g. `main`) sits at the
-top level under its repo header.
+top level under its repo header. Each PR label ends with its GitHub source
+branch in muted square brackets, such as `Improve rendering [feature/render]`.
 
 Under each PR its children are grouped into up to four ordered sections:
 
@@ -131,7 +132,8 @@ Press `/` in the Me view to start an incremental Authored-tree search. The
 footer changes to `inc search: <query>`, and every printable character or
 Backspace immediately recomputes the tree. Matching is case-insensitive over
 visible text: repository and PR labels, section labels and summaries,
-reviewers, comments, and checks. URLs and branch metadata are not searched.
+reviewers, comments, and checks. PR labels include their displayed source branch,
+so branch names are searchable; URLs and undisplayed metadata are not searched.
 Only matching rows and the ancestor path needed to reach them remain; matches
 inside normally collapsed sections are temporarily exposed without changing
 your saved collapse state. Enter commits the filter so navigation, opening,
