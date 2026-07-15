@@ -100,13 +100,15 @@ branch in muted square brackets, such as `Improve rendering [feature/render]`.
 
 Under each PR its children are grouped into up to four ordered sections:
 
-1. **Checks** — a merge-readiness rollup for the PR's head commit. Collapsed by
-   default; the header shows a glyph + required ratio, e.g. `▸ Checks ✓ 4/4
-   required`. Expanding lists every check, non-required ones dimmed and tagged
-   `(not required)`, ordered with failures and incomplete checks first and
-   successful checks last. When a check has been retried or re-run, only its
-   latest run is shown. `Enter` on a check opens its details page (falling back to
-   the PR). See [Checks signal](#checks-signal) below.
+1. **Checks** — a merge-readiness rollup for the PR's head commit. It starts
+   expanded when any required or optional check has failed/errored, and starts
+   collapsed otherwise; the header shows a glyph + required ratio, e.g.
+   `▸ Checks ✓ 4/4 required`. Failure/Error and Pending rows sit directly under
+   Checks in attention-first order. Success, Skipped, and Neutral rows are
+   grouped under a nested, default-collapsed **Valid Results** node. When a
+   check has been retried or re-run, only its latest run is shown. `Enter` on a
+   check opens its details page (falling back to the PR). See
+   [Checks signal](#checks-signal) below.
 2. **Reviewers** — where each reviewer stands (see the glyph table above).
 3. **Open comments** — the first comment of every *unresolved* review thread
    (`isResolved == false`), shown as `@author excerpt (path)`. Threads whose
@@ -118,11 +120,14 @@ Only non-empty sections appear, in that order. Every non-empty section shows a
 selectable `▸`/`▾` header that is also a **collapse control**: `l`/Right expands
 it, `h`/Left collapses it. `h`/Left on a child row (check, reviewer, comment, or
 nested PR) collapses its enclosing section and moves the cursor back to that
-section's header. **Checks and Reviewers are collapsed by default** (Open
-comments and Stacked PRs start expanded); the Reviewers header carries a compact
+section's header. A valid check collapses back to **Valid Results**; an
+actionable check collapses back to **Checks**. Checks conditionally expands as
+described above, while Valid Results and Reviewers start collapsed (Open
+comments and Stacked PRs start expanded). The Reviewers header carries a compact
 response-state summary — e.g. `▸ Reviewers [req, ✗ changes]` — so a
 changes-requested review (`✗`) is visible at a glance without expanding.
-Collapse state is per-`(PR, section)` and survives background refreshes. `Enter`
+Explicit fold state is per-`(PR, section)` and survives background refreshes,
+including a check changing between failing and non-failing. `Enter`
 on a comment opens that comment's permalink; `Enter` on a check opens its
 details; `Enter` on a PR, reviewer, or section header opens the PR. The same
 shape appears in `rollup report`, with every section expanded so all details
@@ -136,7 +141,9 @@ reviewers, comments, and checks. PR labels include their displayed source branch
 so branch names are searchable; URLs and undisplayed metadata are not searched.
 Only matching rows and the ancestor path needed to reach them remain; matches
 inside normally collapsed sections are temporarily exposed without changing
-your saved collapse state. Enter commits the filter so navigation, opening,
+your saved collapse state. A matching valid check retains both Checks and Valid
+Results as ancestors; matching the Valid Results label retains Checks. Enter
+commits the filter so navigation, opening,
 and temporary `h`/`l` folding continue to work. Esc cancels an edit or clears a
 committed filter and restores the full tree and its prior folds. An empty Enter
 means no filter, and `/` while filtered starts a replacement query. The filter
@@ -155,8 +162,9 @@ checks only**:
 | `◉`   | Pending — a required check is still queued/running and none have failed.  |
 | `○`   | Unknown — GitHub hasn't computed mergeability/the rollup yet; resolves on refresh. |
 
-A **failing non-required check never turns the signal red** — it still appears in
-the expanded list, dimmed and marked `(not required)`. A PR whose base branch has
+A **failing non-required check never turns the signal red**, but it does open
+the Checks section so the failure is visible; its row is dimmed and marked
+`(not required)`. A PR whose base branch has
 no required checks (common for stacked PRs targeting an unprotected feature
 branch) shows green `no required checks`. A PR with no checks at all omits the
 section entirely. Because it ignores the review requirement, a PR that is only

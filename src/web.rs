@@ -16,7 +16,7 @@ use chrono::{DateTime, Local, Utc};
 use crate::{
     app::{AppState, Msg},
     model::{
-        CheckState, ChecksRollup, Pr, PrTreeNode, ReviewState, authored_tree,
+        CheckState, CheckStatus, ChecksRollup, Pr, PrTreeNode, ReviewState, authored_tree,
         checks_by_display_priority, group_by_repo,
     },
     report::{
@@ -440,6 +440,10 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
 
     if !pr.checks.is_empty() {
         let summary = ChecksSummary::of(pr);
+        let checks_open = pr
+            .checks
+            .iter()
+            .any(|check| matches!(check.state, CheckState::Failure | CheckState::Error));
         let class = match summary.rollup {
             ChecksRollup::Green => "ok",
             ChecksRollup::Red => "bad",
@@ -448,8 +452,9 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
         };
         let _ = write!(
             out,
-            "<details class=\"pr-section checks\" data-state-key=\"{}\"><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
+            "<details class=\"pr-section checks\" data-state-key=\"{}\"{}><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
             escape(&section_state_key(pr, "checks")),
+            if checks_open { " open" } else { "" },
             class,
             escape(&format!(
                 "{} — {}",
@@ -458,28 +463,37 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             )),
             escape(&pr.url)
         );
-        for check in checks_by_display_priority(&pr.checks) {
-            let target = check
-                .url
-                .as_deref()
-                .filter(|url| !url.is_empty())
-                .unwrap_or(&pr.url);
+        let ordered = checks_by_display_priority(&pr.checks);
+        for check in ordered.iter().copied().filter(|check| {
+            matches!(
+                check.state,
+                CheckState::Failure | CheckState::Error | CheckState::Pending
+            )
+        }) {
+            render_web_check(out, check, pr);
+        }
+        out.push_str("</ul>");
+        let valid: Vec<&CheckStatus> = ordered
+            .into_iter()
+            .filter(|check| {
+                matches!(
+                    check.state,
+                    CheckState::Success | CheckState::Skipped | CheckState::Neutral
+                )
+            })
+            .collect();
+        if !valid.is_empty() {
             let _ = write!(
                 out,
-                "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"state {}\" aria-hidden=\"true\">{}</span><span class=\"check-state-label\">{}</span> {}{}</a></li>",
-                escape(target),
-                check_state_class(check.state),
-                check_state_symbol(check.state),
-                check_state_label(check.state),
-                escape(&check.name),
-                if check.required {
-                    " <span class=\"required-marker\" title=\"Required check\" aria-label=\"required check\">◆</span>"
-                } else {
-                    ""
-                }
+                "<details class=\"check-results valid-results\" data-state-key=\"{}\"><summary>Valid Results</summary><ul>",
+                escape(&section_state_key(pr, "valid-results")),
             );
+            for check in valid {
+                render_web_check(out, check, pr);
+            }
+            out.push_str("</ul></details>");
         }
-        out.push_str("</ul></details>");
+        out.push_str("</details>");
     }
 
     if !pr.reviewers.is_empty() {
@@ -630,6 +644,28 @@ fn page_end(out: &mut String) {
     out.push_str("</script></body></html>");
 }
 
+fn render_web_check(out: &mut String, check: &CheckStatus, pr: &Pr) {
+    let target = check
+        .url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .unwrap_or(&pr.url);
+    let _ = write!(
+        out,
+        "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"state {}\" aria-hidden=\"true\">{}</span><span class=\"check-state-label\">{}</span> {}{}</a></li>",
+        escape(target),
+        check_state_class(check.state),
+        check_state_symbol(check.state),
+        check_state_label(check.state),
+        escape(&check.name),
+        if check.required {
+            " <span class=\"required-marker\" title=\"Required check\" aria-label=\"required check\">◆</span>"
+        } else {
+            ""
+        }
+    );
+}
+
 fn check_state_symbol(state: CheckState) -> &'static str {
     match state {
         CheckState::Success => "✓",
@@ -726,7 +762,7 @@ const SCRIPT: &str = r#"
 "#;
 
 const CSS: &str = r#"
-:root{color-scheme:light dark;--bg:#f7f7f4;--panel:#fff;--text:#20221f;--muted:#686d66;--line:#d8dbd5;--link:#145ea8;--ok:#17813d;--bad:#ba2b2b;--pending:#987000}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,sans-serif}body>header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem max(1rem,calc((100% - 960px)/2));background:var(--panel);border-bottom:1px solid var(--line)}nav{display:flex;gap:.4rem}nav a{padding:.35rem .6rem;border-radius:.4rem;text-decoration:none}nav a[aria-current=page]{background:var(--link);color:#fff}.viewer,.muted,.meta,.loaded{color:var(--muted)}.viewer{margin-left:.6rem}main{max-width:960px;margin:0 auto;padding:1.4rem 1rem 4rem}.status{padding:.7rem 1rem;margin-bottom:1rem;border:1px solid var(--line);border-radius:.5rem;background:var(--panel)}.status p{margin:.2rem 0}.error,.bad{color:var(--bad)}.warning,.pending{color:var(--pending)}.ok{color:var(--ok)}.page-title{display:flex;justify-content:space-between;align-items:end;gap:1rem}.page-title h1{margin:0}.page-title p{margin:.15rem 0 0;color:var(--muted)}.refresh button{padding:.45rem .8rem;border:1px solid var(--line);border-radius:.4rem;background:var(--panel);color:var(--text);font:inherit;cursor:pointer}.refresh button:hover:not(:disabled){border-color:var(--link);color:var(--link)}.refresh button:disabled{cursor:wait;color:var(--muted)}.repo{margin-top:1.6rem}.repo h2{font-size:1rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:.35rem}.pr-tree,.pr-section ul{list-style:none;padding-left:1rem}.pr{position:relative;margin:.55rem 0;padding-left:.8rem;border-left:2px solid var(--line)}.pr article>h3{font-size:1rem;margin:.2rem 0}.pr a,.merged-list a{color:var(--link)}.number{font-variant-numeric:tabular-nums}.badge{display:inline-block;padding:.05rem .35rem;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.78rem}.pr-section{margin:.35rem 0 .35rem .2rem}.pr-section>summary{cursor:pointer;font-weight:600}.pr-section ul{margin:.3rem 0}.pr-section li{margin:.25rem 0}.context-link{margin:.25rem 0 .25rem 1rem;font-size:.85rem}.row-link{margin-left:.35rem}.state{display:inline-block;min-width:1.2rem}.required-marker{color:var(--muted);font-size:.7em;vertical-align:.15em}.merged-list{padding:0;list-style:none}.merged-list li{padding:.8rem 1rem;margin:.65rem 0;background:var(--panel);border:1px solid var(--line);border-radius:.5rem}.meta{font-size:.85rem;margin-top:.2rem}.empty{padding:2rem;text-align:center;color:var(--muted)}@media(max-width:600px){body>header{position:static;display:block}nav{margin-top:.6rem;overflow-x:auto}.pr-tree,.pr-section ul{padding-left:.45rem}.pr{padding-left:.55rem}main{padding-top:1rem}}@media(prefers-color-scheme:dark){:root{--bg:#151715;--panel:#1e211e;--text:#e5e8e3;--muted:#a4aaa1;--line:#3b403a;--link:#75b7ff;--ok:#66ce84;--bad:#ff8585;--pending:#e9c45d}}
+:root{color-scheme:light dark;--bg:#f7f7f4;--panel:#fff;--text:#20221f;--muted:#686d66;--line:#d8dbd5;--link:#145ea8;--ok:#17813d;--bad:#ba2b2b;--pending:#987000}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,sans-serif}body>header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.8rem max(1rem,calc((100% - 960px)/2));background:var(--panel);border-bottom:1px solid var(--line)}nav{display:flex;gap:.4rem}nav a{padding:.35rem .6rem;border-radius:.4rem;text-decoration:none}nav a[aria-current=page]{background:var(--link);color:#fff}.viewer,.muted,.meta,.loaded{color:var(--muted)}.viewer{margin-left:.6rem}main{max-width:960px;margin:0 auto;padding:1.4rem 1rem 4rem}.status{padding:.7rem 1rem;margin-bottom:1rem;border:1px solid var(--line);border-radius:.5rem;background:var(--panel)}.status p{margin:.2rem 0}.error,.bad{color:var(--bad)}.warning,.pending{color:var(--pending)}.ok{color:var(--ok)}.page-title{display:flex;justify-content:space-between;align-items:end;gap:1rem}.page-title h1{margin:0}.page-title p{margin:.15rem 0 0;color:var(--muted)}.refresh button{padding:.45rem .8rem;border:1px solid var(--line);border-radius:.4rem;background:var(--panel);color:var(--text);font:inherit;cursor:pointer}.refresh button:hover:not(:disabled){border-color:var(--link);color:var(--link)}.refresh button:disabled{cursor:wait;color:var(--muted)}.repo{margin-top:1.6rem}.repo h2{font-size:1rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:.35rem}.pr-tree,.pr-section ul,.check-results ul{list-style:none;padding-left:1rem}.pr{position:relative;margin:.55rem 0;padding-left:.8rem;border-left:2px solid var(--line)}.pr article>h3{font-size:1rem;margin:.2rem 0}.pr a,.merged-list a{color:var(--link)}.number{font-variant-numeric:tabular-nums}.badge{display:inline-block;padding:.05rem .35rem;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.78rem}.pr-section{margin:.35rem 0 .35rem .2rem}.pr-section>summary,.check-results>summary{cursor:pointer;font-weight:600}.pr-section ul,.check-results ul{margin:.3rem 0}.pr-section li{margin:.25rem 0}.check-results{margin:.3rem 0 .3rem 1rem}.context-link{margin:.25rem 0 .25rem 1rem;font-size:.85rem}.row-link{margin-left:.35rem}.state{display:inline-block;min-width:1.2rem}.required-marker{color:var(--muted);font-size:.7em;vertical-align:.15em}.merged-list{padding:0;list-style:none}.merged-list li{padding:.8rem 1rem;margin:.65rem 0;background:var(--panel);border:1px solid var(--line);border-radius:.5rem}.meta{font-size:.85rem;margin-top:.2rem}.empty{padding:2rem;text-align:center;color:var(--muted)}@media(max-width:600px){body>header{position:static;display:block}nav{margin-top:.6rem;overflow-x:auto}.pr-tree,.pr-section ul,.check-results ul{padding-left:.45rem}.pr{padding-left:.55rem}main{padding-top:1rem}}@media(prefers-color-scheme:dark){:root{--bg:#151715;--panel:#1e211e;--text:#e5e8e3;--muted:#a4aaa1;--line:#3b403a;--link:#75b7ff;--ok:#66ce84;--bad:#ff8585;--pending:#e9c45d}}
 "#;
 
 #[cfg(test)]
@@ -888,6 +924,10 @@ mod tests {
         assert!(html.contains("<details class=\"pr-section reviewers\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section comments\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section stacked\" data-state-key="));
+        assert!(html.contains("data-state-key=\"repo:z/repo:pr:1:section:checks\" open"));
+        assert!(html.contains(
+            "<details class=\"check-results valid-results\" data-state-key=\"repo:z/repo:pr:1:section:valid-results\"><summary>Valid Results</summary>"
+        ));
         assert!(html.contains("green — 1/1 required"));
         assert!(html.contains(
             "<span class=\"state ok\" aria-hidden=\"true\">✓</span><span class=\"check-state-label\">success</span>"
@@ -917,6 +957,51 @@ mod tests {
         assert!(html.contains("say &lt;hello&gt; &amp; goodbye"));
         assert!(html.contains("Parent &lt;fix&gt; <span class=\"muted\">[branch-1]</span>"));
         assert!(html.contains("title 2 <span class=\"muted\">[branch-2]</span>"));
+    }
+
+    #[test]
+    fn checks_disclosures_use_failure_default_and_omit_empty_valid_results() {
+        let mut healthy = pr("o/r", 1, "me", 1);
+        healthy.checks = vec![CheckStatus {
+            name: "success".into(),
+            state: CheckState::Success,
+            url: None,
+            required: true,
+        }];
+        let healthy_html = render_authored(&WebSnapshot {
+            viewer: "me".into(),
+            authored: vec![healthy],
+            ..WebSnapshot::default()
+        });
+        assert!(
+            healthy_html
+                .contains("data-state-key=\"repo:o/r:pr:1:section:checks\"><summary>Checks")
+        );
+        assert!(!healthy_html.contains("data-state-key=\"repo:o/r:pr:1:section:checks\" open"));
+        assert!(healthy_html.contains("section:valid-results"));
+
+        let mut actionable = pr("o/r", 2, "me", 1);
+        actionable.checks = vec![
+            CheckStatus {
+                name: "optional error".into(),
+                state: CheckState::Error,
+                url: None,
+                required: false,
+            },
+            CheckStatus {
+                name: "pending".into(),
+                state: CheckState::Pending,
+                url: None,
+                required: true,
+            },
+        ];
+        let actionable_html = render_authored(&WebSnapshot {
+            viewer: "me".into(),
+            authored: vec![actionable],
+            ..WebSnapshot::default()
+        });
+        assert!(actionable_html.contains("data-state-key=\"repo:o/r:pr:2:section:checks\" open"));
+        assert!(!actionable_html.contains("section:valid-results"));
     }
 
     #[test]
@@ -963,6 +1048,7 @@ mod tests {
         let unique: std::collections::BTreeSet<_> = first_keys.iter().copied().collect();
         assert_eq!(first_keys.len(), unique.len());
         assert!(unique.contains("repo:z/repo:pr:1:section:checks"));
+        assert!(unique.contains("repo:z/repo:pr:1:section:valid-results"));
         assert!(unique.contains("repo:z/repo:pr:1:section:stacked"));
 
         let mut changed = rich_snapshot();

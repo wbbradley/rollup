@@ -44,17 +44,17 @@ pub enum SectionKind {
     Releases,
 }
 
-/// The set of collapse-state *deviations from default* for the Authored pane's
-/// section nodes, keyed by stable PR identity `(repo, number)` plus the section
-/// kind. Rows are rebuilt every frame and carry no identity, so collapse state
-/// cannot live on a row — it lives here, on `AppState`, and survives refetches.
-/// A key present in the set means "opposite of this section's default".
-pub type ToggledSet = std::collections::HashSet<(String, u64, SectionId)>;
+/// Explicit collapse-state choices for the Authored pane's section nodes,
+/// keyed by stable PR identity `(repo, number)` plus the section kind. Storing
+/// the chosen value (rather than a deviation from the default) keeps a user's
+/// choice stable when a data-driven default changes after a refresh.
+pub type ToggledSet = std::collections::HashMap<(String, u64, SectionId), bool>;
 
 /// Identifies one of a PR's collapsible child sections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionId {
     Checks,
+    ValidResults,
     Reviewers,
     Comments,
     Stacked,
@@ -64,17 +64,21 @@ impl SectionId {
     pub fn label(self) -> &'static str {
         match self {
             SectionId::Checks => "Checks",
+            SectionId::ValidResults => "Valid Results",
             SectionId::Reviewers => "Reviewers",
             SectionId::Comments => "Open comments",
             SectionId::Stacked => "Stacked PRs",
         }
     }
 
-    /// Checks and Reviewers collapse by default (the merge-readiness signal and
-    /// the reviewer summary read from their headers without scrolling); Open
+    /// Static section default. Checks supplies a data-driven default at its
+    /// call site; Valid Results and Reviewers start collapsed, while Open
     /// comments and Stacked PRs start expanded.
     pub fn default_expanded(self) -> bool {
-        !matches!(self, SectionId::Reviewers | SectionId::Checks)
+        !matches!(
+            self,
+            SectionId::Checks | SectionId::ValidResults | SectionId::Reviewers
+        )
     }
 }
 
@@ -154,21 +158,30 @@ impl ReviewerSummaryToken {
     }
 }
 
-/// Whether a PR's section is currently expanded, given the deviation set.
-/// `default_expanded(id) XOR (key present)`.
-pub fn is_expanded(t: &ToggledSet, repo: &str, number: u64, id: SectionId) -> bool {
-    id.default_expanded() ^ t.contains(&(repo.to_string(), number, id))
+/// Whether a PR's section is currently expanded. An explicit user choice wins
+/// over `default`, which may be derived from the PR's current data.
+pub fn is_expanded(t: &ToggledSet, repo: &str, number: u64, id: SectionId, default: bool) -> bool {
+    t.get(&(repo.to_string(), number, id))
+        .copied()
+        .unwrap_or(default)
 }
 
-/// Set a PR's section to `want` expanded/collapsed. Stored as a deviation from
-/// the section's default, so a key exists only when the state differs.
+/// Store a PR section's explicit expanded/collapsed choice.
 pub fn set_expanded(t: &mut ToggledSet, repo: &str, number: u64, id: SectionId, want: bool) {
-    let key = (repo.to_string(), number, id);
-    if want != id.default_expanded() {
-        t.insert(key);
-    } else {
-        t.remove(&key);
-    }
+    t.insert((repo.to_string(), number, id), want);
+}
+
+fn check_is_valid(check: &CheckStatus) -> bool {
+    matches!(
+        check.state,
+        CheckState::Success | CheckState::Skipped | CheckState::Neutral
+    )
+}
+
+fn checks_default_expanded(pr: &Pr) -> bool {
+    pr.checks
+        .iter()
+        .any(|check| matches!(check.state, CheckState::Failure | CheckState::Error))
 }
 
 /// The distinct reviewer response states present on a PR, stably ordered: `req`
@@ -468,6 +481,7 @@ fn section_visible_text(section: SectionId, pr: &Pr) -> String {
             };
             format!("{} {glyph} {}", section.label(), summary.ratio_text())
         }
+        SectionId::ValidResults => section.label().to_string(),
         SectionId::Reviewers => {
             let summary = reviewer_summary(&pr.reviewers)
                 .into_iter()
@@ -485,6 +499,11 @@ fn filtered_pr_matches(node: &PrTreeNode<'_>, viewer: &str, query: &str) -> bool
     visible_text_matches(&pr_visible_text(pr, viewer), query)
         || (!pr.checks.is_empty()
             && (visible_text_matches(&section_visible_text(SectionId::Checks, pr), query)
+                || (pr.checks.iter().any(check_is_valid)
+                    && visible_text_matches(
+                        &section_visible_text(SectionId::ValidResults, pr),
+                        query,
+                    ))
                 || pr
                     .checks
                     .iter()
@@ -532,36 +551,84 @@ fn push_filtered_pr<'a>(
     let pr = node.pr;
 
     if !pr.checks.is_empty() {
-        let section_matches =
+        let checks_section_matches =
             visible_text_matches(&section_visible_text(SectionId::Checks, pr), query);
+        let valid_section_matches = pr.checks.iter().any(check_is_valid)
+            && visible_text_matches(&section_visible_text(SectionId::ValidResults, pr), query);
         let matching: Vec<&CheckStatus> = checks_by_display_priority(&pr.checks)
             .into_iter()
             .filter(|check| visible_text_matches(&check_visible_text(check), query))
             .collect();
-        if section_matches || !matching.is_empty() {
-            let collapsed =
-                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Checks));
+        let matching_actionable: Vec<&CheckStatus> = matching
+            .iter()
+            .copied()
+            .filter(|check| !check_is_valid(check))
+            .collect();
+        let matching_valid: Vec<&CheckStatus> = matching
+            .into_iter()
+            .filter(|check| check_is_valid(check))
+            .collect();
+        let checks_has_descendants =
+            !matching_actionable.is_empty() || valid_section_matches || !matching_valid.is_empty();
+        if checks_section_matches || checks_has_descendants {
+            let checks_expanded = search_collapsed
+                .get(&(pr.repo.clone(), pr.number, SectionId::Checks))
+                .copied()
+                .unwrap_or(true)
+                && checks_has_descendants;
             rows.push(Row::SectionHeader {
                 section: SectionId::Checks,
-                expanded: !collapsed && !matching.is_empty(),
+                expanded: checks_expanded,
                 summary: Vec::new(),
                 checks: Some(ChecksSummary::of(pr)),
                 tree_prefix: child_base.clone(),
             });
-            if !collapsed {
-                let count = matching.len();
-                for (index, check) in matching.into_iter().enumerate() {
+            if checks_expanded {
+                let show_valid_results = valid_section_matches || !matching_valid.is_empty();
+                let direct_count = matching_actionable.len() + usize::from(show_valid_results);
+                for (index, check) in matching_actionable.into_iter().enumerate() {
                     rows.push(Row::Check {
                         c: check,
                         tree_prefix: format!(
                             "{child_base}{}",
-                            if index + 1 == count {
+                            if index + 1 == direct_count {
                                 "└─ "
                             } else {
                                 "├─ "
                             }
                         ),
                     });
+                }
+                if show_valid_results {
+                    let valid_expanded = search_collapsed
+                        .get(&(pr.repo.clone(), pr.number, SectionId::ValidResults))
+                        .copied()
+                        .unwrap_or(true)
+                        && !matching_valid.is_empty();
+                    rows.push(Row::SectionHeader {
+                        section: SectionId::ValidResults,
+                        expanded: valid_expanded,
+                        summary: Vec::new(),
+                        checks: None,
+                        tree_prefix: format!("{child_base}└─ "),
+                    });
+                    if valid_expanded {
+                        let valid_base = format!("{child_base}   ");
+                        let count = matching_valid.len();
+                        for (index, check) in matching_valid.into_iter().enumerate() {
+                            rows.push(Row::Check {
+                                c: check,
+                                tree_prefix: format!(
+                                    "{valid_base}{}",
+                                    if index + 1 == count {
+                                        "└─ "
+                                    } else {
+                                        "├─ "
+                                    }
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -576,8 +643,9 @@ fn push_filtered_pr<'a>(
             .filter(|reviewer| visible_text_matches(&reviewer_visible_text(reviewer), query))
             .collect();
         if section_matches || !matching.is_empty() {
-            let collapsed =
-                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Reviewers));
+            let collapsed = search_collapsed
+                .get(&(pr.repo.clone(), pr.number, SectionId::Reviewers))
+                .is_some_and(|expanded| !expanded);
             rows.push(Row::SectionHeader {
                 section: SectionId::Reviewers,
                 expanded: !collapsed && !matching.is_empty(),
@@ -613,8 +681,9 @@ fn push_filtered_pr<'a>(
             .filter(|comment| visible_text_matches(&comment_visible_text(comment), query))
             .collect();
         if section_matches || !matching.is_empty() {
-            let collapsed =
-                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Comments));
+            let collapsed = search_collapsed
+                .get(&(pr.repo.clone(), pr.number, SectionId::Comments))
+                .is_some_and(|expanded| !expanded);
             rows.push(Row::SectionHeader {
                 section: SectionId::Comments,
                 expanded: !collapsed && !matching.is_empty(),
@@ -650,8 +719,9 @@ fn push_filtered_pr<'a>(
             .filter(|child| filtered_pr_matches(child, viewer, query))
             .collect();
         if section_matches || !matching.is_empty() {
-            let collapsed =
-                search_collapsed.contains(&(pr.repo.clone(), pr.number, SectionId::Stacked));
+            let collapsed = search_collapsed
+                .get(&(pr.repo.clone(), pr.number, SectionId::Stacked))
+                .is_some_and(|expanded| !expanded);
             rows.push(Row::SectionHeader {
                 section: SectionId::Stacked,
                 expanded: !collapsed && !matching.is_empty(),
@@ -716,11 +786,17 @@ fn push_pr<'a>(
     let repo = node.pr.repo.as_str();
     let number = node.pr.number;
 
-    // Checks section — emitted first, directly under the PR, collapsed by
-    // default. Its header carries the merge-readiness signal (required checks
-    // only). Omitted entirely when the PR has no checks.
+    // Checks section — emitted first and opened by default when any check is
+    // failing/errored. Actionable checks remain direct children; completed
+    // outcomes live under a nested, default-collapsed Valid Results node.
     if !node.pr.checks.is_empty() {
-        let expanded = is_expanded(toggled, repo, number, SectionId::Checks);
+        let expanded = is_expanded(
+            toggled,
+            repo,
+            number,
+            SectionId::Checks,
+            checks_default_expanded(node.pr),
+        );
         rows.push(Row::SectionHeader {
             section: SectionId::Checks,
             expanded,
@@ -730,20 +806,72 @@ fn push_pr<'a>(
         });
         if expanded {
             let checks = checks_by_display_priority(&node.pr.checks);
-            let m = checks.len();
-            for (i, c) in checks.into_iter().enumerate() {
-                let conn = if i + 1 == m { "└─ " } else { "├─ " };
+            let actionable: Vec<&CheckStatus> = checks
+                .iter()
+                .copied()
+                .filter(|check| !check_is_valid(check))
+                .collect();
+            let valid: Vec<&CheckStatus> = checks
+                .into_iter()
+                .filter(|check| check_is_valid(check))
+                .collect();
+            let direct_count = actionable.len() + usize::from(!valid.is_empty());
+            for (i, c) in actionable.into_iter().enumerate() {
+                let conn = if i + 1 == direct_count {
+                    "└─ "
+                } else {
+                    "├─ "
+                };
                 rows.push(Row::Check {
                     c,
                     tree_prefix: format!("{child_base}{conn}"),
                 });
+            }
+            if !valid.is_empty() {
+                let valid_expanded = is_expanded(
+                    toggled,
+                    repo,
+                    number,
+                    SectionId::ValidResults,
+                    SectionId::ValidResults.default_expanded(),
+                );
+                rows.push(Row::SectionHeader {
+                    section: SectionId::ValidResults,
+                    expanded: valid_expanded,
+                    summary: Vec::new(),
+                    checks: None,
+                    tree_prefix: format!("{child_base}└─ "),
+                });
+                if valid_expanded {
+                    let valid_base = format!("{child_base}   ");
+                    let count = valid.len();
+                    for (index, check) in valid.into_iter().enumerate() {
+                        rows.push(Row::Check {
+                            c: check,
+                            tree_prefix: format!(
+                                "{valid_base}{}",
+                                if index + 1 == count {
+                                    "└─ "
+                                } else {
+                                    "├─ "
+                                }
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
 
     // Reviewers section.
     if !node.pr.reviewers.is_empty() {
-        let expanded = is_expanded(toggled, repo, number, SectionId::Reviewers);
+        let expanded = is_expanded(
+            toggled,
+            repo,
+            number,
+            SectionId::Reviewers,
+            SectionId::Reviewers.default_expanded(),
+        );
         rows.push(Row::SectionHeader {
             section: SectionId::Reviewers,
             expanded,
@@ -765,7 +893,13 @@ fn push_pr<'a>(
 
     // Open comments section.
     if !node.pr.unresolved_comments.is_empty() {
-        let expanded = is_expanded(toggled, repo, number, SectionId::Comments);
+        let expanded = is_expanded(
+            toggled,
+            repo,
+            number,
+            SectionId::Comments,
+            SectionId::Comments.default_expanded(),
+        );
         rows.push(Row::SectionHeader {
             section: SectionId::Comments,
             expanded,
@@ -787,7 +921,13 @@ fn push_pr<'a>(
 
     // Stacked PRs section.
     if !node.children.is_empty() {
-        let expanded = is_expanded(toggled, repo, number, SectionId::Stacked);
+        let expanded = is_expanded(
+            toggled,
+            repo,
+            number,
+            SectionId::Stacked,
+            SectionId::Stacked.default_expanded(),
+        );
         rows.push(Row::SectionHeader {
             section: SectionId::Stacked,
             expanded,
@@ -939,12 +1079,17 @@ pub fn build_full_report<'a>(
         .into_iter()
         .collect();
     // The console has no interactive controls, so make every section visible.
-    // Checks and Reviewers are collapsed by default in the TUI and therefore
-    // need an explicit deviation here; Comments and Stacked already default
-    // to expanded.
+    // Explicitly expand every interactive level for complete console output.
     let mut toggled = ToggledSet::new();
     for pr in authored {
         set_expanded(&mut toggled, &pr.repo, pr.number, SectionId::Checks, true);
+        set_expanded(
+            &mut toggled,
+            &pr.repo,
+            pr.number,
+            SectionId::ValidResults,
+            true,
+        );
         set_expanded(
             &mut toggled,
             &pr.repo,
@@ -2430,7 +2575,7 @@ mod tests {
         p.checks = vec![
             check("build", CheckState::Success, true),
             check("test", CheckState::Success, true),
-            check("lint", CheckState::Failure, false),
+            check("lint", CheckState::Pending, false),
         ];
         p.checks_rollup = ChecksRollup::Green;
         let authored = vec![p];
@@ -2499,6 +2644,7 @@ mod tests {
         let authored = vec![p];
         let mut toggled = ToggledSet::new();
         set_expanded(&mut toggled, "o/r", 1, SectionId::Checks, true);
+        set_expanded(&mut toggled, "o/r", 1, SectionId::ValidResults, true);
         let section = build_section_authored(&authored, "me", &toggled);
 
         let check_names: Vec<&str> = section
@@ -2510,6 +2656,145 @@ mod tests {
             })
             .collect();
         assert_eq!(check_names, vec!["lint", "build"]);
+    }
+
+    #[test]
+    fn failing_checks_open_with_actionable_rows_above_collapsed_valid_results() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![
+            check("success", CheckState::Success, true),
+            check("pending", CheckState::Pending, true),
+            check("optional failure", CheckState::Failure, false),
+            check("neutral", CheckState::Neutral, false),
+            check("skipped", CheckState::Skipped, false),
+        ];
+        let authored = vec![p];
+        let section = build_section_authored(&authored, "me", &ToggledSet::new());
+
+        let shape: Vec<String> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section,
+                    expanded,
+                    tree_prefix,
+                    ..
+                } => Some(format!("H:{}:{expanded}:{tree_prefix}", section.label())),
+                Row::Check { c, tree_prefix } => Some(format!("C:{}:{tree_prefix}", c.name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "H:Checks:true:     ",
+                "C:optional failure:     ├─ ",
+                "C:pending:     ├─ ",
+                "H:Valid Results:false:     └─ ",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_valid_checks_keep_checks_closed_and_valid_results_is_optional() {
+        let mut only_valid = pr("o/r", 1, "me", false, 100, vec![]);
+        only_valid.checks = vec![
+            check("success", CheckState::Success, true),
+            check("skipped", CheckState::Skipped, false),
+        ];
+        let authored = vec![only_valid];
+        let collapsed = build_section_authored(&authored, "me", &ToggledSet::new());
+        assert!(collapsed.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Checks,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(!collapsed.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::ValidResults,
+                ..
+            }
+        )));
+
+        let mut expanded = ToggledSet::new();
+        set_expanded(&mut expanded, "o/r", 1, SectionId::Checks, true);
+        let section = build_section_authored(&authored, "me", &expanded);
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::ValidResults,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
+
+        let mut no_valid = pr("o/r", 2, "me", false, 100, vec![]);
+        no_valid.checks = vec![
+            check("error", CheckState::Error, false),
+            check("pending", CheckState::Pending, true),
+        ];
+        let no_valid_authored = vec![no_valid];
+        let section = build_section_authored(&no_valid_authored, "me", &ToggledSet::new());
+        assert!(!section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::ValidResults,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn explicit_checks_choice_survives_failure_state_changes() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![check("build", CheckState::Success, true)];
+        let mut choices = ToggledSet::new();
+        set_expanded(&mut choices, "o/r", 1, SectionId::Checks, true);
+        let healthy = vec![p.clone()];
+        assert!(matches!(
+            checks_header_expanded(&healthy, &choices),
+            Some(true)
+        ));
+
+        p.checks[0].state = CheckState::Failure;
+        let failing = vec![p.clone()];
+        assert!(matches!(
+            checks_header_expanded(&failing, &choices),
+            Some(true)
+        ));
+
+        set_expanded(&mut choices, "o/r", 1, SectionId::Checks, false);
+        p.checks[0].state = CheckState::Success;
+        let healthy_again = vec![p];
+        assert!(matches!(
+            checks_header_expanded(&healthy_again, &choices),
+            Some(false)
+        ));
+    }
+
+    fn checks_header_expanded(authored: &[Pr], choices: &ToggledSet) -> Option<bool> {
+        build_section_authored(authored, "me", choices)
+            .rows
+            .into_iter()
+            .find_map(|row| match row {
+                Row::SectionHeader {
+                    section: SectionId::Checks,
+                    expanded,
+                    ..
+                } => Some(expanded),
+                _ => None,
+            })
     }
 
     #[test]
@@ -2556,6 +2841,7 @@ mod tests {
         // Expand so the Check rows render too.
         let mut toggled = ToggledSet::new();
         set_expanded(&mut toggled, "o/r", 1, SectionId::Checks, true);
+        set_expanded(&mut toggled, "o/r", 1, SectionId::ValidResults, true);
         let section = build_section_authored(&authored, "me", &toggled);
         let mut out: Vec<u8> = Vec::new();
         render_section(&section, &mut out, false, 120).unwrap();
@@ -2763,10 +3049,66 @@ mod tests {
     }
 
     #[test]
+    fn filtered_valid_check_retains_checks_and_valid_results_ancestors() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![
+            check("needle success", CheckState::Success, true),
+            check("unrelated failure", CheckState::Failure, false),
+        ];
+        let authored = vec![p];
+        let section =
+            build_section_authored_filtered(&authored, "me", "needle", &ToggledSet::new());
+        let shape: Vec<String> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section, expanded, ..
+                } => Some(format!("{}:{expanded}", section.label())),
+                Row::Check { c, .. } => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["Checks:true", "Valid Results:true", "needle success"]
+        );
+    }
+
+    #[test]
+    fn filtered_valid_results_label_retains_checks_without_exposing_checks() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![check("build", CheckState::Success, true)];
+        let authored = vec![p];
+        let section =
+            build_section_authored_filtered(&authored, "me", "valid results", &ToggledSet::new());
+        let headers: Vec<(SectionId, bool)> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section, expanded, ..
+                } => Some((*section, *expanded)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![(SectionId::Checks, true), (SectionId::ValidResults, false),]
+        );
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
+    }
+
+    #[test]
     fn filtered_authored_uses_temporary_collapse_without_changing_match_count() {
         let authored = vec![pr("o/r", 1, "me", false, 100, vec![user("needle", true)])];
         let mut search_collapsed = ToggledSet::new();
-        search_collapsed.insert(("o/r".into(), 1, SectionId::Reviewers));
+        search_collapsed.insert(("o/r".into(), 1, SectionId::Reviewers), false);
         let section = build_section_authored_filtered(&authored, "me", "needle", &search_collapsed);
 
         assert_eq!(section.count, 1);

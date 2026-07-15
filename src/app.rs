@@ -101,10 +101,9 @@ pub struct AppState {
     pub people_sel: usize,
     pub releases_sel: usize,
     pub releases: Vec<RepoReleaseInfo>,
-    /// Collapse-state deviations for the Authored pane's section nodes, keyed by
-    /// `(repo, number, SectionId)`. Only entries differing from the section's
-    /// default are stored. Not reset by `apply`, so collapse state survives
-    /// background refetches.
+    /// Explicit collapse-state choices for Authored section nodes, keyed by
+    /// `(repo, number, SectionId)`. Not reset by `apply`, so user choices
+    /// survive background refetches and data-driven default changes.
     pub toggled: report::ToggledSet,
     /// Incremental/committed filter state for the TUI's Authored pane.
     pub authored_search: AuthoredSearch,
@@ -380,12 +379,14 @@ struct SectionCtx<'a> {
 fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
     let mut idx = 0usize;
     let mut current_pr: Option<&'a Pr> = None;
+    let mut current_check_section = SectionId::Checks;
     for row in rows {
         match row {
             Row::Pr {
                 pr, stacked_under, ..
             } => {
                 current_pr = Some(pr);
+                current_check_section = SectionId::Checks;
                 if idx == sel {
                     return stacked_under.map(|parent| SectionCtx {
                         repo: pr.repo.as_str(),
@@ -397,6 +398,9 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
                 idx += 1;
             }
             Row::SectionHeader { section, .. } => {
+                if matches!(section, SectionId::Checks | SectionId::ValidResults) {
+                    current_check_section = *section;
+                }
                 if idx == sel {
                     return current_pr.map(|pr| SectionCtx {
                         repo: pr.repo.as_str(),
@@ -434,7 +438,7 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
                     return current_pr.map(|pr| SectionCtx {
                         repo: pr.repo.as_str(),
                         number: pr.number,
-                        section: SectionId::Checks,
+                        section: current_check_section,
                         is_header: false,
                     });
                 }
@@ -830,7 +834,7 @@ fn toggle_section(state: &mut AppState, expand: bool) {
         if expand {
             state.search_collapsed.remove(&key);
         } else {
-            state.search_collapsed.insert(key);
+            state.search_collapsed.insert(key, false);
         }
     } else {
         report::set_expanded(&mut state.toggled, &repo, number, sec, expand);
@@ -1039,7 +1043,8 @@ mod tests {
             &state.toggled,
             "o/r",
             1,
-            SectionId::Reviewers
+            SectionId::Reviewers,
+            SectionId::Reviewers.default_expanded()
         ));
         // Selection stays on the header row.
         assert_eq!(state.authored_sel, 1);
@@ -1071,7 +1076,8 @@ mod tests {
             &state.toggled,
             "o/r",
             1,
-            SectionId::Reviewers
+            SectionId::Reviewers,
+            SectionId::Reviewers.default_expanded()
         ));
         // Selection moved back up to the header.
         assert_eq!(state.authored_sel, 1);
@@ -1107,7 +1113,8 @@ mod tests {
             &state.toggled,
             "o/r",
             1,
-            SectionId::Stacked
+            SectionId::Stacked,
+            SectionId::Stacked.default_expanded()
         ));
         assert_eq!(state.authored_sel, 1); // back on the Stacked header
         let section = state.authored_section();
@@ -1139,11 +1146,10 @@ mod tests {
 
     #[test]
     fn section_ctx_check_row_resolves_to_checks_section() {
-        // A PR with checks (collapsed by default). Expand so a Check row exists.
-        let mut state = me_state(vec![pr_with_checks(
-            1,
-            vec![check("build", Some("https://ci/build"), true)],
-        )]);
+        // An actionable check is a direct child of Checks.
+        let mut failing = check("build", Some("https://ci/build"), true);
+        failing.state = crate::model::CheckState::Failure;
+        let mut state = me_state(vec![pr_with_checks(1, vec![failing])]);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
         // Selectable: Pr#1(0), Checks header(1), Check(2).
         let section = state.authored_section();
@@ -1164,10 +1170,9 @@ mod tests {
 
     #[test]
     fn toggle_h_on_check_collapses_checks_and_reselects_header() {
-        let mut state = me_state(vec![pr_with_checks(
-            1,
-            vec![check("build", Some("https://ci/build"), true)],
-        )]);
+        let mut failing = check("build", Some("https://ci/build"), true);
+        failing.state = crate::model::CheckState::Failure;
+        let mut state = me_state(vec![pr_with_checks(1, vec![failing])]);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
         // Select the Check row (index 2) and collapse via `h`.
         state.authored_sel = 2;
@@ -1176,12 +1181,61 @@ mod tests {
             &state.toggled,
             "o/r",
             1,
-            SectionId::Checks
+            SectionId::Checks,
+            false
         ));
         // Cursor moved back to the Checks header (index 1).
         assert_eq!(state.authored_sel, 1);
         let section = state.authored_section();
         assert!(!section.rows.iter().any(|r| matches!(r, Row::Check { .. })));
+    }
+
+    #[test]
+    fn toggle_h_on_valid_check_collapses_valid_results_and_reselects_nested_header() {
+        let mut state = me_state(vec![pr_with_checks(
+            1,
+            vec![check("build", Some("https://ci/build"), true)],
+        )]);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::ValidResults, true);
+        // Selectable: PR(0), Checks(1), Valid Results(2), valid check(3).
+        state.authored_sel = 3;
+        let section = state.authored_section();
+        let ctx = section_ctx_at(&section.rows, 3).expect("valid check resolves");
+        assert_eq!(ctx.section, SectionId::ValidResults);
+        drop(section);
+
+        toggle_section(&mut state, false);
+        assert_eq!(state.authored_sel, 2);
+        assert!(report::is_expanded(
+            &state.toggled,
+            "o/r",
+            1,
+            SectionId::Checks,
+            false,
+        ));
+        assert!(!report::is_expanded(
+            &state.toggled,
+            "o/r",
+            1,
+            SectionId::ValidResults,
+            false,
+        ));
+        let section = state.authored_section();
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::ValidResults,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
     }
 
     fn state_for_radar(with_releases: bool) -> AppState {
@@ -1461,13 +1515,14 @@ mod tests {
         assert!(
             state
                 .search_collapsed
-                .contains(&("o/r".into(), 1, SectionId::Reviewers))
+                .contains_key(&("o/r".into(), 1, SectionId::Reviewers))
         );
         assert!(report::is_expanded(
             &state.toggled,
             "o/r",
             1,
-            SectionId::Reviewers
+            SectionId::Reviewers,
+            SectionId::Reviewers.default_expanded()
         ));
 
         press(&mut state, KeyCode::Esc);
