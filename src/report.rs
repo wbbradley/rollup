@@ -53,6 +53,10 @@ pub type ToggledSet = std::collections::HashMap<(String, u64, SectionId), bool>;
 /// Identifies one of a PR's collapsible child sections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionId {
+    /// The per-repo grouping header in the Authored pane. Keyed in `ToggledSet`
+    /// as `(repo, 0, Repo)` — no real PR is `#0` — so a whole repo grouping can
+    /// be collapsed. Starts expanded.
+    Repo,
     Checks,
     ValidResults,
     Reviewers,
@@ -63,6 +67,7 @@ pub enum SectionId {
 impl SectionId {
     pub fn label(self) -> &'static str {
         match self {
+            SectionId::Repo => "Repo",
             SectionId::Checks => "Checks",
             SectionId::ValidResults => "Valid Results",
             SectionId::Reviewers => "Reviewers",
@@ -72,8 +77,8 @@ impl SectionId {
     }
 
     /// Static section default. Checks supplies a data-driven default at its
-    /// call site; Valid Results and Reviewers start collapsed, while Open
-    /// comments and Stacked PRs start expanded.
+    /// call site; Valid Results and Reviewers start collapsed, while Repo, Open
+    /// comments, and Stacked PRs start expanded.
     pub fn default_expanded(self) -> bool {
         !matches!(
             self,
@@ -210,7 +215,15 @@ pub fn reviewer_summary(reviewers: &[ReviewerStatus]) -> Vec<ReviewerSummaryToke
 }
 
 pub enum Row<'a> {
-    RepoHeader(String),
+    /// A per-repo grouping header. `expanded` is `Some` only in the Authored
+    /// pane, where the header is a landable, collapsible `▸`/`▾` control (the
+    /// TUI renders the glyph); `None` in the Reviewing and Releases panes,
+    /// where it is a plain, non-collapsing header. The console renderer ignores
+    /// `expanded` so `rollup report` stays fully expanded.
+    RepoHeader {
+        repo: String,
+        expanded: Option<bool>,
+    },
     PersonHeader(String),
     SubGroupLabel(&'static str),
     Pr {
@@ -276,7 +289,8 @@ impl Row<'_> {
     pub fn is_selectable(&self) -> bool {
         matches!(
             self,
-            Row::Pr { .. }
+            Row::RepoHeader { .. }
+                | Row::Pr { .. }
                 | Row::Reviewer { .. }
                 | Row::SectionHeader { .. }
                 | Row::Comment { .. }
@@ -290,7 +304,10 @@ impl Row<'_> {
 pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(reviewing) {
-        rows.push(Row::RepoHeader(repo));
+        rows.push(Row::RepoHeader {
+            repo,
+            expanded: None,
+        });
         for pr in group_prs {
             rows.push(Row::Pr {
                 pr,
@@ -324,7 +341,23 @@ pub fn build_section_authored<'a>(
 ) -> Section<'a> {
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(authored) {
-        rows.push(Row::RepoHeader(repo));
+        // The repo grouping is a landable, collapsible header. Collapsing it
+        // (keyed `(repo, 0, Repo)` — no real PR is `#0`) hides every PR subtree
+        // under it.
+        let expanded = is_expanded(
+            toggled,
+            &repo,
+            0,
+            SectionId::Repo,
+            SectionId::Repo.default_expanded(),
+        );
+        rows.push(Row::RepoHeader {
+            repo,
+            expanded: Some(expanded),
+        });
+        if !expanded {
+            continue;
+        }
         // Within each repo, nest PRs by merge target (stacked-PR tree). Roots
         // start at the two-space base under the repo header.
         let tree = authored_tree(&group_prs);
@@ -365,7 +398,12 @@ pub fn build_section_authored_filtered<'a>(
             .filter(|node| filtered_pr_matches(node, viewer, &query))
             .collect();
         if visible_text_matches(&repo, &query) || !matching_roots.is_empty() {
-            rows.push(Row::RepoHeader(repo));
+            // Repo grouping is not collapsible while a committed filter is
+            // active (`expanded: None`), so it shows no disclosure glyph.
+            rows.push(Row::RepoHeader {
+                repo,
+                expanded: None,
+            });
             count += matching_roots
                 .iter()
                 .map(|node| count_filtered_prs(node, viewer, &query))
@@ -490,7 +528,7 @@ fn section_visible_text(section: SectionId, pr: &Pr) -> String {
                 .join(", ");
             format!("{} {summary}", section.label())
         }
-        SectionId::Comments | SectionId::Stacked => section.label().to_string(),
+        SectionId::Comments | SectionId::Stacked | SectionId::Repo => section.label().to_string(),
     }
 }
 
@@ -1041,7 +1079,10 @@ pub fn build_section_releases<'a>(
 ) -> Section<'a> {
     let mut rows: Vec<Row<'a>> = Vec::new();
     for info in releases {
-        rows.push(Row::RepoHeader(info.repo.clone()));
+        rows.push(Row::RepoHeader {
+            repo: info.repo.clone(),
+            expanded: None,
+        });
         if !info.recent_releases.is_empty() {
             for release in &info.recent_releases {
                 rows.push(Row::ReleaseEntry { release, now });
@@ -1242,7 +1283,10 @@ fn render_row(
     width: usize,
 ) -> io::Result<()> {
     match row {
-        Row::RepoHeader(repo) => {
+        // The console output is always fully expanded, so the collapse glyph is
+        // intentionally omitted here — `rollup report` renders repo headers
+        // exactly as before.
+        Row::RepoHeader { repo, .. } => {
             writeln!(
                 out,
                 "  {}{}{}",
@@ -1839,7 +1883,7 @@ mod tests {
             .rows
             .iter()
             .map(|r| match r {
-                Row::RepoHeader(h) => format!("H:{h}"),
+                Row::RepoHeader { repo, .. } => format!("H:{repo}"),
                 Row::Pr { pr, .. } => format!("P:{}", pr.number),
                 Row::Reviewer { r, .. } => format!("R:{}", r.login),
                 _ => "?".into(),
@@ -1991,7 +2035,7 @@ mod tests {
             .rows
             .iter()
             .map(|r| match r {
-                Row::RepoHeader(_) => "header",
+                Row::RepoHeader { .. } => "header",
                 Row::ReleaseEntry { .. } => "entry",
                 Row::ReleaseTag { .. } => "tag",
                 Row::ReleaseEmpty => "empty",
@@ -2031,7 +2075,7 @@ mod tests {
             .rows
             .iter()
             .map(|r| match r {
-                Row::RepoHeader(h) => format!("H:{h}"),
+                Row::RepoHeader { repo, .. } => format!("H:{repo}"),
                 Row::Pr { pr, .. } => format!("P:{}", pr.number),
                 Row::Reviewer { r, .. } => format!("R:{}", r.login),
                 Row::SectionHeader { section, .. } => format!("S:{}", section.label()),
@@ -2354,7 +2398,14 @@ mod tests {
             .is_selectable()
         );
         assert!(!Row::ReleaseEmpty.is_selectable());
-        assert!(!Row::RepoHeader("o/r".to_string()).is_selectable());
+        // Repo headers are now landable collapse controls (Authored pane).
+        assert!(
+            Row::RepoHeader {
+                repo: "o/r".to_string(),
+                expanded: Some(true),
+            }
+            .is_selectable()
+        );
         assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
         assert!(!Row::SubGroupLabel("Authored").is_selectable());
         assert!(!Row::MergedPr { pr: &p, now }.is_selectable());
@@ -2907,13 +2958,13 @@ mod tests {
             section
                 .rows
                 .iter()
-                .any(|row| matches!(row, Row::RepoHeader(repo) if repo == "o/keep"))
+                .any(|row| matches!(row, Row::RepoHeader { repo, .. } if repo == "o/keep"))
         );
         assert!(
             !section
                 .rows
                 .iter()
-                .any(|row| matches!(row, Row::RepoHeader(repo) if repo == "o/drop"))
+                .any(|row| matches!(row, Row::RepoHeader { repo, .. } if repo == "o/drop"))
         );
         let numbers: Vec<u64> = section
             .rows
@@ -2998,7 +3049,7 @@ mod tests {
                 &ToggledSet::new(),
             );
             assert_eq!(section.count, 1);
-            assert!(matches!(section.rows[0], Row::RepoHeader(_)));
+            assert!(matches!(section.rows[0], Row::RepoHeader { .. }));
             assert!(matches!(section.rows[1], Row::Pr { .. }));
             assert!(matches!(
                 section.rows[2],

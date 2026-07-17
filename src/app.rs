@@ -12,7 +12,8 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 use crate::{
     github::{self, Data},
     model::{
-        CheckState, CheckStatus, Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus,
+        CheckState, CheckStatus, Pr, PrComment, PrTreeNode, RepoReleaseInfo, ReviewerKind,
+        ReviewerStatus, authored_tree, group_by_repo,
     },
     report::{self, Row, Section, SectionId},
     ui, web,
@@ -28,6 +29,7 @@ fn selected_release_url(state: &AppState) -> Option<String> {
         }
         if idx == sel {
             return match row {
+                Row::RepoHeader { repo, .. } => Some(format!("https://github.com/{repo}")),
                 Row::ReleaseEntry { release, .. } => {
                     if release.url.is_empty() {
                         None
@@ -304,6 +306,11 @@ impl AppState {
 
 /// The row the user has selected, resolved to a semantic target.
 enum Selected<'a> {
+    /// A per-repo grouping header (Authored/Reviewing/Releases panes). Carries
+    /// the repo's `owner/name` as an owned `String` — the header's repo name is
+    /// owned by the `Row`, not by the borrowed PR data, so it can't be a `&'a
+    /// str`. `open_selected` opens `https://github.com/{repo}`.
+    Repo(String),
     Pr(&'a Pr),
     Reviewer(&'a Pr, &'a ReviewerStatus),
     // The `SectionId` documents which header resolved and is asserted in tests;
@@ -328,6 +335,15 @@ fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
     let mut current_pr: Option<&'a Pr> = None;
     for row in rows {
         match row {
+            Row::RepoHeader { repo, .. } => {
+                // A new repo grouping starts; drop the prior PR so a stray
+                // section header can't attribute to it.
+                current_pr = None;
+                if idx == sel {
+                    return Some(Selected::Repo(repo.clone()));
+                }
+                idx += 1;
+            }
             Row::Pr { pr, .. } => {
                 current_pr = Some(pr);
                 if idx == sel {
@@ -369,23 +385,39 @@ fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
 /// context of a child row). `is_header` is true when the selected row is the
 /// section header itself; false when it's a child of the section (a reviewer,
 /// comment, or nested PR) whose enclosing section should be collapsed.
-struct SectionCtx<'a> {
-    repo: &'a str,
+struct SectionCtx {
+    repo: String,
     number: u64,
     section: SectionId,
     is_header: bool,
 }
 
 /// Resolve the selected row to the section it belongs to. Walks in lock-step
-/// with `is_selectable`, tracking the current PR. A nested child PR resolves to
-/// its parent's Stacked PRs node (via `stacked_under`); a root PR resolves to
-/// `None` (PRs aren't collapsible).
-fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
+/// with `is_selectable`, tracking the current PR. A repo header resolves to its
+/// own `(repo, 0, Repo)` node; a nested child PR resolves to its parent's
+/// Stacked PRs node (via `stacked_under`); a root PR resolves to `None` (PRs
+/// aren't collapsible).
+fn section_ctx_at(rows: &[Row<'_>], sel: usize) -> Option<SectionCtx> {
     let mut idx = 0usize;
-    let mut current_pr: Option<&'a Pr> = None;
+    let mut current_pr: Option<&Pr> = None;
     let mut current_check_section = SectionId::Checks;
     for row in rows {
         match row {
+            Row::RepoHeader { repo, expanded } => {
+                current_pr = None;
+                current_check_section = SectionId::Checks;
+                if idx == sel {
+                    // Only a collapsible repo header (Authored pane) is a
+                    // toggle target; a plain header (`expanded: None`) is not.
+                    return expanded.map(|_| SectionCtx {
+                        repo: repo.clone(),
+                        number: 0,
+                        section: SectionId::Repo,
+                        is_header: true,
+                    });
+                }
+                idx += 1;
+            }
             Row::Pr {
                 pr, stacked_under, ..
             } => {
@@ -393,7 +425,7 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
                 current_check_section = SectionId::Checks;
                 if idx == sel {
                     return stacked_under.map(|parent| SectionCtx {
-                        repo: pr.repo.as_str(),
+                        repo: pr.repo.clone(),
                         number: parent,
                         section: SectionId::Stacked,
                         is_header: false,
@@ -407,7 +439,7 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
                 }
                 if idx == sel {
                     return current_pr.map(|pr| SectionCtx {
-                        repo: pr.repo.as_str(),
+                        repo: pr.repo.clone(),
                         number: pr.number,
                         section: *section,
                         is_header: true,
@@ -418,7 +450,7 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
             Row::Reviewer { .. } => {
                 if idx == sel {
                     return current_pr.map(|pr| SectionCtx {
-                        repo: pr.repo.as_str(),
+                        repo: pr.repo.clone(),
                         number: pr.number,
                         section: SectionId::Reviewers,
                         is_header: false,
@@ -429,7 +461,7 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
             Row::Comment { .. } => {
                 if idx == sel {
                     return current_pr.map(|pr| SectionCtx {
-                        repo: pr.repo.as_str(),
+                        repo: pr.repo.clone(),
                         number: pr.number,
                         section: SectionId::Comments,
                         is_header: false,
@@ -440,7 +472,7 @@ fn section_ctx_at<'a>(rows: &[Row<'a>], sel: usize) -> Option<SectionCtx<'a>> {
             Row::Check { .. } => {
                 if idx == sel {
                     return current_pr.map(|pr| SectionCtx {
-                        repo: pr.repo.as_str(),
+                        repo: pr.repo.clone(),
                         number: pr.number,
                         section: current_check_section,
                         is_header: false,
@@ -466,6 +498,13 @@ fn header_sel_index(
     let mut current_pr: Option<&Pr> = None;
     for row in rows {
         match row {
+            Row::RepoHeader { repo: r, .. } => {
+                current_pr = None;
+                if section == SectionId::Repo && r == repo {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
             Row::Pr { pr, .. } => {
                 current_pr = Some(pr);
                 idx += 1;
@@ -794,6 +833,7 @@ fn open_selected(state: &AppState) {
     }
     let section = state.current_section();
     let url = match selected_row(&section.rows, state.current_sel()) {
+        Some(Selected::Repo(repo)) => Some(format!("https://github.com/{repo}")),
         Some(Selected::Pr(pr))
         | Some(Selected::Reviewer(pr, _))
         | Some(Selected::Section(pr, _)) => Some(pr.url.clone()),
@@ -826,7 +866,7 @@ fn toggle_section(state: &mut AppState, expand: bool) {
     // (NLL) before we mutate `state.toggled` — mirrors `remove_selected_reviewer`.
     let section = state.authored_section();
     let extracted = section_ctx_at(&section.rows, state.authored_sel)
-        .map(|c| (c.repo.to_string(), c.number, c.section, c.is_header));
+        .map(|c| (c.repo, c.number, c.section, c.is_header));
     let Some((repo, number, sec, is_header)) = extracted else {
         return;
     };
@@ -835,6 +875,11 @@ fn toggle_section(state: &mut AppState, expand: bool) {
         return;
     }
     if matches!(state.authored_search, AuthoredSearch::Filtered(_)) {
+        // Repo groupings aren't collapsible while a committed filter is active
+        // (the filtered builder always shows them), so `h`/`l` are no-ops there.
+        if sec == SectionId::Repo {
+            return;
+        }
         let key = (repo.clone(), number, sec);
         if expand {
             state.search_collapsed.remove(&key);
@@ -902,115 +947,208 @@ fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
     });
 }
 
-/// Build the single-comment "address this comment" agent prompt for a review
-/// comment at `url` on a PR whose source branch is `branch`. When `branch` is
-/// empty (GitHub returned no `headRefName`) the `" in {branch}"` phrase is
-/// dropped entirely so the text never reads `in .`.
-fn single_comment_prompt(url: &str, branch: &str) -> String {
-    let location = if branch.is_empty() {
-        String::new()
-    } else {
-        format!(" in {branch}")
-    };
-    format!(
-        "Please address {url}{location}. Use a worktree if this branch is not already active in the current worktree."
-    )
+/// The actionable items gathered from a single PR for the aggregate copy
+/// prompt: its unresolved comments and its checks-to-address. For container
+/// scopes (a PR subtree, a Stacked PRs header, a repo header) `checks` holds the
+/// PR's *failing* checks (`Failure`/`Error`); for a single-check selection it
+/// holds just that one check regardless of state. A `PrActions` is only created
+/// for a PR with at least one item.
+struct PrActions<'a> {
+    pr: &'a Pr,
+    comments: Vec<&'a PrComment>,
+    checks: Vec<&'a CheckStatus>,
 }
 
-/// Build the whole-PR "address these comments" agent prompt: a header line, a
-/// `- {url}` bullet per unresolved comment, then the worktree instruction. The
-/// `" in {branch}"` phrase is dropped when the PR's source branch is empty.
-fn comments_parent_prompt(pr: &Pr) -> String {
-    let mut out = if pr.head_ref.is_empty() {
-        "Please address the following:\n".to_string()
-    } else {
-        format!("Please address the following in {}:\n", pr.head_ref)
-    };
-    for comment in &pr.unresolved_comments {
-        out.push_str("- ");
-        out.push_str(&comment.url);
-        out.push('\n');
-    }
-    out.push_str("Use a worktree if this branch is not already active in the current worktree.");
-    out
-}
-
-/// Resolve the current selection to the copy-prompt text, or `None` when the
-/// selected node is neither a comment child nor the "Open comments" header.
-/// Comment rows and Comments headers only occur in the Authored pane, so this
-/// is a natural no-op in every other view.
-fn comment_prompt_for_selection(state: &AppState) -> Option<String> {
-    let section = state.current_section();
-    match selected_row(&section.rows, state.current_sel()) {
-        Some(Selected::Comment(pr, c)) => Some(single_comment_prompt(&c.url, &pr.head_ref)),
-        Some(Selected::Section(pr, SectionId::Comments)) => Some(comments_parent_prompt(pr)),
-        _ => None,
-    }
-}
-
-/// Build the single-check "address this check" agent prompt for a check named
-/// `name` at `url` on a PR whose source branch is `branch`. `url` is the
-/// already-resolved URL (the check's, falling back to the owning PR's), so this
-/// always receives one. When `branch` is empty the `" in {branch}"` phrase is
-/// dropped entirely, mirroring [`single_comment_prompt`].
-fn single_check_prompt(name: &str, url: &str, branch: &str) -> String {
-    let location = if branch.is_empty() {
-        String::new()
-    } else {
-        format!(" in {branch}")
-    };
-    format!(
-        "Please address the check {name} ({url}){location}. Use a worktree if this branch is not already active in the current worktree."
-    )
-}
-
-/// Build the whole-PR "address these failing checks" agent prompt: a header
-/// line, a `- {name} ({url})` bullet per *failing* check (`Failure`/`Error`),
-/// then the worktree instruction. Each bullet's URL is the check's, falling
-/// back to the owning PR's when the check has none. Returns `None` when the PR
-/// has no failing checks, so `c` on a Checks header with only
-/// passing/pending/skipped checks is a no-op. The `" in {branch}"` phrase is
-/// dropped when the PR's source branch is empty.
-fn checks_parent_prompt(pr: &Pr) -> Option<String> {
-    let failing: Vec<&CheckStatus> = pr
+/// Gather one PR's own actionable items — every unresolved comment plus every
+/// failing check — returning `None` when the PR has neither.
+fn pr_actions_for(pr: &Pr) -> Option<PrActions<'_>> {
+    let comments: Vec<&PrComment> = pr.unresolved_comments.iter().collect();
+    let checks: Vec<&CheckStatus> = pr
         .checks
         .iter()
         .filter(|c| matches!(c.state, CheckState::Failure | CheckState::Error))
         .collect();
-    if failing.is_empty() {
+    (!comments.is_empty() || !checks.is_empty()).then_some(PrActions {
+        pr,
+        comments,
+        checks,
+    })
+}
+
+/// Recursively gather actionable items from a PR node and all its descendant
+/// stacked PRs, pre-order (the node itself first, then each child's subtree).
+fn gather_actionable<'a>(node: &PrTreeNode<'a>) -> Vec<PrActions<'a>> {
+    let mut out = Vec::new();
+    if let Some(actions) = pr_actions_for(node.pr) {
+        out.push(actions);
+    }
+    for child in &node.children {
+        out.extend(gather_actionable(child));
+    }
+    out
+}
+
+/// Gather actionable items from a node's *descendant* subtrees only — the
+/// node's own items are excluded. Used by the Stacked PRs header, which
+/// addresses the children stacked on a PR, not the PR itself.
+fn gather_children<'a>(node: &PrTreeNode<'a>) -> Vec<PrActions<'a>> {
+    node.children.iter().flat_map(gather_actionable).collect()
+}
+
+/// Find the tree node for `(repo, number)` anywhere in `nodes` (depth-first).
+fn find_node<'t, 'a>(
+    nodes: &'t [PrTreeNode<'a>],
+    repo: &str,
+    number: u64,
+) -> Option<&'t PrTreeNode<'a>> {
+    for node in nodes {
+        if node.pr.repo == repo && node.pr.number == number {
+            return Some(node);
+        }
+        if let Some(found) = find_node(&node.children, repo, number) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Build one repo's merge-target tree from `authored`, using the same grouping
+/// and ordering as the Authored pane so gathered PR groups match what the user
+/// sees. The returned nodes borrow `authored` directly, so the intermediate
+/// per-repo slice can be dropped.
+fn repo_tree<'a>(authored: &'a [Pr], repo: &str) -> Vec<PrTreeNode<'a>> {
+    let group = group_by_repo(authored)
+        .into_iter()
+        .find(|(r, _)| r == repo)
+        .map(|(_, prs)| prs)
+        .unwrap_or_default();
+    authored_tree(&group)
+}
+
+/// Build the aggregate "please address the following" agent prompt from a set
+/// of per-PR actionable items, or `None` when nothing is actionable. Each PR
+/// with ≥1 item becomes a group: an `In {head_ref} (#{number} {title}):`
+/// sub-header (the `In {head_ref} ` prefix and parentheses are dropped when the
+/// source branch is empty, leaving `#{number} {title}:`), a `- {url}` bullet per
+/// comment, then a `- check {name} ({url})` bullet per check (the check's URL,
+/// falling back to the owning PR's). The trailer is branch-count aware: with a
+/// single distinct branch it asks for one worktree; with more than one it asks
+/// for a worktree per branch and to consider a sub-agent per branch.
+fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
+    let groups: Vec<&PrActions> = items
+        .iter()
+        .filter(|item| !item.comments.is_empty() || !item.checks.is_empty())
+        .collect();
+    if groups.is_empty() {
         return None;
     }
-    let mut out = if pr.head_ref.is_empty() {
-        "Please address the following failing checks:\n".to_string()
-    } else {
-        format!(
-            "Please address the following failing checks in {}:\n",
-            pr.head_ref
-        )
-    };
-    for check in failing {
-        let url = check.url.as_deref().unwrap_or(&pr.url);
-        out.push_str(&format!("- {} ({url})\n", check.name));
+
+    let mut out = String::from("Please address the following:\n\n");
+    for item in &groups {
+        let pr = item.pr;
+        if pr.head_ref.is_empty() {
+            out.push_str(&format!("#{} {}:\n", pr.number, pr.title));
+        } else {
+            out.push_str(&format!(
+                "In {} (#{} {}):\n",
+                pr.head_ref, pr.number, pr.title
+            ));
+        }
+        for comment in &item.comments {
+            out.push_str("- ");
+            out.push_str(&comment.url);
+            out.push('\n');
+        }
+        for check in &item.checks {
+            let url = check.url.as_deref().unwrap_or(pr.url.as_str());
+            out.push_str(&format!("- check {} ({url})\n", check.name));
+        }
+        out.push('\n');
     }
-    out.push_str("Use a worktree if this branch is not already active in the current worktree.");
+
+    let mut branches: Vec<&str> = groups
+        .iter()
+        .map(|item| item.pr.head_ref.as_str())
+        .filter(|branch| !branch.is_empty())
+        .collect();
+    branches.sort_unstable();
+    branches.dedup();
+    out.push_str(if branches.len() > 1 {
+        "Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch."
+    } else {
+        "Use a worktree if this branch is not already active in the current worktree."
+    });
     Some(out)
 }
 
-/// Resolve the current selection to a check copy-prompt, or `None` when the
-/// selected node is neither a check child nor the "Checks" header. The nested
-/// "Valid Results" header does not match — only `SectionId::Checks` triggers
-/// the whole-PR case. Check rows and Checks headers only occur in the Authored
-/// pane, so this is a natural no-op in every other view.
-fn check_prompt_for_selection(state: &AppState) -> Option<String> {
-    let section = state.current_section();
-    match selected_row(&section.rows, state.current_sel()) {
-        Some(Selected::Section(pr, SectionId::Checks)) => checks_parent_prompt(pr),
-        Some(Selected::Check(pr, c)) => Some(single_check_prompt(
-            &c.name,
-            c.url.as_deref().unwrap_or(&pr.url),
-            &pr.head_ref,
-        )),
-        _ => None,
+/// Resolve the current Authored-pane selection to its aggregate copy prompt, or
+/// `None` when the selected node's subtree has nothing actionable. Single-PR
+/// scopes (a comment, a check, the Open comments / Checks headers) format
+/// directly from the already-resolved references; container scopes (a PR
+/// subtree, a Stacked PRs header, a repo header) rebuild the merge-target tree
+/// so the gather is independent of collapse state.
+fn build_copy_prompt(state: &AppState) -> Option<String> {
+    let section = state.authored_section();
+    let selected = selected_row(&section.rows, state.authored_sel)?;
+    match selected {
+        // A single comment: one one-comment group.
+        Selected::Comment(pr, c) => combined_prompt(&[PrActions {
+            pr,
+            comments: vec![c],
+            checks: vec![],
+        }]),
+        // A single check, addressed regardless of its state.
+        Selected::Check(pr, c) => combined_prompt(&[PrActions {
+            pr,
+            comments: vec![],
+            checks: vec![c],
+        }]),
+        // The Open comments header: this PR's unresolved comments only.
+        Selected::Section(pr, SectionId::Comments) => {
+            let comments: Vec<&PrComment> = pr.unresolved_comments.iter().collect();
+            combined_prompt(&[PrActions {
+                pr,
+                comments,
+                checks: vec![],
+            }])
+        }
+        // The Checks header: this PR's failing checks only.
+        Selected::Section(pr, SectionId::Checks) => {
+            let checks: Vec<&CheckStatus> = pr
+                .checks
+                .iter()
+                .filter(|c| matches!(c.state, CheckState::Failure | CheckState::Error))
+                .collect();
+            combined_prompt(&[PrActions {
+                pr,
+                comments: vec![],
+                checks,
+            }])
+        }
+        // A PR row: that PR plus every descendant stacked PR.
+        Selected::Pr(pr) => {
+            let tree = repo_tree(&state.authored, &pr.repo);
+            let items = find_node(&tree, &pr.repo, pr.number)
+                .map(gather_actionable)
+                .unwrap_or_default();
+            combined_prompt(&items)
+        }
+        // The Stacked PRs header: the parent's child subtrees only.
+        Selected::Section(pr, SectionId::Stacked) => {
+            let tree = repo_tree(&state.authored, &pr.repo);
+            let items = find_node(&tree, &pr.repo, pr.number)
+                .map(gather_children)
+                .unwrap_or_default();
+            combined_prompt(&items)
+        }
+        // A repo header: every PR under that repo (all stacks).
+        Selected::Repo(repo) => {
+            let tree = repo_tree(&state.authored, &repo);
+            let items: Vec<PrActions> = tree.iter().flat_map(gather_actionable).collect();
+            combined_prompt(&items)
+        }
+        // Reviewers header, Valid Results header, a reviewer — no prompt notion.
+        Selected::Section(_, _) | Selected::Reviewer(_, _) => None,
     }
 }
 
@@ -1022,21 +1160,26 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// `c`: copy an "address this …" agent prompt for the selected row to the
-/// clipboard, confirming via the footer status line. Handles review comments
-/// (a single comment or every unresolved comment under the "Open comments"
-/// header) and checks (a single check or every failing check under the "Checks"
-/// header). A no-op that leaves `status` unchanged when the selection is none of
-/// these (including a "Checks" header with no failing checks).
+/// `c`: copy one aggregate "please address the following" agent prompt for the
+/// selected Authored node's subtree, confirming via the footer status line. The
+/// prompt gathers every unresolved comment and failing check in that subtree
+/// (a PR includes its whole stack; a Stacked PRs header only its descendants; a
+/// repo header every PR in the repo), grouped per PR. Single comments, single
+/// checks, and section headers use the same unified format. When the subtree
+/// has nothing actionable — including prompt-notion-free nodes (Reviewers, a
+/// reviewer, Valid Results) — the footer reads `c: nothing to address here`.
+/// Only acts in the Me/Authored pane; a no-op elsewhere (no comment/check/repo
+/// gather notion exists in the other views).
 fn copy_prompt(state: &mut AppState) {
-    let Some(prompt) =
-        comment_prompt_for_selection(state).or_else(|| check_prompt_for_selection(state))
-    else {
+    if state.mode != ViewMode::Me {
         return;
-    };
-    state.status = Some(match copy_to_clipboard(&prompt) {
-        Ok(()) => "copied to clipboard".to_string(),
-        Err(e) => format!("c: clipboard error: {e:#}"),
+    }
+    state.status = Some(match build_copy_prompt(state) {
+        None => "c: nothing to address here".to_string(),
+        Some(prompt) => match copy_to_clipboard(&prompt) {
+            Ok(()) => "copied to clipboard".to_string(),
+            Err(e) => format!("c: clipboard error: {e:#}"),
+        },
     });
 }
 
@@ -1080,58 +1223,63 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_maps_pr_section_and_comment() {
-        // A PR with a reviewer AND a comment → two sections, both headers now
-        // selectable. At defaults Reviewers is collapsed (its reviewer row is
-        // hidden), so the selectable order is:
-        //   Pr(0), Section(Reviewers,1), Section(Open comments,2), Comment(3).
+    fn selected_row_maps_repo_pr_section_and_comment() {
+        // A PR with a reviewer AND a comment. The repo header is now selectable
+        // at index 0, so at defaults (Reviewers collapsed, its reviewer row
+        // hidden) the selectable order is:
+        //   Repo(0), Pr(1), Section(Reviewers,2), Section(Open comments,3),
+        //   Comment(4).
         let authored = vec![authored_pr_with_reviewer_and_comment()];
         let section = report::build_section_authored(&authored, "me", &report::ToggledSet::new());
 
         match selected_row(&section.rows, 0) {
-            Some(Selected::Pr(pr)) => assert_eq!(pr.number, 12),
-            _ => panic!("index 0 should be the PR"),
+            Some(Selected::Repo(repo)) => assert_eq!(repo, "o/r"),
+            _ => panic!("index 0 should be the repo header"),
         }
         match selected_row(&section.rows, 1) {
-            Some(Selected::Section(pr, id)) => {
-                assert_eq!(pr.number, 12);
-                assert_eq!(id, SectionId::Reviewers);
-            }
-            _ => panic!("index 1 should be the Reviewers header"),
+            Some(Selected::Pr(pr)) => assert_eq!(pr.number, 12),
+            _ => panic!("index 1 should be the PR"),
         }
         match selected_row(&section.rows, 2) {
             Some(Selected::Section(pr, id)) => {
                 assert_eq!(pr.number, 12);
-                assert_eq!(id, SectionId::Comments);
+                assert_eq!(id, SectionId::Reviewers);
             }
-            _ => panic!("index 2 should be the Open comments header"),
+            _ => panic!("index 2 should be the Reviewers header"),
         }
         match selected_row(&section.rows, 3) {
+            Some(Selected::Section(pr, id)) => {
+                assert_eq!(pr.number, 12);
+                assert_eq!(id, SectionId::Comments);
+            }
+            _ => panic!("index 3 should be the Open comments header"),
+        }
+        match selected_row(&section.rows, 4) {
             Some(Selected::Comment(pr, c)) => {
                 assert_eq!(pr.number, 12);
                 assert_eq!(c.url, "https://github.com/o/r/pull/12#discussion_r1");
                 assert_eq!(c.author, "carol");
             }
-            _ => panic!("index 3 should be the comment"),
+            _ => panic!("index 4 should be the comment"),
         }
         // Out of range → None.
-        assert!(selected_row(&section.rows, 4).is_none());
+        assert!(selected_row(&section.rows, 5).is_none());
     }
 
     #[test]
     fn selected_row_reaches_reviewer_when_expanded() {
-        // Expanding Reviewers inserts the reviewer row at index 2.
+        // Repo(0), Pr(1), Reviewers header(2), Reviewer(3) once expanded.
         let authored = vec![authored_pr_with_reviewer_and_comment()];
         let mut toggled = report::ToggledSet::new();
         report::set_expanded(&mut toggled, "o/r", 12, SectionId::Reviewers, true);
         let section = report::build_section_authored(&authored, "me", &toggled);
 
-        match selected_row(&section.rows, 2) {
+        match selected_row(&section.rows, 3) {
             Some(Selected::Reviewer(pr, rv)) => {
                 assert_eq!(pr.number, 12);
                 assert_eq!(rv.login, "alice");
             }
-            _ => panic!("index 2 should be the reviewer once Reviewers is expanded"),
+            _ => panic!("index 3 should be the reviewer once Reviewers is expanded"),
         }
     }
 
@@ -1179,8 +1327,8 @@ mod tests {
             "a",
             vec![requested_user("alice")],
         )]);
-        // Selectable: Pr(0), Reviewers header(1). Select the header.
-        state.authored_sel = 1;
+        // Selectable: Repo(0), Pr(1), Reviewers header(2). Select the header.
+        state.authored_sel = 2;
         toggle_section(&mut state, true);
 
         assert!(report::is_expanded(
@@ -1191,7 +1339,7 @@ mod tests {
             SectionId::Reviewers.default_expanded()
         ));
         // Selection stays on the header row.
-        assert_eq!(state.authored_sel, 1);
+        assert_eq!(state.authored_sel, 2);
         // The reviewer row is now present.
         let section = state.authored_section();
         assert!(
@@ -1212,8 +1360,9 @@ mod tests {
         )]);
         // Start expanded so a reviewer row exists.
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Reviewers, true);
-        // Selectable: Pr(0), Reviewers header(1), Reviewer(2). Select the reviewer.
-        state.authored_sel = 2;
+        // Selectable: Repo(0), Pr(1), Reviewers header(2), Reviewer(3). Select
+        // the reviewer.
+        state.authored_sel = 3;
         toggle_section(&mut state, false);
 
         assert!(!report::is_expanded(
@@ -1224,7 +1373,7 @@ mod tests {
             SectionId::Reviewers.default_expanded()
         ));
         // Selection moved back up to the header.
-        assert_eq!(state.authored_sel, 1);
+        assert_eq!(state.authored_sel, 2);
         let section = state.authored_section();
         assert!(
             !section
@@ -1241,9 +1390,9 @@ mod tests {
             simple_pr(1, "main", "a", vec![]),
             simple_pr(2, "a", "b", vec![]),
         ]);
-        // Selectable: Pr#1(0), Stacked header(1), Pr#2(2).
+        // Selectable: Repo(0), Pr#1(1), Stacked header(2), Pr#2(3).
         let section = state.authored_section();
-        let ctx = section_ctx_at(&section.rows, 2).expect("nested child resolves");
+        let ctx = section_ctx_at(&section.rows, 3).expect("nested child resolves");
         assert_eq!(ctx.repo, "o/r");
         assert_eq!(ctx.number, 1); // parent PR
         assert_eq!(ctx.section, SectionId::Stacked);
@@ -1251,7 +1400,7 @@ mod tests {
         drop(section);
 
         // `h` on the nested child collapses the parent's Stacked node.
-        state.authored_sel = 2;
+        state.authored_sel = 3;
         toggle_section(&mut state, false);
         assert!(!report::is_expanded(
             &state.toggled,
@@ -1260,7 +1409,7 @@ mod tests {
             SectionId::Stacked,
             SectionId::Stacked.default_expanded()
         ));
-        assert_eq!(state.authored_sel, 1); // back on the Stacked header
+        assert_eq!(state.authored_sel, 2); // back on the Stacked header
         let section = state.authored_section();
         assert!(
             !section
@@ -1295,20 +1444,20 @@ mod tests {
         failing.state = crate::model::CheckState::Failure;
         let mut state = me_state(vec![pr_with_checks(1, vec![failing])]);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
-        // Selectable: Pr#1(0), Checks header(1), Check(2).
+        // Selectable: Repo(0), Pr#1(1), Checks header(2), Check(3).
         let section = state.authored_section();
-        let ctx = section_ctx_at(&section.rows, 2).expect("check row resolves");
+        let ctx = section_ctx_at(&section.rows, 3).expect("check row resolves");
         assert_eq!(ctx.repo, "o/r");
         assert_eq!(ctx.number, 1);
         assert_eq!(ctx.section, SectionId::Checks);
         assert!(!ctx.is_header);
 
-        match selected_row(&section.rows, 2) {
+        match selected_row(&section.rows, 3) {
             Some(Selected::Check(pr, c)) => {
                 assert_eq!(pr.number, 1);
                 assert_eq!(c.name, "build");
             }
-            _ => panic!("index 2 should be the check row"),
+            _ => panic!("index 3 should be the check row"),
         }
     }
 
@@ -1318,8 +1467,9 @@ mod tests {
         failing.state = crate::model::CheckState::Failure;
         let mut state = me_state(vec![pr_with_checks(1, vec![failing])]);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
-        // Select the Check row (index 2) and collapse via `h`.
-        state.authored_sel = 2;
+        // Selectable: Repo(0), Pr#1(1), Checks header(2), Check(3). Select the
+        // check and collapse via `h`.
+        state.authored_sel = 3;
         toggle_section(&mut state, false);
         assert!(!report::is_expanded(
             &state.toggled,
@@ -1328,8 +1478,8 @@ mod tests {
             SectionId::Checks,
             false
         ));
-        // Cursor moved back to the Checks header (index 1).
-        assert_eq!(state.authored_sel, 1);
+        // Cursor moved back to the Checks header (index 2).
+        assert_eq!(state.authored_sel, 2);
         let section = state.authored_section();
         assert!(!section.rows.iter().any(|r| matches!(r, Row::Check { .. })));
     }
@@ -1342,15 +1492,15 @@ mod tests {
         )]);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::ValidResults, true);
-        // Selectable: PR(0), Checks(1), Valid Results(2), valid check(3).
-        state.authored_sel = 3;
+        // Selectable: Repo(0), PR(1), Checks(2), Valid Results(3), valid check(4).
+        state.authored_sel = 4;
         let section = state.authored_section();
-        let ctx = section_ctx_at(&section.rows, 3).expect("valid check resolves");
+        let ctx = section_ctx_at(&section.rows, 4).expect("valid check resolves");
         assert_eq!(ctx.section, SectionId::ValidResults);
         drop(section);
 
         toggle_section(&mut state, false);
-        assert_eq!(state.authored_sel, 2);
+        assert_eq!(state.authored_sel, 3);
         assert!(report::is_expanded(
             &state.toggled,
             "o/r",
@@ -1587,7 +1737,10 @@ mod tests {
             AuthoredSearch::Editing("café".into())
         );
         assert_eq!(state.authored_section().count, 1);
-        assert_eq!(state.authored_sel, 0);
+        // Filtered selectable rows: repo header(0) + the matching PR(1). The
+        // reset clamps the stale selection to that range (still valid at 1) and
+        // resets the stale scroll offset.
+        assert_eq!(state.authored_sel, 1);
         assert_eq!(state.authored_list_state.offset(), 0);
 
         press(&mut state, KeyCode::Backspace);
@@ -1654,7 +1807,9 @@ mod tests {
         // Persistently expand Reviewers before searching.
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Reviewers, true);
         state.authored_search = AuthoredSearch::Filtered("needle".into());
-        state.authored_sel = 2; // matching reviewer under the exposed header
+        // Filtered selectable order: Repo(0), Pr(1), Reviewers header(2),
+        // reviewer(3). Select the matching reviewer under the exposed header.
+        state.authored_sel = 3;
         toggle_section(&mut state, false);
         assert!(
             state
@@ -1680,19 +1835,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn single_comment_prompt_includes_branch_and_drops_it_when_empty() {
-        assert_eq!(
-            single_comment_prompt("https://x/#c1", "feature"),
-            "Please address https://x/#c1 in feature. Use a worktree if this branch is not already active in the current worktree."
-        );
-        // Empty branch: the whole " in {branch}" phrase is dropped, no "in .".
-        assert_eq!(
-            single_comment_prompt("https://x/#c1", ""),
-            "Please address https://x/#c1. Use a worktree if this branch is not already active in the current worktree."
-        );
-    }
-
     fn comment(url: &str) -> PrComment {
         PrComment {
             author: "carol".to_string(),
@@ -1703,169 +1845,419 @@ mod tests {
         }
     }
 
-    #[test]
-    fn comments_parent_prompt_bullets_urls_and_drops_empty_branch() {
-        let mut pr = simple_pr(1, "main", "feature", vec![]);
-        pr.unresolved_comments = vec![comment("https://x/#c1"), comment("https://x/#c2")];
-        assert_eq!(
-            comments_parent_prompt(&pr),
-            "Please address the following in feature:\n\
-             - https://x/#c1\n\
-             - https://x/#c2\n\
-             Use a worktree if this branch is not already active in the current worktree."
-        );
-
-        pr.head_ref = String::new();
-        assert_eq!(
-            comments_parent_prompt(&pr),
-            "Please address the following:\n\
-             - https://x/#c1\n\
-             - https://x/#c2\n\
-             Use a worktree if this branch is not already active in the current worktree."
-        );
-    }
-
-    #[test]
-    fn comment_prompt_for_selection_resolves_child_header_and_no_op() {
-        let mut state = me_state(vec![authored_pr_with_reviewer_and_comment()]);
-        // Selectable order (Reviewers collapsed, Open comments expanded by
-        // default): Pr(0), Reviewers header(1), Open comments header(2),
-        // Comment(3).
-        let comment_url = "https://github.com/o/r/pull/12#discussion_r1";
-
-        // A comment child → single-comment prompt with the PR's branch.
-        state.authored_sel = 3;
-        assert_eq!(
-            comment_prompt_for_selection(&state),
-            Some(single_comment_prompt(comment_url, "feature")),
-        );
-
-        // The "Open comments" header → bulleted whole-PR prompt.
-        state.authored_sel = 2;
-        assert_eq!(
-            comment_prompt_for_selection(&state),
-            Some(format!(
-                "Please address the following in feature:\n- {comment_url}\nUse a worktree if this branch is not already active in the current worktree."
-            )),
-        );
-
-        // The PR row (neither a comment nor the Comments header) → no-op.
-        state.authored_sel = 0;
-        assert_eq!(comment_prompt_for_selection(&state), None);
-    }
-
-    #[test]
-    fn single_check_prompt_includes_branch_and_drops_it_when_empty() {
-        assert_eq!(
-            single_check_prompt("build", "https://ci/build", "feature"),
-            "Please address the check build (https://ci/build) in feature. Use a worktree if this branch is not already active in the current worktree."
-        );
-        // Empty branch: the whole " in {branch}" phrase is dropped, no "in .".
-        assert_eq!(
-            single_check_prompt("build", "https://ci/build", ""),
-            "Please address the check build (https://ci/build). Use a worktree if this branch is not already active in the current worktree."
-        );
-    }
-
-    /// A failing check named `name` with details URL `url`, for prompt tests.
+    /// A failing check named `name` with details URL `url`.
     fn failing_check(name: &str, url: Option<&str>) -> CheckStatus {
         let mut c = check(name, url, true);
         c.state = crate::model::CheckState::Failure;
         c
     }
 
+    /// The selectable index of the first row for which `want` holds. Panics if
+    /// none match — keeps selection-resolution tests robust to row-order shifts.
+    fn sel_where(section: &Section<'_>, want: impl Fn(&Selected<'_>) -> bool) -> usize {
+        let mut idx = 0usize;
+        while let Some(row) = selected_row(&section.rows, idx) {
+            if want(&row) {
+                return idx;
+            }
+            idx += 1;
+        }
+        panic!("no selectable row matched the predicate");
+    }
+
     #[test]
-    fn checks_parent_prompt_bullets_failing_checks_and_none_when_none() {
-        // Only a passing check → no failing checks → None.
-        let pr = pr_with_checks(1, vec![check("build", Some("https://ci/build"), true)]);
-        assert_eq!(checks_parent_prompt(&pr), None);
+    fn pr_actions_for_skips_reviewers_and_passing_checks() {
+        // A PR with only a requested reviewer and a passing check has nothing
+        // actionable.
+        let mut inert = simple_pr(9, "main", "z", vec![requested_user("bob")]);
+        inert.checks = vec![check("lint", Some("https://ci/lint"), true)];
+        assert!(pr_actions_for(&inert).is_none());
+    }
 
-        // Failing checks are bulleted with name + URL; a check without a URL
-        // falls back to the PR URL; a passing check is excluded. pr_with_checks
-        // builds source branch "a".
-        let pr = pr_with_checks(
-            2,
-            vec![
-                failing_check("build", Some("https://ci/build")),
-                failing_check("test", None),
-                check("lint", Some("https://ci/lint"), false),
-            ],
-        );
-        assert_eq!(
-            checks_parent_prompt(&pr),
-            Some(format!(
-                "Please address the following failing checks in a:\n\
-                 - build (https://ci/build)\n\
-                 - test ({})\n\
-                 Use a worktree if this branch is not already active in the current worktree.",
-                pr.url
-            )),
-        );
+    #[test]
+    fn gather_actionable_collects_pr_and_descendant_stack() {
+        // Root #1 (comment + one failing + one passing check); child #2 (one
+        // failing check). Reviewers and the passing check are excluded.
+        let mut root = simple_pr(1, "main", "a", vec![requested_user("alice")]);
+        root.unresolved_comments = vec![comment("https://x/#c1")];
+        root.checks = vec![
+            failing_check("build", Some("https://ci/build")),
+            check("lint", Some("https://ci/lint"), true),
+        ];
+        let mut child = simple_pr(2, "a", "b", vec![]);
+        child.checks = vec![failing_check("test", None)];
+        let prs = vec![&root, &child];
+        let tree = authored_tree(&prs);
+        assert_eq!(tree.len(), 1, "child #2 nests under root #1");
 
-        // Empty source branch drops the " in {branch}" phrase.
-        let mut pr = pr_with_checks(3, vec![failing_check("build", Some("https://ci/build"))]);
-        pr.head_ref = String::new();
+        let items = gather_actionable(&tree[0]);
+        assert_eq!(items.len(), 2);
+        // Pre-order: the root first, its comment plus only the failing check.
+        assert_eq!(items[0].pr.number, 1);
+        assert_eq!(items[0].comments.len(), 1);
+        assert_eq!(items[0].checks.len(), 1);
+        assert_eq!(items[0].checks[0].name, "build");
+        // Then the descendant: its failing check, no comments.
+        assert_eq!(items[1].pr.number, 2);
+        assert!(items[1].comments.is_empty());
+        assert_eq!(items[1].checks.len(), 1);
+    }
+
+    #[test]
+    fn combined_prompt_single_pr_comment_then_check_single_branch_trailer() {
+        let mut pr = simple_pr(12, "main", "feature", vec![]);
+        pr.title = "Fix the thing".into();
+        pr.unresolved_comments = vec![comment("https://x/#c1")];
+        let build = failing_check("build", Some("https://ci/build"));
+        let items = vec![PrActions {
+            pr: &pr,
+            comments: pr.unresolved_comments.iter().collect(),
+            checks: vec![&build],
+        }];
         assert_eq!(
-            checks_parent_prompt(&pr),
-            Some(
-                "Please address the following failing checks:\n\
-                 - build (https://ci/build)\n\
-                 Use a worktree if this branch is not already active in the current worktree."
-                    .to_string()
-            ),
+            combined_prompt(&items).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In feature (#12 Fix the thing):\n\
+             - https://x/#c1\n\
+             - check build (https://ci/build)\n\
+             \n\
+             Use a worktree if this branch is not already active in the current worktree."
         );
     }
 
     #[test]
-    fn check_prompt_for_selection_resolves_header_check_and_no_op() {
-        // A failing check "build" (opens Checks by default) with a URL, plus a
-        // passing check "lint" with no URL (→ Valid Results, PR-URL fallback).
-        let mut state = me_state(vec![pr_with_checks(
-            1,
-            vec![
-                failing_check("build", Some("https://ci/build")),
-                check("lint", None, false),
-            ],
-        )]);
+    fn combined_prompt_empty_head_ref_drops_the_in_branch_prefix() {
+        let mut pr = simple_pr(5, "main", "", vec![]);
+        pr.title = "No branch".into();
+        let c = comment("https://x/#c9");
+        let items = vec![PrActions {
+            pr: &pr,
+            comments: vec![&c],
+            checks: vec![],
+        }];
+        assert_eq!(
+            combined_prompt(&items).unwrap(),
+            "Please address the following:\n\
+             \n\
+             #5 No branch:\n\
+             - https://x/#c9\n\
+             \n\
+             Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    #[test]
+    fn combined_prompt_multiple_branches_use_multi_branch_trailer_and_pr_url_fallback() {
+        let mut pr1 = simple_pr(1, "main", "a", vec![]);
+        pr1.title = "first".into();
+        let mut pr2 = simple_pr(2, "a", "b", vec![]);
+        pr2.title = "second".into();
+        let build = failing_check("build", Some("https://ci/build"));
+        let nourl = failing_check("test", None); // → falls back to pr2.url
+        let c = comment("https://x/#c1");
+        let items = vec![
+            PrActions {
+                pr: &pr1,
+                comments: vec![&c],
+                checks: vec![&build],
+            },
+            PrActions {
+                pr: &pr2,
+                comments: vec![],
+                checks: vec![&nourl],
+            },
+        ];
+        assert_eq!(
+            combined_prompt(&items).unwrap(),
+            format!(
+                "Please address the following:\n\
+                 \n\
+                 In a (#1 first):\n\
+                 - https://x/#c1\n\
+                 - check build (https://ci/build)\n\
+                 \n\
+                 In b (#2 second):\n\
+                 - check test ({})\n\
+                 \n\
+                 Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch.",
+                pr2.url
+            )
+        );
+    }
+
+    #[test]
+    fn combined_prompt_is_none_when_no_actionable_items() {
+        assert_eq!(combined_prompt(&[]), None);
+        // A PR group with neither comments nor checks contributes nothing.
+        let pr = simple_pr(1, "main", "a", vec![]);
+        let empty = vec![PrActions {
+            pr: &pr,
+            comments: vec![],
+            checks: vec![],
+        }];
+        assert_eq!(combined_prompt(&empty), None);
+    }
+
+    /// Repo `o/r`: root #1 (branch `a`) with a comment and a failing check;
+    /// child #2 (branch `b`) with a failing check; a second root #3 (branch
+    /// `c`) with a comment. Distinguishes PR-subtree, Stacked-children, and
+    /// whole-repo gather scopes.
+    fn stacked_state() -> AppState {
+        let mut pr1 = simple_pr(1, "main", "a", vec![]);
+        pr1.title = "first".into();
+        pr1.unresolved_comments = vec![comment("https://x/#c1")];
+        pr1.checks = vec![failing_check("build", Some("https://ci/build"))];
+        let mut pr2 = simple_pr(2, "a", "b", vec![]);
+        pr2.title = "second".into();
+        pr2.checks = vec![failing_check("test", None)];
+        let mut pr3 = simple_pr(3, "main", "c", vec![]);
+        pr3.title = "third".into();
+        pr3.unresolved_comments = vec![comment("https://x/#c3")];
+        me_state(vec![pr1, pr2, pr3])
+    }
+
+    #[test]
+    fn copy_prompt_on_pr_row_aggregates_the_whole_stack() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Pr(pr) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = idx;
+        // The whole #1 stack (#1 and its child #2), but NOT the sibling root #3.
+        assert_eq!(
+            build_copy_prompt(&state).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In a (#1 first):\n\
+             - https://x/#c1\n\
+             - check build (https://ci/build)\n\
+             \n\
+             In b (#2 second):\n\
+             - check test (https://github.com/o/r/pull/2)\n\
+             \n\
+             Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch."
+        );
+    }
+
+    #[test]
+    fn copy_prompt_on_stacked_header_covers_children_only() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Section(pr, SectionId::Stacked) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = idx;
+        // Only the child #2, not the parent #1 → single branch.
+        assert_eq!(
+            build_copy_prompt(&state).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In b (#2 second):\n\
+             - check test (https://github.com/o/r/pull/2)\n\
+             \n\
+             Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    #[test]
+    fn copy_prompt_on_repo_header_covers_every_pr_in_the_repo() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(&section, |s| matches!(s, Selected::Repo(_)));
+        drop(section);
+        state.authored_sel = idx;
+        // Both roots and the child: #1, #2, #3 → three branches.
+        assert_eq!(
+            build_copy_prompt(&state).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In a (#1 first):\n\
+             - https://x/#c1\n\
+             - check build (https://ci/build)\n\
+             \n\
+             In b (#2 second):\n\
+             - check test (https://github.com/o/r/pull/2)\n\
+             \n\
+             In c (#3 third):\n\
+             - https://x/#c3\n\
+             \n\
+             Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch."
+        );
+    }
+
+    #[test]
+    fn copy_prompt_single_comment_and_single_check_share_the_unified_format() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let comment_idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Comment(_, c) if c.url == "https://x/#c1"),
+        );
+        let check_idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Check(_, c) if c.name == "build"),
+        );
+        drop(section);
+
+        state.authored_sel = comment_idx;
+        assert_eq!(
+            build_copy_prompt(&state).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In a (#1 first):\n\
+             - https://x/#c1\n\
+             \n\
+             Use a worktree if this branch is not already active in the current worktree."
+        );
+
+        state.authored_sel = check_idx;
+        assert_eq!(
+            build_copy_prompt(&state).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In a (#1 first):\n\
+             - check build (https://ci/build)\n\
+             \n\
+             Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    /// Repo `o/r`, PR #1 (branch `a`) with only a requested reviewer and a
+    /// passing check — every actionable-gather scope is empty, but the single
+    /// passing check is still addressable. Checks/Valid Results/Reviewers are
+    /// forced open so their nodes are reachable.
+    fn inert_state() -> AppState {
+        let mut pr = simple_pr(1, "main", "a", vec![requested_user("alice")]);
+        pr.checks = vec![check("lint", Some("https://ci/lint"), true)];
+        let mut state = me_state(vec![pr]);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
         report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::ValidResults, true);
-        // Selectable (attention-first order): Pr(0), Checks header(1), failing
-        // build(2), Valid Results header(3), passing lint(4). Branch is "a".
-        let pr_url = "https://github.com/o/r/pull/1";
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Reviewers, true);
+        state
+    }
 
-        // The Checks header → bulleted failing-checks prompt.
-        state.authored_sel = 1;
-        assert_eq!(
-            check_prompt_for_selection(&state),
-            Some(
-                "Please address the following failing checks in a:\n\
-                 - build (https://ci/build)\n\
-                 Use a worktree if this branch is not already active in the current worktree."
-                    .to_string()
-            ),
+    #[test]
+    fn build_copy_prompt_is_none_for_prompt_free_and_all_green_scopes() {
+        let mut state = inert_state();
+        let section = state.authored_section();
+        let repo = sel_where(&section, |s| matches!(s, Selected::Repo(_)));
+        let pr = sel_where(&section, |s| matches!(s, Selected::Pr(p) if p.number == 1));
+        let checks = sel_where(&section, |s| {
+            matches!(s, Selected::Section(_, SectionId::Checks))
+        });
+        let valid = sel_where(&section, |s| {
+            matches!(s, Selected::Section(_, SectionId::ValidResults))
+        });
+        let reviewers = sel_where(&section, |s| {
+            matches!(s, Selected::Section(_, SectionId::Reviewers))
+        });
+        let reviewer = sel_where(&section, |s| matches!(s, Selected::Reviewer(_, _)));
+        let lint = sel_where(
+            &section,
+            |s| matches!(s, Selected::Check(_, c) if c.name == "lint"),
         );
+        drop(section);
 
-        // The failing check subnode → single-check prompt with its own URL.
-        state.authored_sel = 2;
+        // Repo / PR subtree (all-green) and prompt-notion-free nodes → nothing.
+        for idx in [repo, pr, checks, valid, reviewers, reviewer] {
+            state.authored_sel = idx;
+            assert_eq!(
+                build_copy_prompt(&state),
+                None,
+                "index {idx} should be empty"
+            );
+        }
+
+        // A single check is still addressable even when it is passing.
+        state.authored_sel = lint;
         assert_eq!(
-            check_prompt_for_selection(&state),
-            Some(single_check_prompt("build", "https://ci/build", "a")),
+            build_copy_prompt(&state).unwrap(),
+            "Please address the following:\n\
+             \n\
+             In a (#1 t1):\n\
+             - check lint (https://ci/lint)\n\
+             \n\
+             Use a worktree if this branch is not already active in the current worktree."
         );
+    }
 
-        // A passing check under Valid Results → single-check prompt regardless
-        // of state, with the PR-URL fallback (its own url is None).
-        state.authored_sel = 4;
-        assert_eq!(
-            check_prompt_for_selection(&state),
-            Some(single_check_prompt("lint", pr_url, "a")),
-        );
+    #[test]
+    fn copy_prompt_status_empty_case_and_no_op_outside_me() {
+        let mut state = inert_state();
+        let section = state.authored_section();
+        let pr_idx = sel_where(&section, |s| matches!(s, Selected::Pr(p) if p.number == 1));
+        drop(section);
 
-        // The nested Valid Results header → no-op (only Checks matches).
-        state.authored_sel = 3;
-        assert_eq!(check_prompt_for_selection(&state), None);
+        // Empty gather → explicit footer status (no clipboard write happens).
+        state.authored_sel = pr_idx;
+        copy_prompt(&mut state);
+        assert_eq!(state.status.as_deref(), Some("c: nothing to address here"));
 
-        // The PR row → no-op.
+        // Outside the Authored pane, `c` is a silent no-op.
+        state.status = None;
+        state.mode = ViewMode::People;
+        copy_prompt(&mut state);
+        assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn repo_header_is_selectable_and_toggles_the_whole_repo() {
+        let mut state = me_state(vec![simple_pr(1, "main", "a", vec![])]);
+        // Both walkers agree: the repo header is the first selectable row.
+        let section = state.authored_section();
+        assert!(matches!(
+            selected_row(&section.rows, 0),
+            Some(Selected::Repo(r)) if r == "o/r"
+        ));
+        let ctx = section_ctx_at(&section.rows, 0).expect("repo header resolves");
+        assert_eq!(ctx.repo, "o/r");
+        assert_eq!(ctx.number, 0);
+        assert_eq!(ctx.section, SectionId::Repo);
+        assert!(ctx.is_header);
+        drop(section);
+
+        // `h` collapses the repo grouping, hiding its PR rows; cursor stays put.
         state.authored_sel = 0;
-        assert_eq!(check_prompt_for_selection(&state), None);
+        toggle_section(&mut state, false);
+        assert!(!report::is_expanded(
+            &state.toggled,
+            "o/r",
+            0,
+            SectionId::Repo,
+            true
+        ));
+        assert_eq!(state.authored_sel, 0);
+        let section = state.authored_section();
+        assert!(!section.rows.iter().any(|r| matches!(r, Row::Pr { .. })));
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::RepoHeader { .. }))
+        );
+        drop(section);
+
+        // `l` re-expands and the PR reappears.
+        toggle_section(&mut state, true);
+        assert!(report::is_expanded(
+            &state.toggled,
+            "o/r",
+            0,
+            SectionId::Repo,
+            true
+        ));
+        let section = state.authored_section();
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Pr { pr, .. } if pr.number == 1))
+        );
     }
 }

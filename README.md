@@ -58,14 +58,14 @@ a later refresh fails. `rollup report` does not start the listener.
 | Key             | Action                                                |
 |-----------------|-------------------------------------------------------|
 | `↑` `↓` `k` `j` | Move selection (PR rows *and* reviewer sub-rows)      |
-| `l` / `h`       | Expand / collapse the selected section (Authored pane; Right/Left also work) |
+| `l` / `h`       | Expand / collapse the selected section or repo grouping (Authored pane; Right/Left also work) |
 | `g` / `G`       | Jump to top / bottom of the pane                      |
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
 | `p`             | Switch to People view                                 |
 | `/`             | Incrementally search/filter the Authored tree (Me view) |
-| `Enter`         | Open the selected PR (or comment / check details / release/tag page) in your browser |
-| `c`             | Copy an "address this …" agent prompt to the clipboard — the selected open comment (or every open comment under the "Open comments" header), or the selected check (or every failing check under the "Checks" header) (Me view) |
+| `Enter`         | Open the selected PR (or comment / check details / repo / release/tag page) in your browser |
+| `c`             | Copy one aggregate agent prompt for the selected Authored node's subtree — every unresolved comment and failing check it contains, grouped per PR (a PR includes its whole stack; a Stacked PRs header only its descendants; a repo header every PR in the repo) (Me view) |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
 | `Esc`           | Cancel/clear Authored search, or return to Me from People/Radar |
@@ -128,19 +128,28 @@ comments and Stacked PRs start expanded). The Reviewers header carries a compact
 response-state summary — e.g. `▸ Reviewers [req, ✗ changes]` — so a
 changes-requested review (`✗`) is visible at a glance without expanding.
 Explicit fold state is per-`(PR, section)` and survives background refreshes,
-including a check changing between failing and non-failing. `Enter`
-on a comment opens that comment's permalink; `Enter` on a check opens its
-details; `Enter` on a PR, reviewer, or section header opens the PR. Pressing
-`c` on an open comment copies an "address this comment" agent prompt (the
-comment's permalink and the PR's source branch) to the system clipboard;
-pressing `c` on the "Open comments" header copies one prompt that lists every
-open comment under that PR. Likewise, `c` on a single check copies an "address
-this check" prompt (its name, its details URL — falling back to the PR URL —
-and the PR's source branch, and it works on passing checks too); `c` on the
-"Checks" header copies one prompt bulleting every *failing* check under that PR
-(and is a no-op when none are failing). The same shape appears in `rollup
-report`, with every section expanded so all details are visible (and with text
-tokens in the summary).
+including a check changing between failing and non-failing. The per-repo
+grouping header is itself landable and collapsible: `l`/Right and `h`/Left
+expand or collapse the whole repo, hiding or showing all of its PR subtrees
+(gather, below, ignores this fold). `Enter` on a comment opens that comment's
+permalink; `Enter` on a check opens its details; `Enter` on a PR, reviewer, or
+section header opens the PR; `Enter` on a repo header opens the repository.
+
+Pressing `c` on **any** Authored node copies one aggregate agent prompt for that
+node's subtree to the system clipboard, gathering every unresolved comment and
+failing check it contains, grouped per PR. A PR includes its whole stack; a
+**Stacked PRs** header covers only the PRs stacked on it; a **repo header**
+covers every PR in the repo; the **Open comments** and **Checks** headers cover
+that one PR's comments or failing checks; and a single comment or single check
+copies just that item (a single check works even when it is passing). Nodes with
+no prompting notion (**Reviewers**, a reviewer, **Valid Results**) and empty
+subtrees report `c: nothing to address here`. The prompt closes with a
+worktree instruction that is branch-count aware — one worktree for a single
+branch, or a worktree (and possibly a separate sub-agent) per branch when it
+spans several. The section shape also appears in `rollup report`, with every
+section expanded so all details are visible (and with text tokens in the
+summary); `rollup report` and the web UI have no keybindings, so the `c`
+aggregation is TUI-only.
 
 Press `/` in the Me view to start an incremental Authored-tree search. The
 footer changes to `inc search: <query>`, and every printable character or

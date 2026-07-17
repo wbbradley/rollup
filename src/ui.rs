@@ -188,12 +188,24 @@ fn draw_section(
 
 fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
     match row {
-        Row::RepoHeader(repo) => ListItem::new(Line::from(Span::styled(
-            repo.clone(),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))),
+        Row::RepoHeader { repo, expanded } => {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            // A disclosure glyph appears only where the header is collapsible
+            // (the Authored pane sets `expanded: Some(_)`).
+            if let Some(exp) = expanded {
+                spans.push(Span::styled(
+                    if *exp { "▾ " } else { "▸ " }.to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            spans.push(Span::styled(
+                repo.clone(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            ListItem::new(Line::from(spans))
+        }
         Row::PersonHeader(login) => ListItem::new(Line::from(Span::styled(
             format!("@{login}"),
             Style::default()
