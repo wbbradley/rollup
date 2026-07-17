@@ -11,7 +11,9 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
     github::{self, Data},
-    model::{CheckStatus, Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus},
+    model::{
+        CheckState, CheckStatus, Pr, PrComment, RepoReleaseInfo, ReviewerKind, ReviewerStatus,
+    },
     report::{self, Row, Section, SectionId},
     ui, web,
 };
@@ -583,7 +585,7 @@ fn run_app(
                             request_refresh(&mut state, web_snapshots, || spawn_fetch(tx));
                         }
                         KeyCode::Char('x') => remove_selected_reviewer(&mut state, tx),
-                        KeyCode::Char('c') => copy_comment_prompt(&mut state),
+                        KeyCode::Char('c') => copy_prompt(&mut state),
                         KeyCode::Char('l') | KeyCode::Right => toggle_section(&mut state, true),
                         KeyCode::Char('h') | KeyCode::Left => toggle_section(&mut state, false),
                         _ => {}
@@ -946,6 +948,72 @@ fn comment_prompt_for_selection(state: &AppState) -> Option<String> {
     }
 }
 
+/// Build the single-check "address this check" agent prompt for a check named
+/// `name` at `url` on a PR whose source branch is `branch`. `url` is the
+/// already-resolved URL (the check's, falling back to the owning PR's), so this
+/// always receives one. When `branch` is empty the `" in {branch}"` phrase is
+/// dropped entirely, mirroring [`single_comment_prompt`].
+fn single_check_prompt(name: &str, url: &str, branch: &str) -> String {
+    let location = if branch.is_empty() {
+        String::new()
+    } else {
+        format!(" in {branch}")
+    };
+    format!(
+        "Please address the check {name} ({url}){location}. Use a worktree if this branch is not already active in the current worktree."
+    )
+}
+
+/// Build the whole-PR "address these failing checks" agent prompt: a header
+/// line, a `- {name} ({url})` bullet per *failing* check (`Failure`/`Error`),
+/// then the worktree instruction. Each bullet's URL is the check's, falling
+/// back to the owning PR's when the check has none. Returns `None` when the PR
+/// has no failing checks, so `c` on a Checks header with only
+/// passing/pending/skipped checks is a no-op. The `" in {branch}"` phrase is
+/// dropped when the PR's source branch is empty.
+fn checks_parent_prompt(pr: &Pr) -> Option<String> {
+    let failing: Vec<&CheckStatus> = pr
+        .checks
+        .iter()
+        .filter(|c| matches!(c.state, CheckState::Failure | CheckState::Error))
+        .collect();
+    if failing.is_empty() {
+        return None;
+    }
+    let mut out = if pr.head_ref.is_empty() {
+        "Please address the following failing checks:\n".to_string()
+    } else {
+        format!(
+            "Please address the following failing checks in {}:\n",
+            pr.head_ref
+        )
+    };
+    for check in failing {
+        let url = check.url.as_deref().unwrap_or(&pr.url);
+        out.push_str(&format!("- {} ({url})\n", check.name));
+    }
+    out.push_str("Use a worktree if this branch is not already active in the current worktree.");
+    Some(out)
+}
+
+/// Resolve the current selection to a check copy-prompt, or `None` when the
+/// selected node is neither a check child nor the "Checks" header. The nested
+/// "Valid Results" header does not match — only `SectionId::Checks` triggers
+/// the whole-PR case. Check rows and Checks headers only occur in the Authored
+/// pane, so this is a natural no-op in every other view.
+fn check_prompt_for_selection(state: &AppState) -> Option<String> {
+    let section = state.current_section();
+    match selected_row(&section.rows, state.current_sel()) {
+        Some(Selected::Section(pr, SectionId::Checks)) => checks_parent_prompt(pr),
+        Some(Selected::Check(pr, c)) => Some(single_check_prompt(
+            &c.name,
+            c.url.as_deref().unwrap_or(&pr.url),
+            &pr.head_ref,
+        )),
+        _ => None,
+    }
+}
+
 /// Copy `text` to the system clipboard. Creates a fresh handle per call — fine
 /// on macOS (the primary platform), where the pasteboard outlives the handle.
 fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -954,12 +1022,16 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// `c`: copy an "address this comment" prompt for the selected review comment
-/// (or every unresolved comment under the selected "Open comments" header) to
-/// the clipboard, confirming via the footer status line. A no-op that leaves
-/// `status` unchanged when the selection is neither.
-fn copy_comment_prompt(state: &mut AppState) {
-    let Some(prompt) = comment_prompt_for_selection(state) else {
+/// `c`: copy an "address this …" agent prompt for the selected row to the
+/// clipboard, confirming via the footer status line. Handles review comments
+/// (a single comment or every unresolved comment under the "Open comments"
+/// header) and checks (a single check or every failing check under the "Checks"
+/// header). A no-op that leaves `status` unchanged when the selection is none of
+/// these (including a "Checks" header with no failing checks).
+fn copy_prompt(state: &mut AppState) {
+    let Some(prompt) =
+        comment_prompt_for_selection(state).or_else(|| check_prompt_for_selection(state))
+    else {
         return;
     };
     state.status = Some(match copy_to_clipboard(&prompt) {
@@ -1680,5 +1752,120 @@ mod tests {
         // The PR row (neither a comment nor the Comments header) → no-op.
         state.authored_sel = 0;
         assert_eq!(comment_prompt_for_selection(&state), None);
+    }
+
+    #[test]
+    fn single_check_prompt_includes_branch_and_drops_it_when_empty() {
+        assert_eq!(
+            single_check_prompt("build", "https://ci/build", "feature"),
+            "Please address the check build (https://ci/build) in feature. Use a worktree if this branch is not already active in the current worktree."
+        );
+        // Empty branch: the whole " in {branch}" phrase is dropped, no "in .".
+        assert_eq!(
+            single_check_prompt("build", "https://ci/build", ""),
+            "Please address the check build (https://ci/build). Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    /// A failing check named `name` with details URL `url`, for prompt tests.
+    fn failing_check(name: &str, url: Option<&str>) -> CheckStatus {
+        let mut c = check(name, url, true);
+        c.state = crate::model::CheckState::Failure;
+        c
+    }
+
+    #[test]
+    fn checks_parent_prompt_bullets_failing_checks_and_none_when_none() {
+        // Only a passing check → no failing checks → None.
+        let pr = pr_with_checks(1, vec![check("build", Some("https://ci/build"), true)]);
+        assert_eq!(checks_parent_prompt(&pr), None);
+
+        // Failing checks are bulleted with name + URL; a check without a URL
+        // falls back to the PR URL; a passing check is excluded. pr_with_checks
+        // builds source branch "a".
+        let pr = pr_with_checks(
+            2,
+            vec![
+                failing_check("build", Some("https://ci/build")),
+                failing_check("test", None),
+                check("lint", Some("https://ci/lint"), false),
+            ],
+        );
+        assert_eq!(
+            checks_parent_prompt(&pr),
+            Some(format!(
+                "Please address the following failing checks in a:\n\
+                 - build (https://ci/build)\n\
+                 - test ({})\n\
+                 Use a worktree if this branch is not already active in the current worktree.",
+                pr.url
+            )),
+        );
+
+        // Empty source branch drops the " in {branch}" phrase.
+        let mut pr = pr_with_checks(3, vec![failing_check("build", Some("https://ci/build"))]);
+        pr.head_ref = String::new();
+        assert_eq!(
+            checks_parent_prompt(&pr),
+            Some(
+                "Please address the following failing checks:\n\
+                 - build (https://ci/build)\n\
+                 Use a worktree if this branch is not already active in the current worktree."
+                    .to_string()
+            ),
+        );
+    }
+
+    #[test]
+    fn check_prompt_for_selection_resolves_header_check_and_no_op() {
+        // A failing check "build" (opens Checks by default) with a URL, plus a
+        // passing check "lint" with no URL (→ Valid Results, PR-URL fallback).
+        let mut state = me_state(vec![pr_with_checks(
+            1,
+            vec![
+                failing_check("build", Some("https://ci/build")),
+                check("lint", None, false),
+            ],
+        )]);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::ValidResults, true);
+        // Selectable (attention-first order): Pr(0), Checks header(1), failing
+        // build(2), Valid Results header(3), passing lint(4). Branch is "a".
+        let pr_url = "https://github.com/o/r/pull/1";
+
+        // The Checks header → bulleted failing-checks prompt.
+        state.authored_sel = 1;
+        assert_eq!(
+            check_prompt_for_selection(&state),
+            Some(
+                "Please address the following failing checks in a:\n\
+                 - build (https://ci/build)\n\
+                 Use a worktree if this branch is not already active in the current worktree."
+                    .to_string()
+            ),
+        );
+
+        // The failing check subnode → single-check prompt with its own URL.
+        state.authored_sel = 2;
+        assert_eq!(
+            check_prompt_for_selection(&state),
+            Some(single_check_prompt("build", "https://ci/build", "a")),
+        );
+
+        // A passing check under Valid Results → single-check prompt regardless
+        // of state, with the PR-URL fallback (its own url is None).
+        state.authored_sel = 4;
+        assert_eq!(
+            check_prompt_for_selection(&state),
+            Some(single_check_prompt("lint", pr_url, "a")),
+        );
+
+        // The nested Valid Results header → no-op (only Checks matches).
+        state.authored_sel = 3;
+        assert_eq!(check_prompt_for_selection(&state), None);
+
+        // The PR row → no-op.
+        state.authored_sel = 0;
+        assert_eq!(check_prompt_for_selection(&state), None);
     }
 }
