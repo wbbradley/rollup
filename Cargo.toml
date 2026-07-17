@@ -8,6 +8,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"
+arboard = { version = "3.6.1", default-features = false }
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
 open = "5.3.3"

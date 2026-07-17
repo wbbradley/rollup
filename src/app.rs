@@ -307,7 +307,9 @@ enum Selected<'a> {
     // The `SectionId` documents which header resolved and is asserted in tests;
     // `open_selected` opens the parent PR regardless, so prod code ignores it.
     Section(&'a Pr, #[allow(dead_code)] SectionId),
-    Comment(&'a PrComment),
+    /// A comment row. Carries its PR so the copy-prompt handler can reach the
+    /// owning PR's source branch (`head_ref`); mirrors `Check`.
+    Comment(&'a Pr, &'a PrComment),
     /// A check row. Carries its PR so `open_selected` can fall back to the PR
     /// URL when the check has no details URL.
     Check(&'a Pr, &'a CheckStatus),
@@ -345,7 +347,7 @@ fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
             }
             Row::Comment { c, .. } => {
                 if idx == sel {
-                    return Some(Selected::Comment(c));
+                    return current_pr.map(|pr| Selected::Comment(pr, c));
                 }
                 idx += 1;
             }
@@ -581,6 +583,7 @@ fn run_app(
                             request_refresh(&mut state, web_snapshots, || spawn_fetch(tx));
                         }
                         KeyCode::Char('x') => remove_selected_reviewer(&mut state, tx),
+                        KeyCode::Char('c') => copy_comment_prompt(&mut state),
                         KeyCode::Char('l') | KeyCode::Right => toggle_section(&mut state, true),
                         KeyCode::Char('h') | KeyCode::Left => toggle_section(&mut state, false),
                         _ => {}
@@ -792,7 +795,7 @@ fn open_selected(state: &AppState) {
         Some(Selected::Pr(pr))
         | Some(Selected::Reviewer(pr, _))
         | Some(Selected::Section(pr, _)) => Some(pr.url.clone()),
-        Some(Selected::Comment(c)) => Some(c.url.clone()),
+        Some(Selected::Comment(_, c)) => Some(c.url.clone()),
         // A check opens its details/target URL, falling back to the PR.
         Some(Selected::Check(pr, c)) => Some(
             c.url
@@ -897,6 +900,74 @@ fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
     });
 }
 
+/// Build the single-comment "address this comment" agent prompt for a review
+/// comment at `url` on a PR whose source branch is `branch`. When `branch` is
+/// empty (GitHub returned no `headRefName`) the `" in {branch}"` phrase is
+/// dropped entirely so the text never reads `in .`.
+fn single_comment_prompt(url: &str, branch: &str) -> String {
+    let location = if branch.is_empty() {
+        String::new()
+    } else {
+        format!(" in {branch}")
+    };
+    format!(
+        "Please address {url}{location}. Use a worktree if this branch is not already active in the current worktree."
+    )
+}
+
+/// Build the whole-PR "address these comments" agent prompt: a header line, a
+/// `- {url}` bullet per unresolved comment, then the worktree instruction. The
+/// `" in {branch}"` phrase is dropped when the PR's source branch is empty.
+fn comments_parent_prompt(pr: &Pr) -> String {
+    let mut out = if pr.head_ref.is_empty() {
+        "Please address the following:\n".to_string()
+    } else {
+        format!("Please address the following in {}:\n", pr.head_ref)
+    };
+    for comment in &pr.unresolved_comments {
+        out.push_str("- ");
+        out.push_str(&comment.url);
+        out.push('\n');
+    }
+    out.push_str("Use a worktree if this branch is not already active in the current worktree.");
+    out
+}
+
+/// Resolve the current selection to the copy-prompt text, or `None` when the
+/// selected node is neither a comment child nor the "Open comments" header.
+/// Comment rows and Comments headers only occur in the Authored pane, so this
+/// is a natural no-op in every other view.
+fn comment_prompt_for_selection(state: &AppState) -> Option<String> {
+    let section = state.current_section();
+    match selected_row(&section.rows, state.current_sel()) {
+        Some(Selected::Comment(pr, c)) => Some(single_comment_prompt(&c.url, &pr.head_ref)),
+        Some(Selected::Section(pr, SectionId::Comments)) => Some(comments_parent_prompt(pr)),
+        _ => None,
+    }
+}
+
+/// Copy `text` to the system clipboard. Creates a fresh handle per call — fine
+/// on macOS (the primary platform), where the pasteboard outlives the handle.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.to_owned())?;
+    Ok(())
+}
+
+/// `c`: copy an "address this comment" prompt for the selected review comment
+/// (or every unresolved comment under the selected "Open comments" header) to
+/// the clipboard, confirming via the footer status line. A no-op that leaves
+/// `status` unchanged when the selection is neither.
+fn copy_comment_prompt(state: &mut AppState) {
+    let Some(prompt) = comment_prompt_for_selection(state) else {
+        return;
+    };
+    state.status = Some(match copy_to_clipboard(&prompt) {
+        Ok(()) => "copied to clipboard".to_string(),
+        Err(e) => format!("c: clipboard error: {e:#}"),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -964,7 +1035,8 @@ mod tests {
             _ => panic!("index 2 should be the Open comments header"),
         }
         match selected_row(&section.rows, 3) {
-            Some(Selected::Comment(c)) => {
+            Some(Selected::Comment(pr, c)) => {
+                assert_eq!(pr.number, 12);
                 assert_eq!(c.url, "https://github.com/o/r/pull/12#discussion_r1");
                 assert_eq!(c.author, "carol");
             }
@@ -1534,5 +1606,79 @@ mod tests {
                 .iter()
                 .any(|row| matches!(row, Row::Reviewer { .. }))
         );
+    }
+
+    #[test]
+    fn single_comment_prompt_includes_branch_and_drops_it_when_empty() {
+        assert_eq!(
+            single_comment_prompt("https://x/#c1", "feature"),
+            "Please address https://x/#c1 in feature. Use a worktree if this branch is not already active in the current worktree."
+        );
+        // Empty branch: the whole " in {branch}" phrase is dropped, no "in .".
+        assert_eq!(
+            single_comment_prompt("https://x/#c1", ""),
+            "Please address https://x/#c1. Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    fn comment(url: &str) -> PrComment {
+        PrComment {
+            author: "carol".to_string(),
+            body: "add a test".to_string(),
+            url: url.to_string(),
+            path: None,
+            is_outdated: false,
+        }
+    }
+
+    #[test]
+    fn comments_parent_prompt_bullets_urls_and_drops_empty_branch() {
+        let mut pr = simple_pr(1, "main", "feature", vec![]);
+        pr.unresolved_comments = vec![comment("https://x/#c1"), comment("https://x/#c2")];
+        assert_eq!(
+            comments_parent_prompt(&pr),
+            "Please address the following in feature:\n\
+             - https://x/#c1\n\
+             - https://x/#c2\n\
+             Use a worktree if this branch is not already active in the current worktree."
+        );
+
+        pr.head_ref = String::new();
+        assert_eq!(
+            comments_parent_prompt(&pr),
+            "Please address the following:\n\
+             - https://x/#c1\n\
+             - https://x/#c2\n\
+             Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    #[test]
+    fn comment_prompt_for_selection_resolves_child_header_and_no_op() {
+        let mut state = me_state(vec![authored_pr_with_reviewer_and_comment()]);
+        // Selectable order (Reviewers collapsed, Open comments expanded by
+        // default): Pr(0), Reviewers header(1), Open comments header(2),
+        // Comment(3).
+        let comment_url = "https://github.com/o/r/pull/12#discussion_r1";
+
+        // A comment child → single-comment prompt with the PR's branch.
+        state.authored_sel = 3;
+        assert_eq!(
+            comment_prompt_for_selection(&state),
+            Some(single_comment_prompt(comment_url, "feature")),
+        );
+
+        // The "Open comments" header → bulleted whole-PR prompt.
+        state.authored_sel = 2;
+        assert_eq!(
+            comment_prompt_for_selection(&state),
+            Some(format!(
+                "Please address the following in feature:\n- {comment_url}\nUse a worktree if this branch is not already active in the current worktree."
+            )),
+        );
+
+        // The PR row (neither a comment nor the Comments header) → no-op.
+        state.authored_sel = 0;
+        assert_eq!(comment_prompt_for_selection(&state), None);
     }
 }

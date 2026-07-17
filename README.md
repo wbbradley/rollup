@@ -65,6 +65,7 @@ a later refresh fails. `rollup report` does not start the listener.
 | `p`             | Switch to People view                                 |
 | `/`             | Incrementally search/filter the Authored tree (Me view) |
 | `Enter`         | Open the selected PR (or comment / check details / release/tag page) in your browser |
+| `c`             | Copy an "address this comment" agent prompt to the clipboard — the selected open comment, or every open comment under the selected "Open comments" header (Me view) |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
 | `Esc`           | Cancel/clear Authored search, or return to Me from People/Radar |
@@ -129,9 +130,13 @@ changes-requested review (`✗`) is visible at a glance without expanding.
 Explicit fold state is per-`(PR, section)` and survives background refreshes,
 including a check changing between failing and non-failing. `Enter`
 on a comment opens that comment's permalink; `Enter` on a check opens its
-details; `Enter` on a PR, reviewer, or section header opens the PR. The same
-shape appears in `rollup report`, with every section expanded so all details
-are visible (and with text tokens in the summary).
+details; `Enter` on a PR, reviewer, or section header opens the PR. Pressing
+`c` on an open comment copies an "address this comment" agent prompt (the
+comment's permalink and the PR's source branch) to the system clipboard;
+pressing `c` on the "Open comments" header copies one prompt that lists every
+open comment under that PR. The same shape appears in `rollup report`, with
+every section expanded so all details are visible (and with text tokens in the
+summary).
 
 Press `/` in the Me view to start an incremental Authored-tree search. The
 footer changes to `inc search: <query>`, and every printable character or

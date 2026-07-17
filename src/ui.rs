@@ -638,9 +638,9 @@ fn footer_line(state: &AppState) -> Line<'static> {
 
     let hint = match (&state.mode, &state.authored_search) {
         (ViewMode::Me, AuthoredSearch::Filtered(query)) => format!(
-            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open   "
+            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open · c copy   "
         ),
-        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · e radar · p people · r refresh · q quit   ".to_string(),
+        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · c copy · e radar · p people · r refresh · q quit   ".to_string(),
         (ViewMode::Radar, _) => "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   ".to_string(),
         (ViewMode::People, _) => "↑↓ move · Esc back · Enter open · x remove reviewer · e radar · r refresh · q quit   ".to_string(),
     };
