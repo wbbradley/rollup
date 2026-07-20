@@ -1,7 +1,7 @@
 use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -10,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::{DefaultTerminal, widgets::ListState};
 
 use crate::{
+    config,
     github::{self, Data},
     model::{
         CheckState, CheckStatus, Pr, PrComment, PrTreeNode, RepoReleaseInfo, ReviewerKind,
@@ -529,13 +530,20 @@ fn count_selectable(section: &Section<'_>) -> usize {
 }
 
 pub fn run() -> Result<()> {
+    // Read the auto-refresh cadence once at startup. A malformed config still
+    // surfaces to the user via the per-fetch `config_error` path (github::fetch
+    // reloads config itself); here we only need the interval, so fall back to
+    // the default rather than fail the whole app.
+    let refresh_interval = config::load()
+        .map(|cfg| cfg.refresh_interval)
+        .unwrap_or(config::DEFAULT_REFRESH_INTERVAL);
     let (tx, rx) = mpsc::channel::<Msg>();
     // Bind before entering raw terminal mode so a port conflict returns a clean
     // contextual error without requiring terminal restoration.
     let web_server = web::start(web::DEFAULT_ADDRESS, tx.clone())?;
     let web_snapshots = web_server.snapshots();
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, &web_snapshots, &tx, &rx);
+    let result = run_app(&mut terminal, &web_snapshots, &tx, &rx, refresh_interval);
     ratatui::restore();
     result
 }
@@ -545,21 +553,44 @@ fn run_app(
     web_snapshots: &web::SnapshotStore,
     tx: &Sender<Msg>,
     rx: &Receiver<Msg>,
+    refresh_interval: Duration,
 ) -> Result<()> {
     let mut state = AppState::new();
     web_snapshots.publish(web::WebSnapshot::from_app(&state));
     spawn_fetch(tx);
+    // The startup fetch counts as a refresh, so the first auto-refresh is one
+    // interval out. `request_refresh` resets this whenever a refresh actually
+    // launches (timer, manual `r`, web Refresh, or a post-action reload), so the
+    // deadline always means "one interval since the last refresh."
+    let mut next_refresh = Instant::now() + refresh_interval;
 
     let mut dirty = true;
     loop {
-        let changed = drain_msgs(rx, &mut state, tx, web_snapshots, &mut spawn_fetch);
-        if changed {
+        let drained = drain_msgs(rx, &mut state, tx, web_snapshots, &mut spawn_fetch);
+        if drained.changed {
             web_snapshots.publish(web::WebSnapshot::from_app(&state));
         }
+        // A web Refresh or post-action reload launched inside `drain_msgs`
+        // restarts the interval clock too.
+        if drained.launched_refresh {
+            next_refresh = Instant::now() + refresh_interval;
+        }
 
-        if should_redraw(dirty, changed, state.loading) {
+        if should_redraw(dirty, drained.changed, state.loading) {
             terminal.draw(|f| ui::draw(f, &mut state))?;
             dirty = false;
+        }
+
+        // Auto-refresh: when the interval elapses, launch a GitHub reload that
+        // updates both the TUI and the web snapshot. Runs before event handling
+        // so it fires regardless of input state (no pause while editing the
+        // Authored search). `request_refresh` is single-flight, so an in-flight
+        // fetch is never duplicated; the deadline advances only on a real launch.
+        if Instant::now() >= next_refresh
+            && request_refresh(&mut state, web_snapshots, || spawn_fetch(tx))
+        {
+            next_refresh = Instant::now() + refresh_interval;
+            dirty = true;
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -621,7 +652,9 @@ fn run_app(
                         }
                         KeyCode::Enter => open_selected(&state),
                         KeyCode::Char('r') => {
-                            request_refresh(&mut state, web_snapshots, || spawn_fetch(tx));
+                            if request_refresh(&mut state, web_snapshots, || spawn_fetch(tx)) {
+                                next_refresh = Instant::now() + refresh_interval;
+                            }
                         }
                         KeyCode::Char('x') => remove_selected_reviewer(&mut state, tx),
                         KeyCode::Char('c') => copy_prompt(&mut state),
@@ -712,17 +745,26 @@ fn should_redraw(dirty: bool, changed: bool, loading: bool) -> bool {
     dirty || changed || loading
 }
 
+/// What `drain_msgs` observed this iteration: whether app state changed (drives
+/// republish/redraw) and whether a refresh actually launched (drives the
+/// auto-refresh deadline reset in `run_app`).
+struct Drained {
+    changed: bool,
+    launched_refresh: bool,
+}
+
 fn drain_msgs<F>(
     rx: &Receiver<Msg>,
     state: &mut AppState,
     tx: &Sender<Msg>,
     web_snapshots: &web::SnapshotStore,
     launch_fetch: &mut F,
-) -> bool
+) -> Drained
 where
     F: FnMut(&Sender<Msg>),
 {
     let mut changed = false;
+    let mut launched_refresh = false;
     while let Ok(msg) = rx.try_recv() {
         match msg {
             Msg::Fetched(Ok(data)) => {
@@ -736,7 +778,7 @@ where
             Msg::Action { label, result } => match result {
                 Ok(()) => {
                     state.status = Some(format!("{label}: ok"));
-                    request_refresh(state, web_snapshots, || launch_fetch(tx));
+                    launched_refresh |= request_refresh(state, web_snapshots, || launch_fetch(tx));
                     changed = true;
                 }
                 Err(e) => {
@@ -745,14 +787,19 @@ where
                 }
             },
             Msg::WebRefresh { acknowledged } => {
-                changed |= request_refresh(state, web_snapshots, || launch_fetch(tx));
+                let launched = request_refresh(state, web_snapshots, || launch_fetch(tx));
+                changed |= launched;
+                launched_refresh |= launched;
                 // `request_refresh` publishes the loading snapshot before it
                 // returns, so the listener can now safely redirect the browser.
                 let _ = acknowledged.send(());
             }
         }
     }
-    changed
+    Drained {
+        changed,
+        launched_refresh,
+    }
 }
 
 /// Start a full GitHub refresh if one is not already running. Publishing the
@@ -1632,11 +1679,11 @@ mod tests {
         })
         .unwrap();
 
-        assert!(drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {}));
+        assert!(drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {}).changed);
         assert_eq!(state.status, Some("test: ok".to_string()));
 
         // Channel is now empty → nothing drained → no change reported.
-        assert!(!drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {}));
+        assert!(!drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {}).changed);
     }
 
     #[test]
@@ -1679,10 +1726,14 @@ mod tests {
         .unwrap();
         let launches = Cell::new(0);
 
-        assert!(drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
+        let drained = drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
             assert!(snapshots.load().is_loading());
             launches.set(launches.get() + 1);
-        }));
+        });
+        assert!(drained.changed);
+        // The first web Refresh launched a fetch; `run_app` uses this to reset
+        // the auto-refresh deadline.
+        assert!(drained.launched_refresh);
         first_acknowledgment.try_recv().unwrap();
         second_acknowledgment.try_recv().unwrap();
         assert!(snapshots.load().is_loading());

@@ -758,6 +758,11 @@ const SCRIPT: &str = r#"
   if (document.body.dataset.loading === "true") {
     window.setTimeout(() => window.location.reload(), 750);
   }
+  // Idle re-display: a server-side auto-refresh updates the in-memory snapshot
+  // without any browser action, so reload on a fixed cadence (independent of the
+  // configurable GitHub interval) to pick it up. A GET only re-renders the
+  // snapshot — no GitHub call — so this stays cheap.
+  window.setInterval(() => window.location.reload(), 60000);
 })();
 "#;
 
@@ -1039,6 +1044,22 @@ mod tests {
         assert!(loading.contains("aria-busy=\"true\""));
         assert!(loading.contains("Refreshing…"));
         assert!(loading.contains("window.location.reload()"));
+    }
+
+    #[test]
+    fn idle_pages_reload_on_the_fixed_interval() {
+        // A server-side auto-refresh updates the in-memory snapshot with no
+        // browser action, so even an idle (not loading) page must reload on the
+        // fixed 60s cadence to re-display it — on both surfaces.
+        let ready = rich_snapshot();
+        assert!(!ready.is_loading());
+        for html in [render_authored(&ready), render_merged(&ready, Utc::now())] {
+            assert!(html.contains("window.setInterval(() => window.location.reload(), 60000)"));
+        }
+        // The fast while-loading reload is independent and still present.
+        let loading = render_authored(&WebSnapshot::default());
+        assert!(loading.contains("window.setTimeout(() => window.location.reload(), 750)"));
+        assert!(loading.contains("window.setInterval(() => window.location.reload(), 60000)"));
     }
 
     #[test]
