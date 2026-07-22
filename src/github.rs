@@ -802,8 +802,13 @@ fn check_run_is_newer(candidate: Option<&str>, current: Option<&str>) -> bool {
 }
 
 /// Map a `CheckRun`'s status/conclusion to a [`CheckState`]. A run that hasn't
-/// completed is Pending; a completed run maps its conclusion, treating anything
-/// that isn't a clean pass/neutral/skip as a failure so it can block a merge.
+/// completed is Pending. A completed run maps its conclusion: a clean pass or
+/// skip records as such, a genuine `FAILURE` is a failure, and every other
+/// terminal conclusion — cancellation, timeout, startup failure, action
+/// required, or anything we don't recognize — is an Error. A completed run that
+/// simply hasn't reported a conclusion yet stays Pending. This guarantees a
+/// finished check that neither passed nor was skipped always surfaces in the
+/// failing set rather than being mistaken for still-running.
 fn check_run_state(status: Option<&str>, conclusion: Option<&str>) -> CheckState {
     match status {
         // COMPLETED (or an absent status) → decide from the conclusion.
@@ -811,13 +816,13 @@ fn check_run_state(status: Option<&str>, conclusion: Option<&str>) -> CheckState
             Some("SUCCESS") => CheckState::Success,
             Some("SKIPPED") => CheckState::Skipped,
             Some("NEUTRAL") | Some("STALE") => CheckState::Neutral,
-            Some("FAILURE")
-            | Some("TIMED_OUT")
-            | Some("STARTUP_FAILURE")
-            | Some("CANCELLED")
-            | Some("ACTION_REQUIRED") => CheckState::Failure,
-            // Completed but no conclusion yet, or an unknown conclusion.
-            _ => CheckState::Pending,
+            Some("FAILURE") => CheckState::Failure,
+            // Completed but no conclusion reported yet → still running.
+            None => CheckState::Pending,
+            // CANCELLED / TIMED_OUT / STARTUP_FAILURE / ACTION_REQUIRED, or any
+            // conclusion we don't recognize: the run finished without passing,
+            // so surface it as an error instead of hiding it as pending.
+            Some(_) => CheckState::Error,
         },
         // QUEUED / IN_PROGRESS / WAITING / PENDING / REQUESTED → still running.
         Some(_) => CheckState::Pending,
@@ -1507,6 +1512,80 @@ mod tests {
             .unwrap();
         assert_eq!(validate.state, CheckState::Success);
         assert_eq!(validate.url.as_deref(), Some("https://ci/new"));
+    }
+
+    #[test]
+    fn check_run_state_maps_conclusions() {
+        // Clean outcomes.
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("SUCCESS")),
+            CheckState::Success
+        );
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("SKIPPED")),
+            CheckState::Skipped
+        );
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("NEUTRAL")),
+            CheckState::Neutral
+        );
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("STALE")),
+            CheckState::Neutral
+        );
+        // A genuine test failure stays a failure.
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("FAILURE")),
+            CheckState::Failure
+        );
+        // Abnormal terminations — including cancellation — are errors, not
+        // failures, and must not fall through to Pending.
+        for conclusion in [
+            "CANCELLED",
+            "TIMED_OUT",
+            "STARTUP_FAILURE",
+            "ACTION_REQUIRED",
+            "SOMETHING_NEW", // an unrecognized conclusion still surfaces.
+        ] {
+            assert_eq!(
+                check_run_state(Some("COMPLETED"), Some(conclusion)),
+                CheckState::Error,
+                "conclusion {conclusion} should map to Error"
+            );
+        }
+        // Completed but no conclusion reported yet, and not-yet-completed runs,
+        // are still pending.
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), None),
+            CheckState::Pending
+        );
+        assert_eq!(
+            check_run_state(Some("IN_PROGRESS"), None),
+            CheckState::Pending
+        );
+        assert_eq!(check_run_state(Some("QUEUED"), None), CheckState::Pending);
+    }
+
+    #[test]
+    fn checks_from_commits_cancelled_run_is_error() {
+        // A cancelled CheckRun that is the current result (no newer duplicate)
+        // must land in the error/failing set, not be hidden as pending.
+        let json = r#"{
+            "nodes": [{
+                "commit": {
+                    "statusCheckRollup": {
+                        "contexts": { "nodes": [
+                            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "CANCELLED", "startedAt": "2026-07-14T17:58:03Z", "detailsUrl": "https://ci/test" }
+                        ]}
+                    }
+                }
+            }]
+        }"#;
+        let commits: CommitsConnection = serde_json::from_str(json).unwrap();
+        let (checks, present) = checks_from_commits(&Some(commits));
+        assert!(present);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].state, CheckState::Error);
     }
 
     #[test]
