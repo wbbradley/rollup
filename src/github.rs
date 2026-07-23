@@ -246,11 +246,10 @@ pub fn fetch() -> Result<Data> {
             }
         }
     }
-    // One fetch feeds both Me and People views; the render layer filters per
-    // view. The fetch set must cover BOTH — `authors_for_people` excludes the
-    // viewer, so on its own it would hide the viewer's own merged PRs in Me
-    // mode. Take the union.
-    let authors = model::merged_fetch_authors(&viewer, &authored, &reviewing);
+    // The merged-PR fetch is scoped to the authors visible in every view: the
+    // viewer plus the authors of the PRs awaiting the viewer's review. The
+    // render layer filters this set per view.
+    let authors = model::authors_for_me(&viewer, &reviewing);
     let merged = if authors.is_empty() {
         Vec::new()
     } else {

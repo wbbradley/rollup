@@ -80,27 +80,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 focus == Focus::Releases,
             );
         }
-        ViewMode::People => {
-            let people_section =
-                report::build_section_people(&state.authored, &state.reviewing, &viewer_str);
-            state.people_page = draw_section(
-                f,
-                top,
-                &people_section,
-                state.people_sel,
-                &mut state.people_list_state,
-                true,
-            );
-        }
     }
 
-    let allowed: std::collections::BTreeSet<String> = match state.mode {
-        ViewMode::Me => report::allowed_authors_me(&viewer_str, &state.reviewing),
-        ViewMode::Radar => report::allowed_authors_me(&viewer_str, &state.reviewing),
-        ViewMode::People => {
-            report::allowed_authors_people(&state.authored, &state.reviewing, &viewer_str)
-        }
-    };
+    // Me and Radar both scope the merged pane to the viewer + reviewing authors.
+    let allowed: std::collections::BTreeSet<String> =
+        report::allowed_authors_me(&viewer_str, &state.reviewing);
     let mut merged_section = report::build_section_merged(
         &state.merged,
         &allowed,
@@ -206,16 +190,6 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             ));
             ListItem::new(Line::from(spans))
         }
-        Row::PersonHeader(login) => ListItem::new(Line::from(Span::styled(
-            format!("@{login}"),
-            Style::default()
-                .fg(color_for_login(login))
-                .add_modifier(Modifier::BOLD),
-        ))),
-        Row::SubGroupLabel(label) => ListItem::new(Line::from(Span::styled(
-            format!("  {label}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ))),
         Row::Pr {
             pr,
             hide_author_if,
@@ -652,9 +626,8 @@ fn footer_line(state: &AppState) -> Line<'static> {
         (ViewMode::Me, AuthoredSearch::Filtered(query)) => format!(
             "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open · c copy   "
         ),
-        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · c copy · e radar · p people · r refresh · q quit   ".to_string(),
+        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · c copy · p review · e radar · r refresh · q quit   ".to_string(),
         (ViewMode::Radar, _) => "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   ".to_string(),
-        (ViewMode::People, _) => "↑↓ move · Esc back · Enter open · x remove reviewer · e radar · r refresh · q quit   ".to_string(),
     };
     Line::from(vec![
         Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),

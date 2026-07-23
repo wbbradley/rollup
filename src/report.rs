@@ -12,8 +12,7 @@ use crate::{
     model::{
         CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrTreeNode, ReleaseInfo,
         RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo, authored_tree, authors_for_me,
-        authors_for_people, checks_by_display_priority, group_by_person, group_by_repo, human_age,
-        merged_fetch_authors,
+        checks_by_display_priority, group_by_repo, human_age,
     },
 };
 
@@ -39,7 +38,6 @@ pub struct Section<'a> {
 pub enum SectionKind {
     MeReviewing,
     MeAuthored,
-    People,
     RecentlyMerged,
     Releases,
 }
@@ -224,8 +222,6 @@ pub enum Row<'a> {
         repo: String,
         expanded: Option<bool>,
     },
-    PersonHeader(String),
-    SubGroupLabel(&'static str),
     Pr {
         pr: &'a Pr,
         hide_author_if: Option<String>,
@@ -990,63 +986,6 @@ fn push_pr<'a>(
     }
 }
 
-pub fn build_section_people<'a>(
-    authored: &'a [Pr],
-    reviewing: &'a [Pr],
-    viewer: &str,
-) -> Section<'a> {
-    let groups = group_by_person(authored, reviewing, viewer);
-    let count = groups.len();
-    let mut rows: Vec<Row<'a>> = Vec::new();
-    for person in groups {
-        rows.push(Row::PersonHeader(person.login.clone()));
-        if !person.authored.is_empty() {
-            rows.push(Row::SubGroupLabel("Authored"));
-            for pr in person.authored {
-                rows.push(Row::Pr {
-                    pr,
-                    hide_author_if: Some(person.login.clone()),
-                    show_head_ref: false,
-                    tree_prefix: None,
-                    stacked_under: None,
-                });
-                for r in &pr.reviewers {
-                    rows.push(Row::Reviewer {
-                        r,
-                        tree_prefix: None,
-                    });
-                }
-            }
-        }
-        if !person.reviewing.is_empty() {
-            rows.push(Row::SubGroupLabel("Reviewing"));
-            for pr in person.reviewing {
-                rows.push(Row::Pr {
-                    pr,
-                    hide_author_if: None,
-                    show_head_ref: false,
-                    tree_prefix: None,
-                    stacked_under: None,
-                });
-                for r in &pr.reviewers {
-                    rows.push(Row::Reviewer {
-                        r,
-                        tree_prefix: None,
-                    });
-                }
-            }
-        }
-    }
-    Section {
-        title: "People".to_string(),
-        subtitle: None,
-        count,
-        kind: SectionKind::People,
-        rows,
-        empty_message: Some("(no other people)"),
-    }
-}
-
 pub fn build_section_merged<'a>(
     merged: &'a [Pr],
     allowed_authors: &BTreeSet<String>,
@@ -1116,9 +1055,7 @@ pub fn build_full_report<'a>(
     now: DateTime<Utc>,
     loaded_at: Option<DateTime<Local>>,
 ) -> Report<'a> {
-    let allowed: BTreeSet<String> = merged_fetch_authors(viewer, authored, reviewing)
-        .into_iter()
-        .collect();
+    let allowed: BTreeSet<String> = allowed_authors_me(viewer, reviewing);
     // The console has no interactive controls, so make every section visible.
     // Explicitly expand every interactive level for complete console output.
     let mut toggled = ToggledSet::new();
@@ -1146,7 +1083,6 @@ pub fn build_full_report<'a>(
             build_section_reviewing(reviewing),
             build_section_releases(releases, now),
             build_section_authored(authored, viewer, &toggled),
-            build_section_people(authored, reviewing, viewer),
             build_section_merged(merged, &allowed, MERGED_PANE_CAP, now),
         ],
     }
@@ -1154,12 +1090,6 @@ pub fn build_full_report<'a>(
 
 pub fn allowed_authors_me(viewer: &str, reviewing: &[Pr]) -> BTreeSet<String> {
     authors_for_me(viewer, reviewing).into_iter().collect()
-}
-
-pub fn allowed_authors_people(authored: &[Pr], reviewing: &[Pr], viewer: &str) -> BTreeSet<String> {
-    authors_for_people(authored, reviewing, viewer)
-        .into_iter()
-        .collect()
 }
 
 // --- color helpers (migrated from ui.rs) ---
@@ -1294,20 +1224,6 @@ fn render_row(
                 repo,
                 reset(use_color)
             )
-        }
-        Row::PersonHeader(login) => {
-            let (r, g, b) = rgb_for_login(login);
-            writeln!(
-                out,
-                "  {}{}@{}{}",
-                fg_rgb(use_color, r, g, b),
-                bold(use_color),
-                login,
-                reset(use_color),
-            )
-        }
-        Row::SubGroupLabel(label) => {
-            writeln!(out, "    {}{}:{}", dim(use_color), label, reset(use_color))
         }
         Row::Pr {
             pr,
@@ -1850,15 +1766,6 @@ mod tests {
         }
     }
 
-    fn team(name: &str, requested: bool) -> ReviewerStatus {
-        ReviewerStatus {
-            login: name.to_string(),
-            kind: ReviewerKind::Team,
-            state: ReviewState::NoReview,
-            requested,
-        }
-    }
-
     /// A reviewer who has already reviewed (`requested == false`) with a given
     /// verdict — used to exercise the response-state summary.
     fn reviewed(login: &str, state: ReviewState) -> ReviewerStatus {
@@ -1893,52 +1800,6 @@ mod tests {
             kinds,
             vec!["H:a/r", "P:4", "P:3", "P:2", "H:z/r", "P:1", "R:r1"],
         );
-    }
-
-    #[test]
-    fn build_section_people_excludes_viewer_and_teams() {
-        let viewer = "me";
-        let authored = vec![pr(
-            "o/r",
-            1,
-            viewer,
-            false,
-            100,
-            vec![user("alice", true), team("@core", true)],
-        )];
-        let reviewing = vec![pr(
-            "o/r",
-            2,
-            "bob",
-            false,
-            200,
-            vec![user(viewer, true), team("@core", true)],
-        )];
-        let section = build_section_people(&authored, &reviewing, viewer);
-
-        let person_headers: Vec<&str> = section
-            .rows
-            .iter()
-            .filter_map(|r| match r {
-                Row::PersonHeader(login) => Some(login.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(!person_headers.contains(&viewer));
-        assert!(!person_headers.iter().any(|l| l.starts_with('@')));
-        assert!(person_headers.contains(&"alice"));
-        assert!(person_headers.contains(&"bob"));
-
-        let alice_idx = section
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::PersonHeader(h) if h == "alice"))
-            .expect("alice present");
-        match &section.rows[alice_idx + 1] {
-            Row::SubGroupLabel(s) => assert_eq!(*s, "Reviewing"),
-            _ => panic!("expected SubGroupLabel after PersonHeader"),
-        }
-        assert!(matches!(section.rows[alice_idx + 2], Row::Pr { .. }));
     }
 
     #[test]
@@ -1999,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn build_full_report_contains_all_five_sections() {
+    fn build_full_report_contains_all_four_sections() {
         let viewer = "me";
         let authored = vec![pr("o/r", 1, viewer, false, 100, vec![])];
         let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
@@ -2008,12 +1869,11 @@ mod tests {
         let now = ts_utc(1_000_000);
         let report =
             build_full_report(viewer, &authored, &reviewing, &merged, &releases, now, None);
-        assert_eq!(report.sections.len(), 5);
+        assert_eq!(report.sections.len(), 4);
         assert_eq!(report.sections[0].kind, SectionKind::MeReviewing);
         assert_eq!(report.sections[1].kind, SectionKind::Releases);
         assert_eq!(report.sections[2].kind, SectionKind::MeAuthored);
-        assert_eq!(report.sections[3].kind, SectionKind::People);
-        assert_eq!(report.sections[4].kind, SectionKind::RecentlyMerged);
+        assert_eq!(report.sections[3].kind, SectionKind::RecentlyMerged);
     }
 
     #[test]
@@ -2121,12 +1981,8 @@ mod tests {
 
     #[test]
     fn non_authored_pr_rows_do_not_enable_head_ref_labels() {
-        let authored = vec![pr("o/r", 1, "alice", false, 100, vec![])];
         let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
-        let sections = [
-            build_section_reviewing(&reviewing),
-            build_section_people(&authored, &reviewing, "me"),
-        ];
+        let sections = [build_section_reviewing(&reviewing)];
 
         for section in sections {
             assert!(
@@ -2240,7 +2096,6 @@ mod tests {
             "Review requested of me",
             "Recent releases",
             "Authored by me",
-            "People",
             "Recently merged",
         ] {
             assert!(s.contains(title), "missing {title:?} in:\n{s}");
@@ -2303,7 +2158,6 @@ mod tests {
         render_with(&report, &mut out, false, 120).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("(none)"));
-        assert!(s.contains("(no other people)"));
         assert!(s.contains("No recently merged PRs."));
         assert!(s.contains("(no configured repos)"));
     }
@@ -2406,8 +2260,6 @@ mod tests {
             }
             .is_selectable()
         );
-        assert!(!Row::PersonHeader("alice".to_string()).is_selectable());
-        assert!(!Row::SubGroupLabel("Authored").is_selectable());
         assert!(!Row::MergedPr { pr: &p, now }.is_selectable());
         // Section headers are now selectable collapse controls.
         assert!(

@@ -286,119 +286,6 @@ fn build_nodes<'a>(
     out
 }
 
-#[derive(Debug)]
-pub struct PersonGroup<'a> {
-    pub login: String,
-    pub authored: Vec<&'a Pr>,
-    pub reviewing: Vec<&'a Pr>,
-}
-
-/// Build the People-mode grouping. See PLAN "Add People-pivot view" for the
-/// contract. Excludes the viewer and Team-kind reviewers. Inclusion: a login
-/// appears iff they are either `pr.author` or a User-kind requested reviewer
-/// on any PR in the union of `authored` and `reviewing` (deduped by
-/// `(repo, number)`). Per-person: `authored` collects union PRs authored by
-/// the login; `reviewing` collects union PRs where the login is a requested
-/// User reviewer and is not already under `authored`. Within each sub-group,
-/// non-drafts come first, then newest-updated. Top-level sort is login
-/// case-insensitive alphabetical.
-pub fn group_by_person<'a>(
-    authored: &'a [Pr],
-    reviewing: &'a [Pr],
-    viewer: &str,
-) -> Vec<PersonGroup<'a>> {
-    // Union of the two input slices, deduped by (repo, number). Keep the
-    // first reference seen so lifetimes stay tied to the input slices.
-    let mut seen: std::collections::HashSet<(&str, u64)> = std::collections::HashSet::new();
-    let mut union: Vec<&'a Pr> = Vec::new();
-    for pr in authored.iter().chain(reviewing.iter()) {
-        if seen.insert((pr.repo.as_str(), pr.number)) {
-            union.push(pr);
-        }
-    }
-
-    let viewer_lc = viewer.to_ascii_lowercase();
-    let is_viewer = |login: &str| login.to_ascii_lowercase() == viewer_lc;
-
-    // Collect candidate logins, keyed by lowercased login so we dedupe across
-    // case variants but preserve a stable display form (first seen).
-    let mut candidates: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    let note = |login: &str, candidates: &mut std::collections::BTreeMap<String, String>| {
-        if is_viewer(login) {
-            return;
-        }
-        candidates
-            .entry(login.to_ascii_lowercase())
-            .or_insert_with(|| login.to_string());
-    };
-    for pr in &union {
-        note(&pr.author, &mut candidates);
-        for r in &pr.reviewers {
-            if r.kind == ReviewerKind::User && r.requested {
-                note(&r.login, &mut candidates);
-            }
-        }
-    }
-
-    let sort_prs = |prs: &mut Vec<&'a Pr>| {
-        prs.sort_by(|a, b| {
-            a.is_draft
-                .cmp(&b.is_draft)
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
-        });
-    };
-
-    let mut groups: Vec<PersonGroup<'a>> = Vec::new();
-    for (login_lc, display) in &candidates {
-        let mut authored_vec: Vec<&'a Pr> = Vec::new();
-        let mut authored_keys: std::collections::HashSet<(&str, u64)> =
-            std::collections::HashSet::new();
-        for pr in &union {
-            if pr.author.to_ascii_lowercase() == *login_lc
-                && authored_keys.insert((pr.repo.as_str(), pr.number))
-            {
-                authored_vec.push(pr);
-            }
-        }
-
-        let mut reviewing_vec: Vec<&'a Pr> = Vec::new();
-        let mut reviewing_keys: std::collections::HashSet<(&str, u64)> =
-            std::collections::HashSet::new();
-        for pr in &union {
-            if authored_keys.contains(&(pr.repo.as_str(), pr.number)) {
-                continue;
-            }
-            let is_requested = pr.reviewers.iter().any(|r| {
-                r.kind == ReviewerKind::User
-                    && r.requested
-                    && r.login.to_ascii_lowercase() == *login_lc
-            });
-            if is_requested && reviewing_keys.insert((pr.repo.as_str(), pr.number)) {
-                reviewing_vec.push(pr);
-            }
-        }
-
-        if authored_vec.is_empty() && reviewing_vec.is_empty() {
-            continue;
-        }
-        sort_prs(&mut authored_vec);
-        sort_prs(&mut reviewing_vec);
-        groups.push(PersonGroup {
-            login: display.clone(),
-            authored: authored_vec,
-            reviewing: reviewing_vec,
-        });
-    }
-
-    groups.sort_by(|a, b| {
-        a.login
-            .to_ascii_lowercase()
-            .cmp(&b.login.to_ascii_lowercase())
-    });
-    groups
-}
-
 /// Lowercased, deduped authors visible in Me mode: the viewer plus every
 /// distinct author of a PR in `reviewing`. The Authored pane is always the
 /// viewer, so it contributes no extra logins.
@@ -419,30 +306,33 @@ pub fn authors_for_me(viewer: &str, reviewing: &[Pr]) -> Vec<String> {
     out
 }
 
-/// Every person surfaced by the People view as lowercased login strings.
-/// Mirrors the set that `group_by_person` materializes (authors + User-kind
-/// requested reviewers, excluding viewer and Teams).
-pub fn authors_for_people(authored: &[Pr], reviewing: &[Pr], viewer: &str) -> Vec<String> {
-    group_by_person(authored, reviewing, viewer)
-        .into_iter()
-        .map(|g| g.login.to_ascii_lowercase())
-        .collect()
-}
-
-/// Union of the Me-mode and People-mode author sets, for the single merged-PR
-/// fetch that feeds both views. `authors_for_people` excludes the viewer
-/// by design, so this pulls the viewer and reviewing-pane authors back in.
-/// Lowercased, deduped; order is Me-set first (viewer, then reviewing
-/// authors), then any extra People-set logins.
-pub fn merged_fetch_authors(viewer: &str, authored: &[Pr], reviewing: &[Pr]) -> Vec<String> {
-    let mut out: Vec<String> = authors_for_me(viewer, reviewing);
-    let mut seen: std::collections::BTreeSet<String> = out.iter().cloned().collect();
-    for a in authors_for_people(authored, reviewing, viewer) {
-        if seen.insert(a.clone()) {
-            out.push(a);
-        }
+/// Strip a leading conventional-commit prefix — a known `type`, an optional
+/// `(scope)`, an optional `!`, then `:` — from `title`, returning the trimmed
+/// remainder. Matching is case-insensitive on the type. Only the first `:` is
+/// consulted, so descriptions may contain further colons. Returns `title`
+/// unchanged when it doesn't fit this shape or when stripping would leave the
+/// string empty.
+pub fn strip_conventional_commit_prefix(title: &str) -> &str {
+    const TYPES: [&str; 11] = [
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
+        "revert",
+    ];
+    let Some((head, rest)) = title.split_once(':') else {
+        return title;
+    };
+    // Conventional order is `type(scope)!`, so peel the optional `!` first, then
+    // the optional `(scope)`, leaving just the type token.
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let type_token = match head.split_once('(') {
+        Some((ty, scope)) if scope.ends_with(')') => ty,
+        Some(_) => return title,
+        None => head,
+    };
+    if !TYPES.iter().any(|t| t.eq_ignore_ascii_case(type_token)) {
+        return title;
     }
-    out
+    let stripped = rest.trim_start_matches(' ');
+    if stripped.is_empty() { title } else { stripped }
 }
 
 #[derive(Debug, Clone)]
@@ -556,91 +446,6 @@ mod tests {
         }
     }
 
-    fn user(login: &str, requested: bool) -> ReviewerStatus {
-        ReviewerStatus {
-            login: login.to_string(),
-            kind: ReviewerKind::User,
-            state: ReviewState::NoReview,
-            requested,
-        }
-    }
-
-    fn team(name: &str, requested: bool) -> ReviewerStatus {
-        ReviewerStatus {
-            login: name.to_string(),
-            kind: ReviewerKind::Team,
-            state: ReviewState::NoReview,
-            requested,
-        }
-    }
-
-    #[test]
-    fn group_by_person_excludes_viewer_and_teams() {
-        let viewer = "me";
-        let authored = vec![pr(
-            "o/r",
-            1,
-            viewer,
-            false,
-            100,
-            vec![user("alice", true), team("@core", true)],
-        )];
-        let reviewing = vec![pr(
-            "o/r",
-            2,
-            "bob",
-            false,
-            200,
-            vec![user(viewer, true), team("@core", true)],
-        )];
-        let groups = group_by_person(&authored, &reviewing, viewer);
-        let logins: Vec<&str> = groups.iter().map(|g| g.login.as_str()).collect();
-        assert!(!logins.contains(&viewer));
-        assert!(!logins.iter().any(|l| l.starts_with('@')));
-        assert!(logins.contains(&"alice"));
-        assert!(logins.contains(&"bob"));
-    }
-
-    #[test]
-    fn group_by_person_dedupes_and_sorts() {
-        let viewer = "me";
-        // Same PR shows up in both slices: once as viewer-authored, once as
-        // review-requested. Should appear exactly once, under its author.
-        let shared = pr(
-            "o/r",
-            1,
-            "Bob",
-            false,
-            100,
-            vec![user("alice", true), user(viewer, true)],
-        );
-        let also_alice_draft = pr("o/r", 2, "alice", true, 300, vec![]);
-        let also_alice_ready = pr("o/r", 3, "alice", false, 200, vec![]);
-        let authored = vec![shared.clone(), also_alice_draft, also_alice_ready];
-        let reviewing = vec![shared];
-
-        let groups = group_by_person(&authored, &reviewing, viewer);
-        let logins: Vec<&str> = groups.iter().map(|g| g.login.as_str()).collect();
-        // Case-insensitive alphabetical: "alice" then "Bob".
-        assert_eq!(logins, vec!["alice", "Bob"]);
-
-        let alice = &groups[0];
-        // Alice's authored: her own PRs — non-draft (#3) before draft (#2).
-        let authored_nums: Vec<u64> = alice.authored.iter().map(|p| p.number).collect();
-        assert_eq!(authored_nums, vec![3, 2]);
-        // Alice is a requested reviewer on #1, so it appears exactly once in
-        // her `reviewing` list (even though it's in both input slices).
-        let reviewing_nums: Vec<u64> = alice.reviewing.iter().map(|p| p.number).collect();
-        assert_eq!(reviewing_nums, vec![1]);
-
-        let bob = &groups[1];
-        // Bob authored #1; should appear exactly once despite being in both
-        // input slices.
-        let bob_authored_nums: Vec<u64> = bob.authored.iter().map(|p| p.number).collect();
-        assert_eq!(bob_authored_nums, vec![1]);
-        assert!(bob.reviewing.is_empty());
-    }
-
     #[test]
     fn recent_merged_sorts_by_merged_at_desc_and_caps() {
         let prs = vec![
@@ -686,67 +491,24 @@ mod tests {
     }
 
     #[test]
-    fn authors_for_people_matches_group_by_person_logins() {
-        let viewer = "me";
-        let authored = vec![pr(
-            "o/r",
-            1,
-            viewer,
-            false,
-            100,
-            vec![user("Alice", true), team("@core", true)],
-        )];
-        let reviewing = vec![pr(
-            "o/r",
-            2,
-            "Bob",
-            false,
-            200,
-            vec![user(viewer, true), user("Carol", true)],
-        )];
-        let from_helper: std::collections::BTreeSet<String> =
-            authors_for_people(&authored, &reviewing, viewer)
-                .into_iter()
-                .collect();
-        let from_group: std::collections::BTreeSet<String> =
-            group_by_person(&authored, &reviewing, viewer)
-                .into_iter()
-                .map(|g| g.login.to_ascii_lowercase())
-                .collect();
-        assert_eq!(from_helper, from_group);
-        // Sanity check: viewer excluded, teams excluded, everyone else in.
-        assert!(!from_helper.contains("me"));
-        assert!(!from_helper.iter().any(|l| l.starts_with('@')));
-        assert!(from_helper.contains("alice"));
-        assert!(from_helper.contains("bob"));
-        assert!(from_helper.contains("carol"));
-    }
-
-    #[test]
-    fn merged_fetch_authors_includes_viewer_and_people_set() {
-        let viewer = "Me";
-        let authored = vec![pr(
-            "o/r",
-            1,
-            viewer,
-            false,
-            100,
-            vec![user("Alice", true), team("@core", true)],
-        )];
-        let reviewing = vec![pr("o/r", 2, "Bob", false, 200, vec![user("Carol", true)])];
-        let out = merged_fetch_authors(viewer, &authored, &reviewing);
-        let set: std::collections::BTreeSet<&str> = out.iter().map(String::as_str).collect();
-        // Viewer must be present (the People set alone would omit it).
-        assert!(set.contains("me"));
-        // Reviewing author is present.
-        assert!(set.contains("bob"));
-        // People-set members not otherwise surfaced come through too.
-        assert!(set.contains("alice"));
-        assert!(set.contains("carol"));
-        // Teams never appear.
-        assert!(!set.iter().any(|l| l.starts_with('@')));
-        // Everything is lowercased.
-        assert!(out.iter().all(|s| s == &s.to_ascii_lowercase()));
+    fn strip_conventional_commit_prefix_cases() {
+        assert_eq!(strip_conventional_commit_prefix("feat: add"), "add");
+        assert_eq!(strip_conventional_commit_prefix("fix(scope): bug"), "bug");
+        assert_eq!(strip_conventional_commit_prefix("chore!: drop"), "drop");
+        assert_eq!(
+            strip_conventional_commit_prefix("chore(deps)!: bump"),
+            "bump"
+        );
+        assert_eq!(strip_conventional_commit_prefix("Refactor: X"), "X");
+        // Unknown type tokens and non-conventional shapes pass through.
+        assert_eq!(strip_conventional_commit_prefix("WIP: x"), "WIP: x");
+        assert_eq!(strip_conventional_commit_prefix("update: x"), "update: x");
+        assert_eq!(
+            strip_conventional_commit_prefix("no colon here"),
+            "no colon here"
+        );
+        // Only the first colon is consumed.
+        assert_eq!(strip_conventional_commit_prefix("feat: a: b"), "a: b");
     }
 
     #[test]
@@ -767,26 +529,6 @@ mod tests {
     fn human_age_clamps_future() {
         let now = ts(1_000);
         assert_eq!(human_age(ts(2_000), now), "0s");
-    }
-
-    #[test]
-    fn group_by_person_skips_non_requested_reviewers() {
-        let viewer = "me";
-        // carol already reviewed (requested=false) and doesn't author anything
-        // => must NOT appear as a top-level person.
-        let authored = vec![pr(
-            "o/r",
-            1,
-            viewer,
-            false,
-            100,
-            vec![user("carol", false), user("dave", true)],
-        )];
-        let reviewing = vec![];
-        let groups = group_by_person(&authored, &reviewing, viewer);
-        let logins: Vec<&str> = groups.iter().map(|g| g.login.as_str()).collect();
-        assert!(!logins.contains(&"carol"));
-        assert!(logins.contains(&"dave"));
     }
 
     /// Flatten a tree to `(pr_number, depth)` pairs in pre-order.

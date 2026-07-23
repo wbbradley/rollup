@@ -5,7 +5,7 @@ A terminal dashboard for your GitHub PR review workload. Panes:
 - **Review requested of me** — open PRs waiting on your review (Radar page, `e`).
 - **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch), with each source branch shown as a muted `[branch/name]` suffix. Fills the full width of the Me view.
 - **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Radar page, `e`).
-- **Recently merged PRs** — recently merged PRs by people in the current view.
+- **Recently merged PRs** — recent merges by the authors visible in the current view (you and the authors of the PRs awaiting your review).
 
 Data comes from `gh api graphql`, so auth is whatever `gh` already has.
 
@@ -26,8 +26,8 @@ expanded or folded state within that tab. A failed refresh leaves the last good
 data visible alongside the current error. Refresh only reads GitHub data; the
 web UI has no GitHub mutation actions. A port conflict at
 `127.0.0.1:7011` exits cleanly before the terminal enters raw mode. The web UI's
-scope intentionally excludes the Reviewing, Releases, People, and
-reviewer-removal interfaces; those remain in the TUI and `rollup report`.
+scope intentionally excludes the Reviewing, Releases, and reviewer-removal
+interfaces; those remain in the TUI and `rollup report`.
 
 ## Install
 
@@ -62,13 +62,13 @@ a later refresh fails. `rollup report` does not start the listener.
 | `g` / `G`       | Jump to top / bottom of the pane                      |
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
-| `p`             | Switch to People view                                 |
+| `p`             | Copy a terse review-request line per PR in the selected Authored subtree — `{url} - {title}` with the conventional-commit prefix stripped and ` - DRAFT` appended for drafts, joined by newlines (Me view; same subtree semantics as `c`) |
 | `/`             | Incrementally search/filter the Authored tree (Me view) |
 | `Enter`         | Open the selected PR (or comment / check details / repo / release/tag page) in your browser |
 | `c`             | Copy one aggregate agent prompt for the selected Authored node's subtree — every unresolved comment and failing check it contains, grouped per PR (a PR includes its whole stack; a Stacked PRs header only its descendants; a repo header every PR in the repo) (Me view) |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
-| `Esc`           | Cancel/clear Authored search, or return to Me from People/Radar |
+| `Esc`           | Cancel/clear Authored search, or return to Me from Radar |
 | `q`             | Quit                                                  |
 
 ## Reviewer rows

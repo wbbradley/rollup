@@ -14,7 +14,7 @@ use crate::{
     github::{self, Data},
     model::{
         CheckState, CheckStatus, Pr, PrComment, PrTreeNode, RepoReleaseInfo, ReviewerKind,
-        ReviewerStatus, authored_tree, group_by_repo,
+        ReviewerStatus, authored_tree, group_by_repo, strip_conventional_commit_prefix,
     },
     report::{self, Row, Section, SectionId},
     ui, web,
@@ -60,7 +60,6 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Me,
-    People,
     Radar,
 }
 
@@ -91,8 +90,8 @@ pub struct AppState {
     pub viewer: Option<String>,
     pub authored: Vec<Pr>,
     pub reviewing: Vec<Pr>,
-    /// Recently merged PRs authored by people visible in the current view.
-    /// Fetched as a superset (People-mode set) and filtered per view at
+    /// Recently merged PRs by the authors visible in the current view (the
+    /// viewer plus the authors of the Reviewing PRs). Filtered per view at
     /// render time. Non-interactive.
     pub merged: Vec<Pr>,
     pub loaded_at: Option<DateTime<Local>>,
@@ -103,7 +102,6 @@ pub struct AppState {
     pub mode: ViewMode,
     pub authored_sel: usize,
     pub reviewing_sel: usize,
-    pub people_sel: usize,
     pub releases_sel: usize,
     pub releases: Vec<RepoReleaseInfo>,
     /// Explicit collapse-state choices for Authored section nodes, keyed by
@@ -119,14 +117,12 @@ pub struct AppState {
     /// the viewport when the selection crosses a scroll-margin boundary.
     pub authored_list_state: ListState,
     pub reviewing_list_state: ListState,
-    pub people_list_state: ListState,
     pub releases_list_state: ListState,
     /// Each interactive pane's visible inner height (rows), recorded by `ui`
     /// during the last draw. Used to size half-page jumps (`PageUp`/`PageDown`,
     /// `Ctrl-U`/`Ctrl-D`). Zero until the first frame is drawn.
     pub authored_page: usize,
     pub reviewing_page: usize,
-    pub people_page: usize,
     pub releases_page: usize,
 }
 
@@ -145,7 +141,6 @@ impl AppState {
             mode: ViewMode::Me,
             authored_sel: 0,
             reviewing_sel: 0,
-            people_sel: 0,
             releases_sel: 0,
             releases: Vec::new(),
             toggled: report::ToggledSet::new(),
@@ -153,11 +148,9 @@ impl AppState {
             search_collapsed: report::ToggledSet::new(),
             authored_list_state: ListState::default(),
             reviewing_list_state: ListState::default(),
-            people_list_state: ListState::default(),
             releases_list_state: ListState::default(),
             authored_page: 0,
             reviewing_page: 0,
-            people_page: 0,
             releases_page: 0,
         }
     }
@@ -209,9 +202,6 @@ impl AppState {
         } else if self.releases_sel >= rel_len {
             self.releases_sel = rel_len - 1;
         }
-        // PLAN "Refresh while in People mode: Reset selection to top." —
-        // easiest correct answer when the underlying data just changed.
-        self.people_sel = 0;
     }
 
     pub fn viewer_str(&self) -> &str {
@@ -240,10 +230,6 @@ impl AppState {
         }
     }
 
-    pub fn people_section(&self) -> Section<'_> {
-        report::build_section_people(&self.authored, &self.reviewing, self.viewer_str())
-    }
-
     pub fn releases_section(&self) -> Section<'_> {
         report::build_section_releases(&self.releases, chrono::Utc::now())
     }
@@ -251,7 +237,6 @@ impl AppState {
     fn current_section(&self) -> Section<'_> {
         match self.mode {
             ViewMode::Me => self.authored_section(),
-            ViewMode::People => self.people_section(),
             ViewMode::Radar => match self.focus {
                 Focus::Releases => self.releases_section(),
                 _ => self.reviewing_section(),
@@ -266,7 +251,6 @@ impl AppState {
     fn current_sel(&self) -> usize {
         match self.mode {
             ViewMode::Me => self.authored_sel,
-            ViewMode::People => self.people_sel,
             ViewMode::Radar => match self.focus {
                 Focus::Releases => self.releases_sel,
                 _ => self.reviewing_sel,
@@ -277,7 +261,6 @@ impl AppState {
     fn current_sel_mut(&mut self) -> &mut usize {
         match self.mode {
             ViewMode::Me => &mut self.authored_sel,
-            ViewMode::People => &mut self.people_sel,
             ViewMode::Radar => match self.focus {
                 Focus::Releases => &mut self.releases_sel,
                 _ => &mut self.reviewing_sel,
@@ -290,7 +273,6 @@ impl AppState {
     fn current_page(&self) -> usize {
         match self.mode {
             ViewMode::Me => self.authored_page,
-            ViewMode::People => self.people_page,
             ViewMode::Radar => match self.focus {
                 Focus::Releases => self.releases_page,
                 _ => self.reviewing_page,
@@ -604,15 +586,12 @@ fn run_app(
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Esc => {
-                            if state.mode == ViewMode::People || state.mode == ViewMode::Radar {
+                            if state.mode == ViewMode::Radar {
                                 state.mode = ViewMode::Me;
                                 state.focus = Focus::Authored;
                             }
                         }
-                        KeyCode::Char('p') => {
-                            state.mode = ViewMode::People;
-                            state.people_sel = 0;
-                        }
+                        KeyCode::Char('p') => copy_review_request(&mut state),
                         KeyCode::Char('e') => {
                             state.mode = ViewMode::Radar;
                             state.focus = Focus::Reviewing;
@@ -1042,6 +1021,24 @@ fn gather_children<'a>(node: &PrTreeNode<'a>) -> Vec<PrActions<'a>> {
     node.children.iter().flat_map(gather_actionable).collect()
 }
 
+/// Every PR in a node's subtree, pre-order (the node itself, then each child's
+/// subtree). Unlike [`gather_actionable`], this is unconditional — it includes
+/// PRs that have no comments or checks. Used by the `p` review-request copy.
+fn gather_prs<'a>(node: &PrTreeNode<'a>) -> Vec<&'a Pr> {
+    let mut out = vec![node.pr];
+    for child in &node.children {
+        out.extend(gather_prs(child));
+    }
+    out
+}
+
+/// The PRs in a node's *descendant* subtrees only — the node itself excluded.
+/// The unconditional counterpart to [`gather_children`], for the Stacked PRs
+/// header's review-request copy.
+fn gather_child_prs<'a>(node: &PrTreeNode<'a>) -> Vec<&'a Pr> {
+    node.children.iter().flat_map(gather_prs).collect()
+}
+
 /// Find the tree node for `(repo, number)` anywhere in `nodes` (depth-first).
 fn find_node<'t, 'a>(
     nodes: &'t [PrTreeNode<'a>],
@@ -1226,6 +1223,81 @@ fn copy_prompt(state: &mut AppState) {
         Some(prompt) => match copy_to_clipboard(&prompt) {
             Ok(()) => "copied to clipboard".to_string(),
             Err(e) => format!("c: clipboard error: {e:#}"),
+        },
+    });
+}
+
+/// Format one terse review-request line per PR — `{url} - {title}` with the
+/// title's leading conventional-commit prefix stripped, plus a ` - DRAFT`
+/// suffix when the PR is a draft — joined with `\n`. `None` when `prs` is empty.
+fn review_request(prs: &[&Pr]) -> Option<String> {
+    if prs.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = prs
+        .iter()
+        .map(|pr| {
+            let title = strip_conventional_commit_prefix(&pr.title);
+            let mut line = format!("{} - {title}", pr.url);
+            if pr.is_draft {
+                line.push_str(" - DRAFT");
+            }
+            line
+        })
+        .collect();
+    Some(lines.join("\n"))
+}
+
+/// Resolve the current Authored-pane selection to a review-request block, or
+/// `None` when it resolves to no PR. Mirrors [`build_copy_prompt`]'s selection
+/// routing, but gathers *all* PRs in scope (not just actionable ones) and never
+/// returns empty on a non-container row — it emits the owning PR's line there.
+fn build_review_request(state: &AppState) -> Option<String> {
+    let section = state.authored_section();
+    let selected = selected_row(&section.rows, state.authored_sel)?;
+    let prs: Vec<&Pr> = match selected {
+        // A repo header: every PR under that repo (all stacks).
+        Selected::Repo(repo) => {
+            let tree = repo_tree(&state.authored, &repo);
+            tree.iter().flat_map(gather_prs).collect()
+        }
+        // A PR row: that PR plus every descendant stacked PR.
+        Selected::Pr(pr) => {
+            let tree = repo_tree(&state.authored, &pr.repo);
+            find_node(&tree, &pr.repo, pr.number)
+                .map(gather_prs)
+                .unwrap_or_default()
+        }
+        // The Stacked PRs header: the parent's descendant PRs only.
+        Selected::Section(pr, SectionId::Stacked) => {
+            let tree = repo_tree(&state.authored, &pr.repo);
+            find_node(&tree, &pr.repo, pr.number)
+                .map(gather_child_prs)
+                .unwrap_or_default()
+        }
+        // Any other row (comment, check, reviewer, or non-Stacked header): the
+        // owning PR's line.
+        Selected::Comment(pr, _)
+        | Selected::Check(pr, _)
+        | Selected::Reviewer(pr, _)
+        | Selected::Section(pr, _) => vec![pr],
+    };
+    review_request(&prs)
+}
+
+/// `p`: copy a terse review-request block for the selected Authored subtree to
+/// the system clipboard, confirming via the footer status line. Mirrors
+/// [`copy_prompt`]: Me-only, a no-op elsewhere. A non-container row copies the
+/// owning PR's line; only a genuinely empty resolution reports no PR.
+fn copy_review_request(state: &mut AppState) {
+    if state.mode != ViewMode::Me {
+        return;
+    }
+    state.status = Some(match build_review_request(state) {
+        None => "p: no PR under selection".to_string(),
+        Some(text) => match copy_to_clipboard(&text) {
+            Ok(()) => "copied review request".to_string(),
+            Err(e) => format!("p: clipboard error: {e:#}"),
         },
     });
 }
@@ -2252,7 +2324,7 @@ mod tests {
 
         // Outside the Authored pane, `c` is a silent no-op.
         state.status = None;
-        state.mode = ViewMode::People;
+        state.mode = ViewMode::Radar;
         copy_prompt(&mut state);
         assert_eq!(state.status, None);
     }
@@ -2310,5 +2382,120 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Row::Pr { pr, .. } if pr.number == 1))
         );
+    }
+
+    #[test]
+    fn review_request_formats_lines_with_prefix_strip_and_draft() {
+        // Empty → None.
+        assert_eq!(review_request(&[]), None);
+
+        let mut a = simple_pr(1, "main", "a", vec![]);
+        a.title = "feat: add widget".into();
+        assert_eq!(
+            review_request(&[&a]).unwrap(),
+            "https://github.com/o/r/pull/1 - add widget"
+        );
+
+        // Drafts get a ` - DRAFT` suffix; multiple PRs join with `\n`.
+        let mut b = simple_pr(2, "main", "b", vec![]);
+        b.title = "fix(ui): crash".into();
+        b.is_draft = true;
+        assert_eq!(
+            review_request(&[&a, &b]).unwrap(),
+            "https://github.com/o/r/pull/1 - add widget\n\
+             https://github.com/o/r/pull/2 - crash - DRAFT"
+        );
+    }
+
+    #[test]
+    fn build_review_request_pr_row_covers_whole_stack() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Pr(pr) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = idx;
+        // The #1 stack (#1 and its child #2), not the sibling root #3.
+        assert_eq!(
+            build_review_request(&state).unwrap(),
+            "https://github.com/o/r/pull/1 - first\n\
+             https://github.com/o/r/pull/2 - second"
+        );
+    }
+
+    #[test]
+    fn build_review_request_leaf_pr_is_a_single_line() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Pr(pr) if pr.number == 3),
+        );
+        drop(section);
+        state.authored_sel = idx;
+        assert_eq!(
+            build_review_request(&state).unwrap(),
+            "https://github.com/o/r/pull/3 - third"
+        );
+    }
+
+    #[test]
+    fn build_review_request_stacked_header_covers_children_only() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Section(pr, SectionId::Stacked) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = idx;
+        assert_eq!(
+            build_review_request(&state).unwrap(),
+            "https://github.com/o/r/pull/2 - second"
+        );
+    }
+
+    #[test]
+    fn build_review_request_repo_header_covers_every_pr() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let idx = sel_where(&section, |s| matches!(s, Selected::Repo(_)));
+        drop(section);
+        state.authored_sel = idx;
+        assert_eq!(
+            build_review_request(&state).unwrap(),
+            "https://github.com/o/r/pull/1 - first\n\
+             https://github.com/o/r/pull/2 - second\n\
+             https://github.com/o/r/pull/3 - third"
+        );
+    }
+
+    #[test]
+    fn build_review_request_non_container_row_copies_owning_pr() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        // A comment lives under #1, which also has a child #2 — the comment row
+        // still copies only its owning PR's line, not the whole stack.
+        let idx = sel_where(
+            &section,
+            |s| matches!(s, Selected::Comment(_, c) if c.url == "https://x/#c1"),
+        );
+        drop(section);
+        state.authored_sel = idx;
+        assert_eq!(
+            build_review_request(&state).unwrap(),
+            "https://github.com/o/r/pull/1 - first"
+        );
+    }
+
+    #[test]
+    fn copy_review_request_is_no_op_outside_me() {
+        let mut state = stacked_state();
+        state.status = None;
+        state.mode = ViewMode::Radar;
+        copy_review_request(&mut state);
+        assert_eq!(state.status, None);
     }
 }
