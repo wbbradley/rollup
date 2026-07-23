@@ -1,4 +1,7 @@
-use std::{collections::HashMap, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -233,9 +236,9 @@ pub fn fetch() -> Result<Data> {
     // and finalize its checks rollup. A hard failure is non-fatal — surface a
     // warning and mark the affected PRs Unknown rather than claim a false green.
     match fetch_required_checks(&authored) {
-        Ok((req_map, w)) => {
+        Ok((authoritative, w)) => {
             warnings.extend(w);
-            apply_required_flags(&mut authored, &req_map);
+            finalize_checks(&mut authored, &authoritative);
         }
         Err(e) => {
             warnings.push(format!("required checks: {e:#}"));
@@ -467,9 +470,10 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
     // Checks: only the authored fragment fetches `commits`/`mergeable`, so
     // reviewing/merged nodes yield no checks (`rollup_present == false`) and a
     // provisional Unknown rollup that's never rendered for them. For authored
-    // PRs, `required` is still false here — `apply_required_flags` fills it in
-    // from the second call and recomputes the rollup. `mergeable == UNKNOWN`
-    // (or a missing field) means GitHub is still computing → Unknown.
+    // PRs these are a provisional first-100-context preview with `required` still
+    // false — `finalize_checks` replaces them with the second call's complete,
+    // paginated set and recomputes the rollup. `mergeable == UNKNOWN` (or a
+    // missing field) means GitHub is still computing → Unknown.
     let (checks, rollup_present) = checks_from_commits(&node.commits);
     let mergeable_unknown = !matches!(
         node.mergeable.as_deref(),
@@ -682,6 +686,19 @@ struct StatusCheckRollup {
 #[serde(default)]
 struct CheckContexts {
     nodes: Vec<Option<CheckContextNode>>,
+    /// Only fetched by the paginated required-checks call. The bulk authored
+    /// query omits it, so serde defaults it to a no-more-pages `PageInfo`.
+    #[serde(rename = "pageInfo")]
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
 }
 
 /// One status-check context. Shared by both the authored fetch (which pulls
@@ -727,63 +744,75 @@ fn checks_from_commits(commits: &Option<CommitsConnection>) -> (Vec<CheckStatus>
     let Some(rollup) = rollup else {
         return (Vec::new(), false);
     };
+    let checks = match rollup.contexts.as_ref() {
+        Some(contexts) => checks_from_context_nodes(contexts.nodes.iter().flatten()),
+        None => Vec::new(),
+    };
+    (checks, true)
+}
+
+/// Normalize a rollup's status-check context nodes into [`CheckStatus`] values.
+///
+/// Shared by the bulk authored query (which leaves `isRequired` absent, so
+/// `required` defaults to false — the second call fills it in) and the paginated
+/// required-checks call (which supplies both state and `isRequired`, making its
+/// result authoritative). A retried/re-run workflow leaves the superseded
+/// CheckRun in the rollup alongside its replacement; keep one run per check name,
+/// selected by its start time, so an older failure/cancellation cannot mask a
+/// newer result. StatusContext nodes are not CheckRun instances and GitHub
+/// already rolls them up by context, so they remain untouched.
+fn checks_from_context_nodes<'a>(
+    nodes: impl Iterator<Item = &'a CheckContextNode>,
+) -> Vec<CheckStatus> {
     let mut checks = Vec::new();
-    // A retried/re-run workflow leaves the superseded CheckRun in the rollup
-    // alongside its replacement. Keep one run per check name, selected by its
-    // start time, so an older failure/cancellation cannot mask a newer result.
-    // StatusContext nodes are not CheckRun instances and GitHub already rolls
-    // them up by context, so they remain untouched.
     let mut check_run_indices: HashMap<String, (usize, Option<String>)> = HashMap::new();
-    if let Some(contexts) = rollup.contexts.as_ref() {
-        for ctx in contexts.nodes.iter().flatten() {
-            match ctx {
-                CheckContextNode::CheckRun {
-                    name,
-                    status,
-                    conclusion,
-                    started_at,
-                    details_url,
-                    ..
-                } => {
-                    let Some(name) = name.clone() else { continue };
-                    let check = CheckStatus {
-                        name: name.clone(),
-                        state: check_run_state(status.as_deref(), conclusion.as_deref()),
-                        url: details_url.clone().filter(|u| !u.is_empty()),
-                        required: false,
-                    };
-                    if let Some((index, previous_started_at)) = check_run_indices.get_mut(&name) {
-                        if check_run_is_newer(started_at.as_deref(), previous_started_at.as_deref())
-                        {
-                            checks[*index] = check;
-                            *previous_started_at = started_at.clone();
-                        }
-                    } else {
-                        check_run_indices.insert(name, (checks.len(), started_at.clone()));
-                        checks.push(check);
+    for ctx in nodes {
+        match ctx {
+            CheckContextNode::CheckRun {
+                name,
+                status,
+                conclusion,
+                started_at,
+                details_url,
+                is_required,
+            } => {
+                let Some(name) = name.clone() else { continue };
+                let check = CheckStatus {
+                    name: name.clone(),
+                    state: check_run_state(status.as_deref(), conclusion.as_deref()),
+                    url: details_url.clone().filter(|u| !u.is_empty()),
+                    required: is_required.unwrap_or(false),
+                };
+                if let Some((index, previous_started_at)) = check_run_indices.get_mut(&name) {
+                    if check_run_is_newer(started_at.as_deref(), previous_started_at.as_deref()) {
+                        checks[*index] = check;
+                        *previous_started_at = started_at.clone();
                     }
+                } else {
+                    check_run_indices.insert(name, (checks.len(), started_at.clone()));
+                    checks.push(check);
                 }
-                CheckContextNode::StatusContext {
-                    context,
-                    state,
-                    target_url,
-                    ..
-                } => {
-                    let Some(name) = context.clone() else {
-                        continue;
-                    };
-                    checks.push(CheckStatus {
-                        name,
-                        state: status_context_state(state.as_deref()),
-                        url: target_url.clone().filter(|u| !u.is_empty()),
-                        required: false,
-                    });
-                }
-                CheckContextNode::Other => {}
             }
+            CheckContextNode::StatusContext {
+                context,
+                state,
+                target_url,
+                is_required,
+            } => {
+                let Some(name) = context.clone() else {
+                    continue;
+                };
+                checks.push(CheckStatus {
+                    name,
+                    state: status_context_state(state.as_deref()),
+                    url: target_url.clone().filter(|u| !u.is_empty()),
+                    required: is_required.unwrap_or(false),
+                });
+            }
+            CheckContextNode::Other => {}
         }
     }
-    (checks, true)
+    checks
 }
 
 /// Whether a duplicate check run should replace the instance currently kept.
@@ -839,110 +868,189 @@ fn status_context_state(state: Option<&str>) -> CheckState {
     }
 }
 
-/// Maps an authored-PR index to that PR's `check name → required` flags, as
-/// learned by [`fetch_required_checks`].
-type RequiredFlags = HashMap<usize, HashMap<String, bool>>;
+/// Maps an authored-PR index to that PR's complete, deduplicated checks — with
+/// `required` flags and states resolved — as learned by [`fetch_required_checks`].
+type AuthoritativeChecks = HashMap<usize, Vec<CheckStatus>>;
 
-/// Second GraphQL round-trip: for each authored PR, learn which of its checks
-/// are branch-protection *required*. `isRequired(pullRequestNumber:)` needs a
-/// literal PR number, which the bulk `search(...)` query can't provide, so we
-/// alias one `repository(...) { pullRequest(number: N) { ... } }` per PR (index
-/// `i` → key `p{i}`), mirroring the aliased-per-repo `fetch_releases` pattern.
-/// Returns a map from authored-PR index to `check name → required`.
-fn fetch_required_checks(authored: &[Pr]) -> Result<(RequiredFlags, Vec<String>)> {
-    use std::fmt::Write as _;
+/// Ceiling on rollup-context pages fetched per PR in [`fetch_required_checks`]
+/// (100 contexts each). A PR still paginating past this many pages is left out of
+/// the authoritative map so [`finalize_checks`] marks it `Unknown` rather than
+/// claim a rollup from truncated data. 20 pages = 2000 contexts, far above any
+/// realistic PR.
+const MAX_CHECK_PAGES: usize = 20;
 
-    let mut q = String::from("query {\n");
-    let mut included = 0;
-    for (i, pr) in authored.iter().enumerate() {
-        let Some((owner, name)) = pr.repo.split_once('/') else {
-            continue;
-        };
-        let num = pr.number;
-        writeln!(
-            &mut q,
-            "  p{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ pullRequest(number: {num}) {{ commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ name isRequired(pullRequestNumber: {num}) }} ... on StatusContext {{ context isRequired(pullRequestNumber: {num}) }} }} }} }} }} }} }} }} }}",
-            owner = escape_graphql_string(owner),
-            name = escape_graphql_string(name),
-        )
-        .unwrap();
-        included += 1;
-    }
-    q.push_str("}\n");
-    if included == 0 {
+/// Aliased target for one authored PR in the required-checks call.
+struct ReqTarget {
+    index: usize,
+    owner: String,
+    name: String,
+    number: u64,
+}
+
+/// Second GraphQL round-trip: for each authored PR, fetch the *complete* set of
+/// status-check contexts with their `isRequired(pullRequestNumber:)` flags (which
+/// need a literal PR number the bulk `search(...)` query can't provide) and
+/// states. We alias one `repository(...) { pullRequest(number: N) { ... } }` per
+/// PR (index `i` → key `p{i}`), mirroring the aliased-per-repo `fetch_releases`
+/// pattern, and paginate each PR's `contexts` connection until exhausted — a
+/// required check beyond the first 100 contexts (common on large monorepos) would
+/// otherwise be silently dropped and let a blocked merge read green. Returns a map
+/// from authored-PR index to its authoritative checks.
+fn fetch_required_checks(authored: &[Pr]) -> Result<(AuthoritativeChecks, Vec<String>)> {
+    let targets: Vec<ReqTarget> = authored
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pr)| {
+            let (owner, name) = pr.repo.split_once('/')?;
+            Some(ReqTarget {
+                index,
+                owner: owner.to_string(),
+                name: name.to_string(),
+                number: pr.number,
+            })
+        })
+        .collect();
+    if targets.is_empty() {
         return Ok((HashMap::new(), Vec::new()));
     }
 
-    let output = Command::new("gh")
-        .args(["api", "graphql", "-f"])
-        .arg(format!("query={q}"))
-        .output()
-        .context("failed to invoke gh; is it installed and on PATH?")?;
-    let (data, warnings) = parse_graphql::<RequiredChecksData>(&output, "required-checks")?;
-    let mut out: RequiredFlags = HashMap::new();
-    for i in 0..authored.len() {
-        let key = format!("p{i}");
-        // Only record a map when the alias resolved to a real PR node. A missing
-        // or null alias/PR (e.g. a SAML-blocked repo in this call) leaves the PR
-        // absent so `apply_required_flags` can mark it Unknown, not false-green.
-        if let Some(Some(repo)) = data.aliases.get(&key)
-            && let Some(pr_node) = repo.pull_request.as_ref()
-        {
-            out.insert(i, required_map_from_node(pr_node));
+    let mut warnings = Vec::new();
+    // Accumulated context nodes per PR index, appended across pages. A key is
+    // present iff at least one page of that PR's contexts was read successfully.
+    let mut accum: HashMap<usize, Vec<CheckContextNode>> = HashMap::new();
+    // PR indices whose contexts are known truncated (page cap hit, cursor
+    // missing, or a continuation page failed to resolve). Excluded from the
+    // output so `finalize_checks` declines to claim a rollup for them.
+    let mut incomplete: HashSet<usize> = HashSet::new();
+    // (PR index, cursor for the next page). First page uses `None`.
+    let mut pending: Vec<(usize, Option<String>)> =
+        targets.iter().map(|t| (t.index, None)).collect();
+
+    for page in 0..MAX_CHECK_PAGES {
+        if pending.is_empty() {
+            break;
         }
+        let q = build_required_query(&targets, &pending);
+        let output = Command::new("gh")
+            .args(["api", "graphql", "-f"])
+            .arg(format!("query={q}"))
+            .output()
+            .context("failed to invoke gh; is it installed and on PATH?")?;
+        let (mut data, w) = parse_graphql::<RequiredChecksData>(&output, "required-checks")?;
+        warnings.extend(w);
+
+        let mut next_pending = Vec::new();
+        for (index, cursor) in &pending {
+            let key = format!("p{index}");
+            let contexts = match data.aliases.remove(&key) {
+                Some(Some(repo)) => repo.pull_request.and_then(take_req_contexts),
+                _ => None,
+            };
+            let Some(contexts) = contexts else {
+                // No contexts page for this alias. On a continuation, that
+                // truncates a PR we'd already started paginating → decline to
+                // claim a rollup. On the first page (a missing/null alias, e.g. a
+                // SAML-blocked repo, or a head commit with no rollup) the PR is
+                // simply absent → Unknown via `finalize_checks`'s `None` arm.
+                if cursor.is_some() {
+                    incomplete.insert(*index);
+                }
+                continue;
+            };
+            let has_next = contexts.page_info.has_next_page;
+            let end_cursor = contexts.page_info.end_cursor;
+            accum
+                .entry(*index)
+                .or_default()
+                .extend(contexts.nodes.into_iter().flatten());
+            if has_next {
+                match end_cursor {
+                    Some(cursor) => next_pending.push((*index, Some(cursor))),
+                    // hasNextPage with no cursor can't be followed → truncated.
+                    None => {
+                        incomplete.insert(*index);
+                    }
+                }
+            }
+        }
+        pending = next_pending;
+
+        // Exhausted the page budget with PRs still paginating: their context set
+        // is truncated, so decline to claim a rollup for them.
+        if page + 1 == MAX_CHECK_PAGES && !pending.is_empty() {
+            for (index, _) in &pending {
+                incomplete.insert(*index);
+            }
+            warnings.push(format!(
+                "checks: {} PR(s) have more than {} check contexts; merge-readiness left unknown",
+                pending.len(),
+                MAX_CHECK_PAGES * 100
+            ));
+        }
+    }
+
+    let mut out: AuthoritativeChecks = HashMap::new();
+    for (index, nodes) in accum {
+        if incomplete.contains(&index) {
+            continue;
+        }
+        out.insert(index, checks_from_context_nodes(nodes.iter()));
     }
     Ok((out, warnings))
 }
 
-/// Build a `check name → required` map from one aliased PR node.
-fn required_map_from_node(node: &ReqPrNode) -> HashMap<String, bool> {
-    let mut map = HashMap::new();
-    let contexts = node
-        .commits
-        .as_ref()
-        .and_then(|c| c.nodes.iter().flatten().next())
-        .and_then(|cn| cn.commit.as_ref())
-        .and_then(|ci| ci.status_check_rollup.as_ref())
-        .and_then(|r| r.contexts.as_ref());
-    if let Some(contexts) = contexts {
-        for ctx in contexts.nodes.iter().flatten() {
-            let (name, is_required) = match ctx {
-                CheckContextNode::CheckRun {
-                    name, is_required, ..
-                } => (name.clone(), is_required),
-                CheckContextNode::StatusContext {
-                    context,
-                    is_required,
-                    ..
-                } => (context.clone(), is_required),
-                CheckContextNode::Other => continue,
-            };
-            if let Some(name) = name {
-                map.insert(name, is_required.unwrap_or(false));
-            }
-        }
+/// Build one required-checks GraphQL query for the currently `pending` aliases,
+/// resuming each PR's `contexts` connection from its cursor (`after:`) when set.
+fn build_required_query(targets: &[ReqTarget], pending: &[(usize, Option<String>)]) -> String {
+    use std::fmt::Write as _;
+
+    let by_index: HashMap<usize, &ReqTarget> = targets.iter().map(|t| (t.index, t)).collect();
+    let mut q = String::from("query {\n");
+    for (index, cursor) in pending {
+        let Some(target) = by_index.get(index) else {
+            continue;
+        };
+        let after = match cursor {
+            Some(c) => format!(", after: \"{}\"", escape_graphql_string(c)),
+            None => String::new(),
+        };
+        let num = target.number;
+        writeln!(
+            &mut q,
+            "  p{index}: repository(owner: \"{owner}\", name: \"{name}\") {{ pullRequest(number: {num}) {{ commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100{after}) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ __typename ... on CheckRun {{ name status conclusion startedAt detailsUrl isRequired(pullRequestNumber: {num}) }} ... on StatusContext {{ context state targetUrl isRequired(pullRequestNumber: {num}) }} }} }} }} }} }} }} }} }}",
+            owner = escape_graphql_string(&target.owner),
+            name = escape_graphql_string(&target.name),
+        )
+        .unwrap();
     }
-    map
+    q.push_str("}\n");
+    q
 }
 
-/// Merge the second call's required flags into each authored PR's checks and
-/// recompute its rollup. A PR already Unknown (mergeable/rollup not yet
-/// computed) stays Unknown. A PR with checks but no entry in `req_map` (its
-/// required flags couldn't be fetched) is marked Unknown rather than claiming a
-/// false green.
-fn apply_required_flags(authored: &mut [Pr], req_map: &RequiredFlags) {
+/// Extract (by value) the status-check-rollup contexts connection from one
+/// required-checks PR node, or `None` if the head commit had no rollup at all.
+fn take_req_contexts(node: ReqPrNode) -> Option<CheckContexts> {
+    let commit = node.commits?.nodes.into_iter().flatten().next()?.commit?;
+    commit.status_check_rollup?.contexts
+}
+
+/// Replace each authored PR's checks with the authoritative set from the second
+/// call and recompute its rollup. A PR already Unknown (mergeable/rollup not yet
+/// computed) stays Unknown. A PR with checks but no authoritative entry (its
+/// contexts couldn't be fetched, or were truncated past the page cap) is marked
+/// Unknown rather than claiming a false green. An empty authoritative list for a
+/// PR that had checks is treated as the same discrepancy → Unknown.
+fn finalize_checks(authored: &mut [Pr], authoritative: &AuthoritativeChecks) {
     for (i, pr) in authored.iter_mut().enumerate() {
         if pr.checks.is_empty() || pr.checks_rollup == ChecksRollup::Unknown {
             continue;
         }
-        match req_map.get(&i) {
-            Some(names) => {
-                for c in &mut pr.checks {
-                    c.required = names.get(&c.name).copied().unwrap_or(false);
-                }
+        match authoritative.get(&i) {
+            Some(checks) if !checks.is_empty() => {
+                pr.checks = checks.clone();
                 pr.checks_rollup = model::rollup_from_required(&pr.checks);
             }
-            None => pr.checks_rollup = ChecksRollup::Unknown,
+            _ => pr.checks_rollup = ChecksRollup::Unknown,
         }
     }
 }
@@ -1601,24 +1709,91 @@ mod tests {
     }
 
     #[test]
-    fn required_map_from_node_reads_is_required() {
+    fn req_contexts_map_state_and_required() {
+        // The required-checks call fetches state + isRequired together, so the
+        // shared mapper must resolve both — the rollup is then computable from
+        // the second call's authoritative data alone.
         let json = r#"{
-            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": [
-                { "__typename": "CheckRun", "name": "build", "isRequired": true },
-                { "__typename": "CheckRun", "name": "optional", "isRequired": false },
-                { "__typename": "StatusContext", "context": "legacy", "isRequired": true }
-            ]}}}}]}
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [
+                    { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://ci/build", "isRequired": true },
+                    { "__typename": "CheckRun", "name": "optional", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "", "isRequired": false },
+                    { "__typename": "StatusContext", "context": "legacy", "state": "FAILURE", "targetUrl": "https://ci/legacy", "isRequired": true }
+                ]
+            }}}}]}
         }"#;
         let node: ReqPrNode = serde_json::from_str(json).unwrap();
-        let map = required_map_from_node(&node);
-        assert_eq!(map.get("build"), Some(&true));
-        assert_eq!(map.get("optional"), Some(&false));
-        assert_eq!(map.get("legacy"), Some(&true));
+        let contexts = take_req_contexts(node).unwrap();
+        assert!(!contexts.page_info.has_next_page);
+        let checks = checks_from_context_nodes(contexts.nodes.iter().flatten());
+
+        let build = checks.iter().find(|c| c.name == "build").unwrap();
+        assert_eq!(build.state, CheckState::Success);
+        assert!(build.required);
+        assert_eq!(build.url.as_deref(), Some("https://ci/build"));
+
+        let optional = checks.iter().find(|c| c.name == "optional").unwrap();
+        assert_eq!(optional.state, CheckState::Failure);
+        assert!(!optional.required);
+
+        let legacy = checks.iter().find(|c| c.name == "legacy").unwrap();
+        assert_eq!(legacy.state, CheckState::Failure);
+        assert!(legacy.required);
     }
 
     #[test]
-    fn apply_required_flags_green_when_only_nonrequired_fails() {
-        // Required build passes; non-required lint fails → the signal stays green.
+    fn checks_from_context_nodes_dedups_across_pages() {
+        // Accumulated nodes may include the same check name from a retried run
+        // (potentially split across pages); the newest by startedAt wins
+        // regardless of order, and its required flag is preserved.
+        let json = r#"{ "nodes": [
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "CANCELLED", "startedAt": "2026-07-14T10:00:00Z", "detailsUrl": "https://ci/old", "isRequired": true },
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-07-14T11:00:00Z", "detailsUrl": "https://ci/new", "isRequired": true }
+        ]}"#;
+        let contexts: CheckContexts = serde_json::from_str(json).unwrap();
+        let checks = checks_from_context_nodes(contexts.nodes.iter().flatten());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].state, CheckState::Success);
+        assert_eq!(checks[0].url.as_deref(), Some("https://ci/new"));
+        assert!(checks[0].required);
+    }
+
+    #[test]
+    fn build_required_query_requests_pageinfo_and_paginates() {
+        let targets = vec![
+            ReqTarget {
+                index: 0,
+                owner: "o".into(),
+                name: "r".into(),
+                number: 7,
+            },
+            ReqTarget {
+                index: 1,
+                owner: "o".into(),
+                name: "r".into(),
+                number: 8,
+            },
+        ];
+        // p0 starts fresh; p1 resumes from a cursor.
+        let pending = vec![(0usize, None), (1usize, Some("CUR123".to_string()))];
+        let q = build_required_query(&targets, &pending);
+
+        assert!(q.contains("p0: repository(owner: \"o\", name: \"r\")"));
+        assert!(q.contains("pullRequest(number: 7)"));
+        assert!(q.contains("pageInfo { hasNextPage endCursor }"));
+        assert!(q.contains("isRequired(pullRequestNumber: 7)"));
+        assert!(q.contains("isRequired(pullRequestNumber: 8)"));
+        // State fields present so the rollup is computable from this call alone.
+        assert!(q.contains("status conclusion startedAt detailsUrl"));
+        // No cursor → no `after:`; a cursor → resume from it.
+        assert!(q.contains("contexts(first: 100) {"));
+        assert!(q.contains("contexts(first: 100, after: \"CUR123\") {"));
+    }
+
+    #[test]
+    fn finalize_checks_green_when_only_nonrequired_fails() {
+        // Provisional preview from the bulk query: two checks, no required flags.
         let json = r#"{
             "number": 1,
             "repository": { "nameWithOwner": "o/r" },
@@ -1634,14 +1809,27 @@ mod tests {
         // Provisional: mergeable known, no required flags yet → Green.
         assert_eq!(pr.checks_rollup, ChecksRollup::Green);
 
-        let mut names = HashMap::new();
-        names.insert("build".to_string(), true);
-        names.insert("lint".to_string(), false);
-        let mut req = HashMap::new();
-        req.insert(0usize, names);
+        // Authoritative set from the second call: required build passes,
+        // non-required lint fails → the signal stays green.
+        let authoritative_checks = vec![
+            CheckStatus {
+                name: "build".into(),
+                state: CheckState::Success,
+                url: None,
+                required: true,
+            },
+            CheckStatus {
+                name: "lint".into(),
+                state: CheckState::Failure,
+                url: None,
+                required: false,
+            },
+        ];
+        let mut authoritative = HashMap::new();
+        authoritative.insert(0usize, authoritative_checks);
 
         let mut authored = vec![pr];
-        apply_required_flags(&mut authored, &req);
+        finalize_checks(&mut authored, &authoritative);
         let pr = &authored[0];
         assert!(
             pr.checks
@@ -1661,9 +1849,56 @@ mod tests {
     }
 
     #[test]
-    fn apply_required_flags_unknown_when_flags_unavailable() {
-        // A PR with checks and known mergeability but absent from the required
-        // map (its flags couldn't be fetched) must not claim a false green.
+    fn finalize_checks_reconstructs_list_with_required_failure_beyond_preview() {
+        // The bulk query's first-100-context preview shows only a passing build,
+        // so the provisional rollup is Green. The paginated second call surfaces
+        // a required failing check the preview never included; the rollup must go
+        // Red and that check must appear in the finalized list.
+        let json = r#"{
+            "number": 1, "repository": { "nameWithOwner": "o/r" }, "mergeable": "MERGEABLE",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "" }
+            ]}}}}]}
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).unwrap();
+        assert_eq!(pr.checks.len(), 1);
+        assert_eq!(pr.checks_rollup, ChecksRollup::Green);
+
+        let authoritative_checks = vec![
+            CheckStatus {
+                name: "build".into(),
+                state: CheckState::Success,
+                url: None,
+                required: true,
+            },
+            CheckStatus {
+                name: "e2e".into(),
+                state: CheckState::Failure,
+                url: None,
+                required: true,
+            },
+        ];
+        let mut authoritative = HashMap::new();
+        authoritative.insert(0usize, authoritative_checks);
+
+        let mut authored = vec![pr];
+        finalize_checks(&mut authored, &authoritative);
+        let pr = &authored[0];
+        assert_eq!(pr.checks.len(), 2);
+        assert!(
+            pr.checks
+                .iter()
+                .any(|c| c.name == "e2e" && c.state == CheckState::Failure)
+        );
+        assert_eq!(pr.checks_rollup, ChecksRollup::Red);
+    }
+
+    #[test]
+    fn finalize_checks_unknown_when_authoritative_missing() {
+        // A PR with checks and known mergeability but absent from the
+        // authoritative map (its contexts couldn't be fetched, or were truncated
+        // past the page cap) must not claim a false green.
         let json = r#"{
             "number": 1, "repository": { "nameWithOwner": "o/r" },
             "mergeable": "MERGEABLE",
@@ -1675,7 +1910,7 @@ mod tests {
         let pr = node_to_pr(node).unwrap();
         assert_eq!(pr.checks_rollup, ChecksRollup::Green);
         let mut authored = vec![pr];
-        apply_required_flags(&mut authored, &HashMap::new());
+        finalize_checks(&mut authored, &HashMap::new());
         assert_eq!(authored[0].checks_rollup, ChecksRollup::Unknown);
     }
 
@@ -1692,9 +1927,9 @@ mod tests {
         let pr = node_to_pr(node).unwrap();
         assert_eq!(pr.checks.len(), 1);
         assert_eq!(pr.checks_rollup, ChecksRollup::Unknown);
-        // A PR already Unknown is left alone by apply_required_flags.
+        // A PR already Unknown is left alone by finalize_checks.
         let mut authored = vec![pr];
-        apply_required_flags(&mut authored, &HashMap::new());
+        finalize_checks(&mut authored, &HashMap::new());
         assert_eq!(authored[0].checks_rollup, ChecksRollup::Unknown);
     }
 
