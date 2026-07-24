@@ -191,7 +191,14 @@ fn checks_default_expanded(pr: &Pr) -> bool {
 /// first (any reviewer still requested), then, for reviewers who have reviewed,
 /// each distinct verdict in the order approved, changes, commented, dismissed.
 /// `NoReview` contributes nothing on its own (only via `requested`).
-pub fn reviewer_summary(reviewers: &[ReviewerStatus]) -> Vec<ReviewerSummaryToken> {
+///
+/// A comment-only review (`commented`) matters only while its comments are still
+/// open, so the `commented` token is suppressed once `has_unresolved_comments` is
+/// false — a resolved comment-only review is noise on the collapsed header.
+pub fn reviewer_summary(
+    reviewers: &[ReviewerStatus],
+    has_unresolved_comments: bool,
+) -> Vec<ReviewerSummaryToken> {
     let mut out: Vec<ReviewerSummaryToken> = Vec::new();
     if reviewers.iter().any(|r| r.requested) {
         out.push(ReviewerSummaryToken::Requested);
@@ -205,6 +212,9 @@ pub fn reviewer_summary(reviewers: &[ReviewerStatus]) -> Vec<ReviewerSummaryToke
         (ReviewState::Commented, ReviewerSummaryToken::Commented),
         (ReviewState::Dismissed, ReviewerSummaryToken::Dismissed),
     ] {
+        if token == ReviewerSummaryToken::Commented && !has_unresolved_comments {
+            continue;
+        }
         if reviewers.iter().any(|r| !r.requested && r.state == state) {
             out.push(token);
         }
@@ -517,7 +527,7 @@ fn section_visible_text(section: SectionId, pr: &Pr) -> String {
         }
         SectionId::ValidResults => section.label().to_string(),
         SectionId::Reviewers => {
-            let summary = reviewer_summary(&pr.reviewers)
+            let summary = reviewer_summary(&pr.reviewers, !pr.unresolved_comments.is_empty())
                 .into_iter()
                 .map(ReviewerSummaryToken::tui_label)
                 .collect::<Vec<_>>()
@@ -683,7 +693,7 @@ fn push_filtered_pr<'a>(
             rows.push(Row::SectionHeader {
                 section: SectionId::Reviewers,
                 expanded: !collapsed && !matching.is_empty(),
-                summary: reviewer_summary(&pr.reviewers),
+                summary: reviewer_summary(&pr.reviewers, !pr.unresolved_comments.is_empty()),
                 checks: None,
                 tree_prefix: child_base.clone(),
             });
@@ -909,7 +919,7 @@ fn push_pr<'a>(
         rows.push(Row::SectionHeader {
             section: SectionId::Reviewers,
             expanded,
-            summary: reviewer_summary(&node.pr.reviewers),
+            summary: reviewer_summary(&node.pr.reviewers, !node.pr.unresolved_comments.is_empty()),
             checks: None,
             tree_prefix: child_base.clone(),
         });
@@ -2779,7 +2789,7 @@ mod tests {
             reviewed("carol", ReviewState::ChangesRequested), // rejection
             reviewed("dave", ReviewState::Approved),          // duplicate approved
         ];
-        let summary = reviewer_summary(&reviewers);
+        let summary = reviewer_summary(&reviewers, false);
         assert_eq!(
             summary,
             vec![
@@ -2790,6 +2800,27 @@ mod tests {
         );
         // The rejection signal is present.
         assert!(summary.contains(&ReviewerSummaryToken::ChangesRequested));
+    }
+
+    #[test]
+    fn reviewer_summary_hides_commented_without_unresolved_comments() {
+        let reviewers = vec![
+            reviewed("bob", ReviewState::Approved),
+            reviewed("carol", ReviewState::Commented),
+        ];
+        // No open threads: the comment-only review is stale, so it's dropped.
+        assert_eq!(
+            reviewer_summary(&reviewers, false),
+            vec![ReviewerSummaryToken::Approved],
+        );
+        // With open threads the commented signal is worth surfacing.
+        assert_eq!(
+            reviewer_summary(&reviewers, true),
+            vec![
+                ReviewerSummaryToken::Approved,
+                ReviewerSummaryToken::Commented,
+            ],
+        );
     }
 
     #[test]

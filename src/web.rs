@@ -497,7 +497,7 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     }
 
     if !pr.reviewers.is_empty() {
-        let summary = reviewer_summary(&pr.reviewers)
+        let summary = reviewer_summary(&pr.reviewers, !pr.unresolved_comments.is_empty())
             .iter()
             .map(|token| token.console_label())
             .collect::<Vec<_>>()
