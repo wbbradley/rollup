@@ -13,8 +13,9 @@ use crate::{
     config,
     github::{self, Data},
     model::{
-        CheckState, CheckStatus, Pr, PrComment, PrTreeNode, RepoReleaseInfo, ReviewerKind,
-        ReviewerStatus, authored_tree, group_by_repo, strip_conventional_commit_prefix,
+        CheckState, CheckStatus, Pr, PrComment, PrCommentKind, PrTreeNode, RepoReleaseInfo,
+        ReviewerKind, ReviewerStatus, authored_tree, group_by_repo,
+        strip_conventional_commit_prefix,
     },
     report::{self, Row, Section, SectionId},
     ui, web,
@@ -441,12 +442,16 @@ fn section_ctx_at(rows: &[Row<'_>], sel: usize) -> Option<SectionCtx> {
                 }
                 idx += 1;
             }
-            Row::Comment { .. } => {
+            Row::Comment { c, .. } => {
                 if idx == sel {
                     return current_pr.map(|pr| SectionCtx {
                         repo: pr.repo.clone(),
                         number: pr.number,
-                        section: SectionId::Comments,
+                        section: if c.kind == PrCommentKind::ReviewSummary {
+                            SectionId::Reviewers
+                        } else {
+                            SectionId::Comments
+                        },
                         is_header: false,
                     });
                 }
@@ -1127,7 +1132,7 @@ fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
 
 /// Resolve the current Authored-pane selection to its aggregate copy prompt, or
 /// `None` when the selected node's subtree has nothing actionable. Single-PR
-/// scopes (a comment, a check, the Open comments / Checks headers) format
+/// scopes (a comment, a check, a reviewer, or a leaf section header) format
 /// directly from the already-resolved references; container scopes (a PR
 /// subtree, a Stacked PRs header, a repo header) rebuild the merge-target tree
 /// so the gather is independent of collapse state.
@@ -1149,7 +1154,39 @@ fn build_copy_prompt(state: &AppState) -> Option<String> {
         }]),
         // The Open comments header: this PR's unresolved comments only.
         Selected::Section(pr, SectionId::Comments) => {
-            let comments: Vec<&PrComment> = pr.unresolved_comments.iter().collect();
+            let comments: Vec<&PrComment> = pr
+                .unresolved_comments
+                .iter()
+                .filter(|comment| comment.kind == PrCommentKind::Thread)
+                .collect();
+            combined_prompt(&[PrActions {
+                pr,
+                comments,
+                checks: vec![],
+            }])
+        }
+        // Review summary comments nested under one reviewer.
+        Selected::Reviewer(pr, reviewer) => {
+            let comments: Vec<&PrComment> = pr
+                .unresolved_comments
+                .iter()
+                .filter(|comment| {
+                    comment.kind == PrCommentKind::ReviewSummary && comment.author == reviewer.login
+                })
+                .collect();
+            combined_prompt(&[PrActions {
+                pr,
+                comments,
+                checks: vec![],
+            }])
+        }
+        // Every review summary nested in the Reviewers section.
+        Selected::Section(pr, SectionId::Reviewers) => {
+            let comments: Vec<&PrComment> = pr
+                .unresolved_comments
+                .iter()
+                .filter(|comment| comment.kind == PrCommentKind::ReviewSummary)
+                .collect();
             combined_prompt(&[PrActions {
                 pr,
                 comments,
@@ -1191,8 +1228,8 @@ fn build_copy_prompt(state: &AppState) -> Option<String> {
             let items: Vec<PrActions> = tree.iter().flat_map(gather_actionable).collect();
             combined_prompt(&items)
         }
-        // Reviewers header, Valid Results header, a reviewer — no prompt notion.
-        Selected::Section(_, _) | Selected::Reviewer(_, _) => None,
+        // Valid Results and other non-actionable section headers.
+        Selected::Section(_, _) => None,
     }
 }
 
@@ -1210,8 +1247,9 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 /// (a PR includes its whole stack; a Stacked PRs header only its descendants; a
 /// repo header every PR in the repo), grouped per PR. Single comments, single
 /// checks, and section headers use the same unified format. When the subtree
-/// has nothing actionable — including prompt-notion-free nodes (Reviewers, a
-/// reviewer, Valid Results) — the footer reads `c: nothing to address here`.
+/// has nothing actionable — including a reviewer with no review summary and
+/// prompt-notion-free nodes such as Valid Results — the footer reads
+/// `c: nothing to address here`.
 /// Only acts in the Me/Authored pane; a no-op elsewhere (no comment/check/repo
 /// gather notion exists in the other views).
 fn copy_prompt(state: &mut AppState) {
@@ -1330,6 +1368,7 @@ mod tests {
             updated_at: chrono::Utc.timestamp_opt(100, 0).unwrap(),
             merged_at: None,
             unresolved_comments: vec![PrComment {
+                kind: crate::model::PrCommentKind::Thread,
                 author: "carol".to_string(),
                 body: "add a test here".to_string(),
                 url: "https://github.com/o/r/pull/12#discussion_r1".to_string(),
@@ -1960,6 +1999,7 @@ mod tests {
 
     fn comment(url: &str) -> PrComment {
         PrComment {
+            kind: crate::model::PrCommentKind::Thread,
             author: "carol".to_string(),
             body: "add a test".to_string(),
             url: url.to_string(),
@@ -2248,6 +2288,34 @@ mod tests {
              - check build (https://ci/build)\n\
              \n\
              Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    #[test]
+    fn review_summary_belongs_to_reviewer_for_collapse_and_copy() {
+        let mut pr = authored_pr_with_reviewer_and_comment();
+        pr.unresolved_comments[0].kind = PrCommentKind::ReviewSummary;
+        pr.unresolved_comments[0].author = "alice".to_string();
+        pr.unresolved_comments[0].url = "https://x/#review".to_string();
+        let mut state = me_state(vec![pr]);
+        let section = state.authored_section();
+        let comment_idx = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Comment(_, c) if c.kind == PrCommentKind::ReviewSummary),
+        );
+        let reviewer_idx = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Reviewer(_, reviewer) if reviewer.login == "alice"),
+        );
+        let ctx = section_ctx_at(&section.rows, comment_idx).expect("review summary context");
+        assert_eq!(ctx.section, SectionId::Reviewers);
+        drop(section);
+
+        state.authored_sel = reviewer_idx;
+        assert!(
+            build_copy_prompt(&state)
+                .expect("reviewer summary prompt")
+                .contains("https://x/#review")
         );
     }
 

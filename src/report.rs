@@ -10,9 +10,9 @@ use chrono::{DateTime, Local, Utc};
 use crate::{
     github,
     model::{
-        CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrTreeNode, ReleaseInfo,
-        RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo, authored_tree, authors_for_me,
-        checks_by_display_priority, group_by_repo, human_age,
+        CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrCommentKind, PrTreeNode,
+        ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo, authored_tree,
+        authors_for_me, checks_by_display_priority, group_by_repo, human_age,
     },
 };
 
@@ -263,8 +263,9 @@ pub enum Row<'a> {
         checks: Option<ChecksSummary>,
         tree_prefix: String,
     },
-    /// An unresolved review-thread comment under a PR. Selectable; Enter opens
-    /// the comment's permalink.
+    /// A review-summary comment nested beneath its reviewer, or an unresolved
+    /// inline-thread comment under Open comments. Selectable; Enter opens its
+    /// permalink.
     Comment {
         c: &'a PrComment,
         tree_prefix: String,
@@ -557,13 +558,20 @@ fn filtered_pr_matches(node: &PrTreeNode<'_>, viewer: &str, query: &str) -> bool
                 || pr
                     .reviewers
                     .iter()
-                    .any(|reviewer| visible_text_matches(&reviewer_visible_text(reviewer), query))))
-        || (!pr.unresolved_comments.is_empty()
+                    .any(|reviewer| visible_text_matches(&reviewer_visible_text(reviewer), query))
+                || pr.unresolved_comments.iter().any(|comment| {
+                    comment.kind == PrCommentKind::ReviewSummary
+                        && visible_text_matches(&comment_visible_text(comment), query)
+                })))
+        || (pr
+            .unresolved_comments
+            .iter()
+            .any(|comment| comment.kind == PrCommentKind::Thread)
             && (visible_text_matches(&section_visible_text(SectionId::Comments, pr), query)
-                || pr
-                    .unresolved_comments
-                    .iter()
-                    .any(|comment| visible_text_matches(&comment_visible_text(comment), query))))
+                || pr.unresolved_comments.iter().any(|comment| {
+                    comment.kind == PrCommentKind::Thread
+                        && visible_text_matches(&comment_visible_text(comment), query)
+                })))
         || (!node.children.is_empty()
             && (visible_text_matches(&section_visible_text(SectionId::Stacked, pr), query)
                 || node
@@ -681,10 +689,23 @@ fn push_filtered_pr<'a>(
     if !pr.reviewers.is_empty() {
         let section_matches =
             visible_text_matches(&section_visible_text(SectionId::Reviewers, pr), query);
-        let matching: Vec<&ReviewerStatus> = pr
+        let matching: Vec<(&ReviewerStatus, Vec<&PrComment>)> = pr
             .reviewers
             .iter()
-            .filter(|reviewer| visible_text_matches(&reviewer_visible_text(reviewer), query))
+            .filter_map(|reviewer| {
+                let comments: Vec<&PrComment> = pr
+                    .unresolved_comments
+                    .iter()
+                    .filter(|comment| {
+                        comment.kind == PrCommentKind::ReviewSummary
+                            && comment.author == reviewer.login
+                            && visible_text_matches(&comment_visible_text(comment), query)
+                    })
+                    .collect();
+                (visible_text_matches(&reviewer_visible_text(reviewer), query)
+                    || !comments.is_empty())
+                .then_some((reviewer, comments))
+            })
             .collect();
         if section_matches || !matching.is_empty() {
             let collapsed = search_collapsed
@@ -699,7 +720,7 @@ fn push_filtered_pr<'a>(
             });
             if !collapsed {
                 let count = matching.len();
-                for (index, reviewer) in matching.into_iter().enumerate() {
+                for (index, (reviewer, comments)) in matching.into_iter().enumerate() {
                     rows.push(Row::Reviewer {
                         r: reviewer,
                         tree_prefix: Some(format!(
@@ -711,17 +732,39 @@ fn push_filtered_pr<'a>(
                             }
                         )),
                     });
+                    let reviewer_base = format!(
+                        "{child_base}{}",
+                        if index + 1 == count { "   " } else { "│  " }
+                    );
+                    let comment_count = comments.len();
+                    for (comment_index, comment) in comments.into_iter().enumerate() {
+                        rows.push(Row::Comment {
+                            c: comment,
+                            tree_prefix: format!(
+                                "{reviewer_base}{}",
+                                if comment_index + 1 == comment_count {
+                                    "└─ "
+                                } else {
+                                    "├─ "
+                                }
+                            ),
+                        });
+                    }
                 }
             }
         }
     }
 
-    if !pr.unresolved_comments.is_empty() {
+    let thread_comments: Vec<&PrComment> = pr
+        .unresolved_comments
+        .iter()
+        .filter(|comment| comment.kind == PrCommentKind::Thread)
+        .collect();
+    if !thread_comments.is_empty() {
         let section_matches =
             visible_text_matches(&section_visible_text(SectionId::Comments, pr), query);
-        let matching: Vec<&PrComment> = pr
-            .unresolved_comments
-            .iter()
+        let matching: Vec<&PrComment> = thread_comments
+            .into_iter()
             .filter(|comment| visible_text_matches(&comment_visible_text(comment), query))
             .collect();
         if section_matches || !matching.is_empty() {
@@ -907,14 +950,20 @@ fn push_pr<'a>(
         }
     }
 
-    // Reviewers section.
+    // Reviewers section. Review-level comments belong to their author here;
+    // only inline threads go in the separate Open comments section below.
     if !node.pr.reviewers.is_empty() {
+        let has_review_summaries = node
+            .pr
+            .unresolved_comments
+            .iter()
+            .any(|comment| comment.kind == PrCommentKind::ReviewSummary);
         let expanded = is_expanded(
             toggled,
             repo,
             number,
             SectionId::Reviewers,
-            SectionId::Reviewers.default_expanded(),
+            SectionId::Reviewers.default_expanded() || has_review_summaries,
         );
         rows.push(Row::SectionHeader {
             section: SectionId::Reviewers,
@@ -931,12 +980,42 @@ fn push_pr<'a>(
                     r,
                     tree_prefix: Some(format!("{child_base}{c}")),
                 });
+                let comments: Vec<&PrComment> = node
+                    .pr
+                    .unresolved_comments
+                    .iter()
+                    .filter(|comment| {
+                        comment.kind == PrCommentKind::ReviewSummary && comment.author == r.login
+                    })
+                    .collect();
+                let reviewer_base =
+                    format!("{child_base}{}", if i + 1 == m { "   " } else { "│  " });
+                let comment_count = comments.len();
+                for (comment_index, comment) in comments.into_iter().enumerate() {
+                    rows.push(Row::Comment {
+                        c: comment,
+                        tree_prefix: format!(
+                            "{reviewer_base}{}",
+                            if comment_index + 1 == comment_count {
+                                "└─ "
+                            } else {
+                                "├─ "
+                            }
+                        ),
+                    });
+                }
             }
         }
     }
 
     // Open comments section.
-    if !node.pr.unresolved_comments.is_empty() {
+    let thread_comments: Vec<&PrComment> = node
+        .pr
+        .unresolved_comments
+        .iter()
+        .filter(|comment| comment.kind == PrCommentKind::Thread)
+        .collect();
+    if !thread_comments.is_empty() {
         let expanded = is_expanded(
             toggled,
             repo,
@@ -952,8 +1031,8 @@ fn push_pr<'a>(
             tree_prefix: child_base.clone(),
         });
         if expanded {
-            let m = node.pr.unresolved_comments.len();
-            for (i, c) in node.pr.unresolved_comments.iter().enumerate() {
+            let m = thread_comments.len();
+            for (i, c) in thread_comments.into_iter().enumerate() {
                 let conn = if i + 1 == m { "└─ " } else { "├─ " };
                 rows.push(Row::Comment {
                     c,
@@ -1560,15 +1639,17 @@ fn render_comment_line(
     use_color: bool,
 ) -> io::Result<()> {
     write!(out, "{}{}{}", dim(use_color), tree_prefix, reset(use_color))?;
-    let (r, g, b) = rgb_for_login(&c.author);
-    write!(
-        out,
-        "{}@{}{}",
-        fg_rgb(use_color, r, g, b),
-        c.author,
-        reset(use_color),
-    )?;
-    write!(out, " {}", c.body)?;
+    if c.kind == PrCommentKind::Thread {
+        let (r, g, b) = rgb_for_login(&c.author);
+        write!(
+            out,
+            "{}@{}{} ",
+            fg_rgb(use_color, r, g, b),
+            c.author,
+            reset(use_color),
+        )?;
+    }
+    write!(out, "{}", c.body)?;
     if let Some(path) = &c.path {
         write!(out, " {}({}){}", dim(use_color), path, reset(use_color))?;
     }
@@ -1752,6 +1833,7 @@ mod tests {
 
     fn comment(author: &str, body: &str, path: Option<&str>, is_outdated: bool) -> PrComment {
         PrComment {
+            kind: crate::model::PrCommentKind::Thread,
             author: author.to_string(),
             body: body.to_string(),
             url: format!("https://github.com/o/r/pull/1#discussion_r_{author}"),
@@ -2448,6 +2530,42 @@ mod tests {
             )
         });
         assert!(expanded, "header reflects expanded state");
+    }
+
+    #[test]
+    fn review_summaries_nest_under_reviewer_not_open_comments() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.reviewers = vec![reviewed("alice", ReviewState::Approved)];
+        let mut summary = comment("alice", "skip the legacy flow", None, false);
+        summary.kind = PrCommentKind::ReviewSummary;
+        p.unresolved_comments = vec![summary];
+
+        let prs = [p];
+        let section = build_section_authored(&prs, "me", &ToggledSet::new());
+        let reviewer_header = section.rows.iter().find_map(|row| match row {
+            Row::SectionHeader {
+                section: SectionId::Reviewers,
+                expanded,
+                ..
+            } => Some(*expanded),
+            _ => None,
+        });
+        assert_eq!(reviewer_header, Some(true));
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Reviewer { r, .. } if r.login == "alice"
+        )));
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Comment { c, .. } if c.kind == PrCommentKind::ReviewSummary
+        )));
+        assert!(!section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Comments,
+                ..
+            }
+        )));
     }
 
     #[test]

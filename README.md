@@ -111,8 +111,11 @@ Under each PR its children are grouped into up to four ordered sections:
    check opens its details page (falling back to the PR). See
    [Checks signal](#checks-signal) below.
 2. **Reviewers** — where each reviewer stands (see the glyph table above).
-3. **Open comments** — the first comment of every *unresolved* review thread
-   (`isResolved == false`), shown as `@author excerpt (path)`. Threads whose
+   Non-empty human review summaries are nested beneath their reviewer; GitHub
+   gives these comments no resolve action. Bot review summaries are omitted.
+3. **Open comments** — the first comment of every *unresolved* inline review
+   thread (`isResolved == false`), shown as `@author excerpt (path)`. Excerpts
+   use the full pane width and end in `…` only when they overflow. Threads whose
    diff hunk has moved or collapsed are still listed, tagged `[outdated]`.
 4. **Stacked PRs** — PRs stacked on this one, each recursing into its own
    sections.
@@ -123,8 +126,9 @@ it, `h`/Left collapses it. `h`/Left on a child row (check, reviewer, comment, or
 nested PR) collapses its enclosing section and moves the cursor back to that
 section's header. A valid check collapses back to **Valid Results**; an
 actionable check collapses back to **Checks**. Checks conditionally expands as
-described above, while Valid Results and Reviewers start collapsed (Open
-comments and Stacked PRs start expanded). The Reviewers header carries a compact
+described above, while Valid Results and Reviewers start collapsed unless a
+review summary needs attention (Open comments and Stacked PRs start expanded).
+The Reviewers header carries a compact
 response-state summary — e.g. `▸ Reviewers [req, ✗ changes]` — so a
 changes-requested review (`✗`) is visible at a glance without expanding.
 Explicit fold state is per-`(PR, section)` and survives background refreshes,
@@ -139,11 +143,12 @@ Pressing `c` on **any** Authored node copies one aggregate agent prompt for that
 node's subtree to the system clipboard, gathering every unresolved comment and
 failing check it contains, grouped per PR. A PR includes its whole stack; a
 **Stacked PRs** header covers only the PRs stacked on it; a **repo header**
-covers every PR in the repo; the **Open comments** and **Checks** headers cover
-that one PR's comments or failing checks; and a single comment or single check
-copies just that item (a single check works even when it is passing). Nodes with
-no prompting notion (**Reviewers**, a reviewer, **Valid Results**) and empty
-subtrees report `c: nothing to address here`. The prompt closes with a
+covers every PR in the repo; the **Reviewers**, **Open comments**, and **Checks**
+headers cover that one PR's review summaries, inline comments, or failing
+checks; and a reviewer, single comment, or single check copies just that scope
+(a single check works even when it is passing). Nodes with no prompting notion
+(such as **Valid Results**) and empty subtrees report `c: nothing to address
+here`. The prompt closes with a
 worktree instruction that is branch-count aware — one worktree for a single
 branch, or a worktree (and possibly a separate sub-agent) per branch when it
 spans several. The section shape also appears in `rollup report`, with every

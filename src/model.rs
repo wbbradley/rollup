@@ -125,14 +125,27 @@ pub fn rollup_from_required(checks: &[CheckStatus]) -> ChecksRollup {
     }
 }
 
-/// The first comment of an unresolved review thread on a PR. Surfaced in the
-/// Authored pane's "Open comments" section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrCommentKind {
+    /// A non-empty body attached to a COMMENTED review. GitHub does not expose
+    /// a resolve action for these; the UI nests them beneath their reviewer.
+    ReviewSummary,
+    /// The first comment of an unresolved inline review thread.
+    Thread,
+}
+
+/// An open review comment on a PR: either a non-empty review-level COMMENTED
+/// body (which GitHub cannot resolve) or the first comment of an unresolved
+/// inline review thread. Surfaced in the Authored pane's "Open comments"
+/// section.
 #[derive(Debug, Clone)]
 pub struct PrComment {
+    pub kind: PrCommentKind,
     pub author: String,
-    /// First line / short excerpt of the comment body.
+    /// Full first non-empty line of the comment body; renderers truncate it to
+    /// their available width.
     pub body: String,
-    /// Direct comment permalink (…#discussion_r…).
+    /// Direct comment or review permalink.
     pub url: String,
     /// Inline file path for a code comment; `None` for a file-level comment.
     pub path: Option<String>,
@@ -159,8 +172,9 @@ pub struct Pr {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// `Some(_)` iff the PR is merged. Open PRs leave this `None`.
     pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// First comment of each unresolved review thread. Only populated for the
-    /// Authored pane's PRs (the reviewing/merged fetches don't request threads).
+    /// Non-empty review-level comments plus the first comment of each unresolved
+    /// inline review thread. Only populated for the Authored pane's PRs (the
+    /// reviewing/merged fetches don't request either connection).
     pub unresolved_comments: Vec<PrComment>,
     /// Head-commit checks. Only populated for the Authored pane's PRs (the
     /// reviewing/merged fetches don't request the status-check rollup). Empty

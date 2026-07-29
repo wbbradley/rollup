@@ -10,8 +10,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use crate::{
     config,
     model::{
-        self, CheckState, CheckStatus, ChecksRollup, Pr, PrComment, ReleaseInfo, RepoReleaseInfo,
-        ReviewState, ReviewerKind, ReviewerStatus, TagInfo,
+        self, CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrCommentKind, ReleaseInfo,
+        RepoReleaseInfo, ReviewState, ReviewerKind, ReviewerStatus, TagInfo,
     },
 };
 
@@ -54,6 +54,9 @@ fragment PrFields on PullRequest {
 fragment AuthoredPrFields on PullRequest {
   ...PrFields
   mergeable
+  reviews(first: 50, states: COMMENTED) {
+    nodes { author { __typename login } bodyText url }
+  }
   commits(last: 1) {
     nodes {
       commit {
@@ -422,8 +425,6 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         }
     }
 
-    reviewers.sort_by_key(|r| r.login.to_lowercase());
-
     let updated_at = node
         .updated_at
         .as_deref()
@@ -437,10 +438,49 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc));
 
-    // Only the `authored:` query fetches `reviewThreads`; reviewing/merged nodes
-    // leave it `None`, so their `unresolved_comments` come out empty. Surface the
-    // first comment of each unresolved thread (including outdated ones).
+    // Only the `authored:` query fetches review bodies and `reviewThreads`;
+    // reviewing/merged nodes leave both `None`, so their `unresolved_comments`
+    // come out empty. GitHub review-level comments do not belong to a thread and
+    // therefore have no resolve action. Surface non-empty human COMMENTED review
+    // bodies as open comments, then the first comment of each unresolved inline
+    // thread (including outdated ones).
     let mut unresolved_comments: Vec<PrComment> = Vec::new();
+    if let Some(reviews) = node.reviews {
+        for review in reviews.nodes {
+            let Some(author) = review.author else {
+                continue;
+            };
+            if author.kind.as_deref() == Some("Bot") {
+                continue;
+            }
+            let body = review.body_text.unwrap_or_default();
+            if body.trim().is_empty() {
+                continue;
+            }
+            let url = review.url.unwrap_or_default();
+            if url.is_empty() {
+                continue;
+            }
+            if !reviewers.iter().any(|reviewer| {
+                reviewer.kind == ReviewerKind::User && reviewer.login == author.login
+            }) {
+                reviewers.push(ReviewerStatus {
+                    login: author.login.clone(),
+                    kind: ReviewerKind::User,
+                    state: ReviewState::Commented,
+                    requested: false,
+                });
+            }
+            unresolved_comments.push(PrComment {
+                kind: PrCommentKind::ReviewSummary,
+                author: author.login,
+                body: first_nonempty_line(&body),
+                url,
+                path: None,
+                is_outdated: false,
+            });
+        }
+    }
     if let Some(threads) = node.review_threads {
         for thread in threads.nodes {
             if thread.is_resolved {
@@ -455,17 +495,20 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
             }
             let path = comment.path.filter(|p| !p.is_empty());
             unresolved_comments.push(PrComment {
+                kind: PrCommentKind::Thread,
                 author: comment
                     .author
                     .map(|a| a.login)
                     .unwrap_or_else(|| "ghost".into()),
-                body: excerpt(&comment.body_text.unwrap_or_default()),
+                body: first_nonempty_line(&comment.body_text.unwrap_or_default()),
                 url,
                 path,
                 is_outdated: thread.is_outdated,
             });
         }
     }
+
+    reviewers.sort_by_key(|r| r.login.to_lowercase());
 
     // Checks: only the authored fragment fetches `commits`/`mergeable`, so
     // reviewing/merged nodes yield no checks (`rollup_present == false`) and a
@@ -502,23 +545,14 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
     })
 }
 
-/// Max characters kept from a review-thread comment's first line for display.
-const COMMENT_EXCERPT_MAX: usize = 60;
-
-/// A short, single-line excerpt of a review comment body: the first non-empty
-/// line, trimmed, char-truncated to [`COMMENT_EXCERPT_MAX`] with a trailing `…`.
-fn excerpt(body: &str) -> String {
-    let line = body
-        .lines()
+/// The first non-empty line of a review comment body, trimmed. Width-aware
+/// truncation belongs to the renderer so wider panes can show more text.
+fn first_nonempty_line(body: &str) -> String {
+    body.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("");
-    if line.chars().count() <= COMMENT_EXCERPT_MAX {
-        return line.to_string();
-    }
-    let mut s: String = line.chars().take(COMMENT_EXCERPT_MAX - 1).collect();
-    s.push('…');
-    s
+        .unwrap_or("")
+        .to_string()
 }
 
 #[derive(Deserialize)]
@@ -567,6 +601,7 @@ struct PrNode {
     review_requests: Option<ReviewRequests>,
     #[serde(rename = "latestReviews")]
     latest_reviews: Option<LatestReviews>,
+    reviews: Option<Reviews>,
     #[serde(rename = "reviewThreads")]
     review_threads: Option<ReviewThreads>,
     /// `MergeableState`: MERGEABLE | CONFLICTING | UNKNOWN. Only fetched by the
@@ -614,7 +649,23 @@ struct RepoNode {
 
 #[derive(Deserialize)]
 struct AuthorNode {
+    #[serde(rename = "__typename")]
+    kind: Option<String>,
     login: String,
+}
+
+#[derive(Deserialize)]
+struct Reviews {
+    nodes: Vec<ReviewNode>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReviewNode {
+    author: Option<AuthorNode>,
+    #[serde(rename = "bodyText")]
+    body_text: Option<String>,
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1542,6 +1593,51 @@ mod tests {
     }
 
     #[test]
+    fn node_to_pr_keeps_human_review_comments_without_threads() {
+        let json = r#"{
+            "number": 12,
+            "title": "Fix the thing",
+            "url": "https://github.com/o/r/pull/12",
+            "repository": { "nameWithOwner": "o/r" },
+            "author": { "login": "me" },
+            "reviews": { "nodes": [
+                {
+                    "author": { "__typename": "User", "login": "carol" },
+                    "bodyText": "Please skip the legacy flow.\nMore detail here.",
+                    "url": "https://github.com/o/r/pull/12#pullrequestreview-42"
+                },
+                {
+                    "author": { "__typename": "Bot", "login": "review-bot" },
+                    "bodyText": "Automated review passed",
+                    "url": "https://github.com/o/r/pull/12#pullrequestreview-43"
+                },
+                {
+                    "author": { "__typename": "User", "login": "dave" },
+                    "bodyText": "   ",
+                    "url": "https://github.com/o/r/pull/12#pullrequestreview-44"
+                }
+            ]},
+            "reviewThreads": { "nodes": [] }
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).expect("pr parsed");
+        assert_eq!(pr.unresolved_comments.len(), 1);
+        let comment = &pr.unresolved_comments[0];
+        assert_eq!(comment.kind, PrCommentKind::ReviewSummary);
+        assert_eq!(comment.author, "carol");
+        assert_eq!(comment.body, "Please skip the legacy flow.");
+        assert_eq!(
+            comment.url,
+            "https://github.com/o/r/pull/12#pullrequestreview-42"
+        );
+        assert_eq!(comment.path, None);
+        assert!(!comment.is_outdated);
+        assert!(pr.reviewers.iter().any(|reviewer| {
+            reviewer.login == "carol" && reviewer.state == ReviewState::Commented
+        }));
+    }
+
+    #[test]
     fn node_to_pr_skips_threads_without_first_comment_or_url() {
         let json = r#"{
             "number": 5,
@@ -1934,13 +2030,11 @@ mod tests {
     }
 
     #[test]
-    fn excerpt_takes_first_nonempty_line_and_truncates() {
-        assert_eq!(excerpt(""), "");
-        assert_eq!(excerpt("\n\n  hello  \nworld"), "hello");
+    fn first_nonempty_line_trims_but_does_not_truncate() {
+        assert_eq!(first_nonempty_line(""), "");
+        assert_eq!(first_nonempty_line("\n\n  hello  \nworld"), "hello");
         let long = "x".repeat(100);
-        let e = excerpt(&long);
-        assert_eq!(e.chars().count(), COMMENT_EXCERPT_MAX);
-        assert!(e.ends_with('…'));
+        assert_eq!(first_nonempty_line(&long), long);
     }
 
     /// Build an `Output` with the given exit code and stdout/stderr text. On

@@ -16,8 +16,8 @@ use chrono::{DateTime, Local, Utc};
 use crate::{
     app::{AppState, Msg},
     model::{
-        CheckState, CheckStatus, ChecksRollup, Pr, PrTreeNode, ReviewState, authored_tree,
-        checks_by_display_priority, group_by_repo,
+        CheckState, CheckStatus, ChecksRollup, Pr, PrCommentKind, PrTreeNode, ReviewState,
+        authored_tree, checks_by_display_priority, group_by_repo,
     },
     report::{
         self, ChecksSummary, Row, build_section_merged, checks_summary_text, reviewer_summary,
@@ -517,25 +517,50 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             };
             let _ = write!(
                 out,
-                "<li><span class=\"state\">{}</span> {} <span class=\"muted\">{} {}</span> <a class=\"row-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">PR</a></li>",
+                "<li><span class=\"state\">{}</span> {} <span class=\"muted\">{} {}</span> <a class=\"row-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">PR</a>",
                 review_state_symbol(reviewer.state),
                 escape(&reviewer.login),
                 review_state_label(reviewer.state),
                 reviewed,
                 escape(&pr.url)
             );
+            let review_comments: Vec<_> = pr
+                .unresolved_comments
+                .iter()
+                .filter(|comment| {
+                    comment.kind == PrCommentKind::ReviewSummary && comment.author == reviewer.login
+                })
+                .collect();
+            if !review_comments.is_empty() {
+                out.push_str("<ul class=\"review-comments\">");
+                for comment in review_comments {
+                    let _ = write!(
+                        out,
+                        "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a></li>",
+                        escape(&comment.url),
+                        escape(&comment.body)
+                    );
+                }
+                out.push_str("</ul>");
+            }
+            out.push_str("</li>");
         }
         out.push_str("</ul></details>");
     }
 
-    if !pr.unresolved_comments.is_empty() {
+    let thread_comments: Vec<_> = pr
+        .unresolved_comments
+        .iter()
+        .filter(|comment| comment.kind == PrCommentKind::Thread)
+        .collect();
+    if !thread_comments.is_empty() {
         let _ = write!(
             out,
             "<details class=\"pr-section comments\" data-state-key=\"{}\" open><summary>Open comments</summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
             escape(&section_state_key(pr, "comments")),
             escape(&pr.url)
         );
-        for comment in &pr.unresolved_comments {
+        for comment in thread_comments {
             let path = comment
                 .path
                 .as_deref()
@@ -830,13 +855,24 @@ mod tests {
             },
         ];
         parent.checks_rollup = ChecksRollup::Green;
-        parent.unresolved_comments = vec![PrComment {
-            author: "eve<img>".to_string(),
-            body: "say <hello> & goodbye".to_string(),
-            url: "https://comments.test/?q=\"x\"&a=1".to_string(),
-            path: Some("src/<bad>.rs".to_string()),
-            is_outdated: true,
-        }];
+        parent.unresolved_comments = vec![
+            PrComment {
+                kind: crate::model::PrCommentKind::Thread,
+                author: "eve<img>".to_string(),
+                body: "say <hello> & goodbye".to_string(),
+                url: "https://comments.test/?q=\"x\"&a=1".to_string(),
+                path: Some("src/<bad>.rs".to_string()),
+                is_outdated: true,
+            },
+            PrComment {
+                kind: crate::model::PrCommentKind::ReviewSummary,
+                author: "bob".to_string(),
+                body: "review summary <note>".to_string(),
+                url: "https://comments.test/review?a=1&b=2".to_string(),
+                path: None,
+                is_outdated: false,
+            },
+        ];
         let mut child = pr("z/repo", 2, "me", 10);
         child.base_ref = parent.head_ref.clone();
         WebSnapshot {
@@ -928,6 +964,8 @@ mod tests {
         assert!(html.contains("<details class=\"pr-section checks\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section reviewers\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section comments\" data-state-key="));
+        assert!(html.contains("<ul class=\"review-comments\">"));
+        assert!(html.contains("review summary &lt;note&gt;"));
         assert!(html.contains("<details class=\"pr-section stacked\" data-state-key="));
         assert!(html.contains("data-state-key=\"repo:z/repo:pr:1:section:checks\" open"));
         assert!(html.contains(

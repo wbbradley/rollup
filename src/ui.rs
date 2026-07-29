@@ -3,14 +3,14 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph},
 };
 
 use crate::{
     app::{AppState, AuthoredSearch, Focus, ViewMode},
     model::{
-        CheckState, CheckStatus, ChecksRollup, Pr, PrComment, ReleaseInfo, ReviewState,
-        ReviewerStatus, TagInfo, human_age,
+        CheckState, CheckStatus, ChecksRollup, Pr, PrComment, PrCommentKind, ReleaseInfo,
+        ReviewState, ReviewerStatus, TagInfo, human_age,
     },
     report::{self, ChecksSummary, ReviewerSummaryToken, Row, Section, SectionId},
 };
@@ -126,10 +126,10 @@ fn draw_section(
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let inner_h = block.inner(area).height as usize;
+    let inner = block.inner(area);
+    let inner_h = inner.height as usize;
 
     if section.rows.is_empty() {
-        let inner = block.inner(area);
         f.render_widget(block, area);
         let msg = Paragraph::new(Span::styled(
             section.empty_message.unwrap_or(""),
@@ -145,7 +145,13 @@ fn draw_section(
         if row.is_selectable() {
             row_of_sel.push(items.len());
         }
-        items.push(render_list_item(row));
+        // Reserve a stable two-column selection gutter for every row. Comment
+        // truncation can then use the rest of the pane exactly, whether or not
+        // the row is currently selected.
+        items.push(render_list_item(
+            row,
+            inner.width.saturating_sub(2) as usize,
+        ));
     }
 
     let highlighted_row = row_of_sel.get(selection).copied();
@@ -164,13 +170,14 @@ fn draw_section(
     let list = List::new(items)
         .block(block)
         .highlight_style(highlight_style)
-        .highlight_symbol(if focused { "▶ " } else { "  " });
+        .highlight_symbol(if focused { "▶ " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always);
 
     f.render_stateful_widget(list, area, list_state);
     inner_h
 }
 
-fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
+fn render_list_item(row: &Row<'_>, width: usize) -> ListItem<'static> {
     match row {
         Row::RepoHeader { repo, expanded } => {
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -216,7 +223,7 @@ fn render_list_item(row: &Row<'_>) -> ListItem<'static> {
             checks.as_ref(),
             tree_prefix,
         )),
-        Row::Comment { c, tree_prefix } => ListItem::new(comment_line(c, tree_prefix)),
+        Row::Comment { c, tree_prefix } => ListItem::new(comment_line(c, tree_prefix, width)),
         Row::Check { c, tree_prefix } => ListItem::new(check_line(c, tree_prefix)),
         Row::MergedPr { pr, now } => ListItem::new(merged_pr_line(pr, *now)),
         Row::ReleaseEntry { release, now } => ListItem::new(release_entry_line(release, *now)),
@@ -298,9 +305,9 @@ fn draw_merged_pane(f: &mut Frame, area: Rect, section: &Section<'_>) {
         .title(title_line)
         .borders(Borders::ALL)
         .border_style(border_style);
+    let inner = block.inner(area);
 
     if section.rows.is_empty() {
-        let inner = block.inner(area);
         f.render_widget(block, area);
         let msg = Paragraph::new(Span::styled(
             section.empty_message.unwrap_or(""),
@@ -310,7 +317,11 @@ fn draw_merged_pane(f: &mut Frame, area: Rect, section: &Section<'_>) {
         return;
     }
 
-    let items: Vec<ListItem> = section.rows.iter().map(render_list_item).collect();
+    let items: Vec<ListItem> = section
+        .rows
+        .iter()
+        .map(|row| render_list_item(row, inner.width as usize))
+        .collect();
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
@@ -537,18 +548,18 @@ fn summary_token_style(token: ReviewerSummaryToken) -> Style {
     }
 }
 
-fn comment_line(c: &PrComment, tree_prefix: &str) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(
-            tree_prefix.to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
+fn comment_line(c: &PrComment, tree_prefix: &str, width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        tree_prefix.to_string(),
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    if c.kind == PrCommentKind::Thread {
+        spans.push(Span::styled(
             format!("@{} ", c.author),
             Style::default().fg(color_for_login(&c.author)),
-        ),
-        Span::raw(c.body.clone()),
-    ];
+        ));
+    }
+    spans.push(Span::raw(c.body.clone()));
     if let Some(path) = &c.path {
         spans.push(Span::styled(
             format!(" ({path})"),
@@ -561,7 +572,42 @@ fn comment_line(c: &PrComment, tree_prefix: &str) -> Line<'static> {
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
-    Line::from(spans)
+    truncate_line(Line::from(spans), width)
+}
+
+/// Truncate a styled line to exactly `width` display columns, adding an
+/// ellipsis only when content actually overflows. Styling is retained for the
+/// visible portion of every span.
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    if width == 0 {
+        return Line::default();
+    }
+
+    let content_budget = width - 1;
+    let mut used = 0;
+    let mut visible = Vec::new();
+    'spans: for span in line.spans {
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let char_width = Span::raw(ch.to_string()).width();
+            if used + char_width > content_budget {
+                if !text.is_empty() {
+                    visible.push(Span::styled(text, span.style));
+                }
+                break 'spans;
+            }
+            text.push(ch);
+            used += char_width;
+        }
+        if !text.is_empty() {
+            visible.push(Span::styled(text, span.style));
+        }
+    }
+    visible.push(Span::raw("…"));
+    Line::from(visible)
 }
 
 fn color_for_login(login: &str) -> Color {
@@ -681,5 +727,55 @@ mod tests {
             empty.spans.last().unwrap().content.as_ref(),
             "Improve rendering"
         );
+    }
+
+    #[test]
+    fn comment_line_uses_available_width_before_ellipsizing() {
+        let body = "x".repeat(100);
+        let comment = PrComment {
+            kind: crate::model::PrCommentKind::Thread,
+            author: "alice".to_string(),
+            body: body.clone(),
+            url: "https://example.test/review".to_string(),
+            path: None,
+            is_outdated: false,
+        };
+
+        let narrow = comment_line(&comment, "└─ ", 80);
+        let narrow_text: String = narrow
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(narrow.width(), 80);
+        assert!(narrow_text.ends_with('…'));
+
+        let wide = comment_line(&comment, "└─ ", 140);
+        let wide_text: String = wide
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(wide_text.ends_with(&body));
+        assert!(!wide_text.ends_with('…'));
+    }
+
+    #[test]
+    fn review_summary_line_omits_redundant_author() {
+        let comment = PrComment {
+            kind: PrCommentKind::ReviewSummary,
+            author: "alice".to_string(),
+            body: "Please skip the legacy flow".to_string(),
+            url: "https://example.test/review".to_string(),
+            path: None,
+            is_outdated: false,
+        };
+        let line = comment_line(&comment, "   └─ ", 80);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "   └─ Please skip the legacy flow");
     }
 }
