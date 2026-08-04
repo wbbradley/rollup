@@ -48,6 +48,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, web_address: &str) {
                 state.authored_sel,
                 &mut state.authored_list_state,
                 true,
+                state.loading,
             );
         }
         ViewMode::Radar => {
@@ -65,6 +66,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, web_address: &str) {
                 state.reviewing_sel,
                 &mut state.reviewing_list_state,
                 focus == Focus::Reviewing,
+                state.loading,
             );
             let mut releases_section =
                 report::build_section_releases(&state.releases, chrono::Utc::now());
@@ -78,6 +80,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, web_address: &str) {
                 state.releases_sel,
                 &mut state.releases_list_state,
                 focus == Focus::Releases,
+                false,
             );
         }
     }
@@ -111,6 +114,7 @@ fn draw_section(
     selection: usize,
     list_state: &mut ListState,
     focused: bool,
+    loading: bool,
 ) -> usize {
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -121,10 +125,13 @@ fn draw_section(
         Some(sub) => format!(" {} ({}, {}) ", section.title, section.count, sub),
         None => format!(" {} ({}) ", section.title, section.count),
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .title(title_line)
         .borders(Borders::ALL)
         .border_style(border_style);
+    if loading {
+        block = block.title_top(loading_title_line());
+    }
 
     let inner = block.inner(area);
     let inner_h = inner.height as usize;
@@ -635,6 +642,16 @@ fn spinner_frame() -> &'static str {
     FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
+fn loading_title_line() -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {} Loading… ", spinner_frame()),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .right_aligned()
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, web_address: &str) {
     f.render_widget(Paragraph::new(footer_line(state, web_address)), area);
 }
@@ -657,13 +674,6 @@ fn footer_line(state: &AppState, web_address: &str) -> Line<'static> {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
-    } else if state.loading {
-        Span::styled(
-            format!("{} Loading…", spinner_frame()),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
     } else if let Some(at) = state.loaded_at {
         Span::styled(
             format!(
@@ -680,9 +690,9 @@ fn footer_line(state: &AppState, web_address: &str) -> Line<'static> {
 
     let hint = match (&state.mode, &state.authored_search) {
         (ViewMode::Me, AuthoredSearch::Filtered(query)) => format!(
-            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open · c copy   "
+            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open · c copy · v resolve   "
         ),
-        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · c copy · p review · e radar · r refresh · q quit   ".to_string(),
+        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · c copy · p review · v resolve · e radar · r refresh · q quit   ".to_string(),
         (ViewMode::Radar, _) => "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   ".to_string(),
     };
     Line::from(vec![
@@ -769,6 +779,7 @@ mod tests {
         let body = "x".repeat(100);
         let comment = PrComment {
             kind: crate::model::PrCommentKind::Thread,
+            thread_id: Some("thread-1".to_string()),
             author: "alice".to_string(),
             body: body.clone(),
             url: "https://example.test/review".to_string(),
@@ -799,6 +810,7 @@ mod tests {
     fn review_summary_line_omits_redundant_author() {
         let comment = PrComment {
             kind: PrCommentKind::ReviewSummary,
+            thread_id: None,
             author: "alice".to_string(),
             body: "Please skip the legacy flow".to_string(),
             url: "https://example.test/review".to_string(),
@@ -830,6 +842,7 @@ mod tests {
         };
 
         assert_address(&state); // loading
+        assert!(!line_text(footer_line(&state, address)).contains("Loading"));
         state.loading = false;
         assert_address(&state); // normal
         state.status = Some("refreshed".into());
@@ -847,5 +860,12 @@ mod tests {
             line_text(footer_line(&state, address)),
             "web localhost:7011 · inc search: need"
         );
+    }
+
+    #[test]
+    fn loading_indicator_is_a_right_aligned_title() {
+        let title = loading_title_line();
+        assert_eq!(title.alignment, Some(ratatui::layout::Alignment::Right));
+        assert!(line_text(title).contains("Loading…"));
     }
 }

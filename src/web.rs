@@ -890,6 +890,7 @@ mod tests {
         parent.unresolved_comments = vec![
             PrComment {
                 kind: crate::model::PrCommentKind::Thread,
+                thread_id: Some("thread-1".to_string()),
                 author: "eve<img>".to_string(),
                 body: "say <hello> & goodbye".to_string(),
                 url: "https://comments.test/?q=\"x\"&a=1".to_string(),
@@ -898,6 +899,7 @@ mod tests {
             },
             PrComment {
                 kind: crate::model::PrCommentKind::ReviewSummary,
+                thread_id: None,
                 author: "bob".to_string(),
                 body: "review summary <note>".to_string(),
                 url: "https://comments.test/review?a=1&b=2".to_string(),

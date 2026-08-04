@@ -141,6 +141,9 @@ pub enum PrCommentKind {
 #[derive(Debug, Clone)]
 pub struct PrComment {
     pub kind: PrCommentKind,
+    /// GitHub GraphQL node ID for an inline review thread. Present only for
+    /// `Thread` comments; review summaries have no resolvable thread.
+    pub thread_id: Option<String>,
     pub author: String,
     /// Full first non-empty line of the comment body; renderers truncate it to
     /// their available width.

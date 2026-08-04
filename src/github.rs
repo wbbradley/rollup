@@ -75,6 +75,7 @@ fragment AuthoredPrFields on PullRequest {
   }
   reviewThreads(first: 50) {
     nodes {
+      id
       isResolved
       isOutdated
       comments(first: 1) {
@@ -202,6 +203,70 @@ pub fn remove_user_reviewer(owner: &str, repo: &str, pr_number: u64, login: &str
 
 pub fn remove_team_reviewer(owner: &str, repo: &str, pr_number: u64, team: &str) -> Result<()> {
     remove_reviewer_impl(owner, repo, pr_number, "team_reviewers[]", team)
+}
+
+const RESOLVE_REVIEW_THREAD_MUTATION: &str = r#"
+mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}
+"#;
+
+pub fn resolve_review_thread(thread_id: &str) -> Result<()> {
+    let field = format!("threadId={thread_id}");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={RESOLVE_REVIEW_THREAD_MUTATION}"),
+            "-f",
+            &field,
+        ])
+        .output()
+        .context("failed to invoke gh")?;
+    let (data, warnings) = parse_graphql::<ResolveReviewThreadData>(&output, "resolve-thread")?;
+    confirm_resolved_review_thread(thread_id, data, warnings)
+}
+
+fn confirm_resolved_review_thread(
+    thread_id: &str,
+    data: ResolveReviewThreadData,
+    warnings: Vec<String>,
+) -> Result<()> {
+    let resolved = data
+        .resolve_review_thread
+        .and_then(|payload| payload.thread)
+        .is_some_and(|thread| thread.id == thread_id && thread.is_resolved);
+    if resolved {
+        Ok(())
+    } else {
+        let detail = if warnings.is_empty() {
+            "GitHub did not confirm the thread was resolved".to_string()
+        } else {
+            warnings.join("; ")
+        };
+        Err(anyhow!("gh resolve review thread failed: {detail}"))
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolveReviewThreadData {
+    #[serde(rename = "resolveReviewThread")]
+    resolve_review_thread: Option<ResolveReviewThreadPayload>,
+}
+
+#[derive(Deserialize)]
+struct ResolveReviewThreadPayload {
+    thread: Option<ResolvedReviewThread>,
+}
+
+#[derive(Deserialize)]
+struct ResolvedReviewThread {
+    id: String,
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
 }
 
 fn remove_reviewer_impl(
@@ -473,6 +538,7 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
             }
             unresolved_comments.push(PrComment {
                 kind: PrCommentKind::ReviewSummary,
+                thread_id: None,
                 author: author.login,
                 body: first_nonempty_line(&body),
                 url,
@@ -496,6 +562,7 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
             let path = comment.path.filter(|p| !p.is_empty());
             unresolved_comments.push(PrComment {
                 kind: PrCommentKind::Thread,
+                thread_id: thread.id,
                 author: comment
                     .author
                     .map(|a| a.login)
@@ -619,6 +686,7 @@ struct ReviewThreads {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ReviewThreadNode {
+    id: Option<String>,
     #[serde(rename = "isResolved")]
     is_resolved: bool,
     #[serde(rename = "isOutdated")]
@@ -1541,6 +1609,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_review_thread_mutation_uses_thread_id_and_confirms_resolution() {
+        assert!(RESOLVE_REVIEW_THREAD_MUTATION.contains("$threadId: ID!"));
+        assert!(RESOLVE_REVIEW_THREAD_MUTATION.contains("resolveReviewThread"));
+        let data: ResolveReviewThreadData = serde_json::from_str(
+            r#"{
+                "resolveReviewThread": {
+                    "thread": { "id": "PRRT_1", "isResolved": true }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(confirm_resolved_review_thread("PRRT_1", data, vec![]).is_ok());
+    }
+
+    #[test]
+    fn resolve_review_thread_rejects_unconfirmed_or_mismatched_responses() {
+        for response in [
+            r#"{
+                "resolveReviewThread": {
+                    "thread": { "id": "PRRT_1", "isResolved": false }
+                }
+            }"#,
+            r#"{
+                "resolveReviewThread": {
+                    "thread": { "id": "PRRT_other", "isResolved": true }
+                }
+            }"#,
+            r#"{ "resolveReviewThread": { "thread": null } }"#,
+        ] {
+            let data: ResolveReviewThreadData = serde_json::from_str(response).unwrap();
+            let error = confirm_resolved_review_thread("PRRT_1", data, vec![]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("GitHub did not confirm the thread was resolved")
+            );
+        }
+    }
+
+    #[test]
     fn node_to_pr_keeps_unresolved_threads_including_outdated() {
         // Three threads: resolved (dropped), unresolved (kept), and
         // unresolved+outdated (kept with the [outdated] flag).
@@ -1552,6 +1660,7 @@ mod tests {
             "author": { "login": "me" },
             "reviewThreads": { "nodes": [
                 {
+                    "id": "PRRT_resolved",
                     "isResolved": true,
                     "isOutdated": false,
                     "comments": { "nodes": [
@@ -1559,6 +1668,7 @@ mod tests {
                     ]}
                 },
                 {
+                    "id": "PRRT_current",
                     "isResolved": false,
                     "isOutdated": false,
                     "comments": { "nodes": [
@@ -1566,6 +1676,7 @@ mod tests {
                     ]}
                 },
                 {
+                    "id": "PRRT_outdated",
                     "isResolved": false,
                     "isOutdated": true,
                     "comments": { "nodes": [
@@ -1582,11 +1693,13 @@ mod tests {
         assert_eq!(carol.author, "carol");
         assert_eq!(carol.body, "add a test here");
         assert_eq!(carol.url, "https://x/2");
+        assert_eq!(carol.thread_id.as_deref(), Some("PRRT_current"));
         assert_eq!(carol.path.as_deref(), Some("src/foo.rs"));
         assert!(!carol.is_outdated);
 
         let dave = &pr.unresolved_comments[1];
         assert_eq!(dave.author, "dave");
+        assert_eq!(dave.thread_id.as_deref(), Some("PRRT_outdated"));
         assert!(dave.is_outdated);
         // Empty path collapses to None.
         assert_eq!(dave.path, None);
@@ -1631,6 +1744,7 @@ mod tests {
             "https://github.com/o/r/pull/12#pullrequestreview-42"
         );
         assert_eq!(comment.path, None);
+        assert_eq!(comment.thread_id, None);
         assert!(!comment.is_outdated);
         assert!(pr.reviewers.iter().any(|reviewer| {
             reviewer.login == "carol" && reviewer.state == ReviewState::Commented

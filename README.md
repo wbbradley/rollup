@@ -71,6 +71,7 @@ a later refresh fails. `rollup report` does not start the listener.
 | `/`             | Incrementally search/filter the Authored tree (Me view) |
 | `Enter`         | Open the selected PR (or comment / check details / repo / release/tag page) in your browser |
 | `c`             | Copy one aggregate agent prompt for the selected Authored node's subtree — every unresolved comment and failing check it contains, grouped per PR (a PR includes its whole stack; a Stacked PRs header only its descendants; a repo header every PR in the repo) (Me view) |
+| `v`             | Resolve every outdated inline comment in the selected Authored scope, then refresh |
 | `x`             | Remove the selected reviewer from the PR              |
 | `r`             | Refresh                                               |
 | `Esc`           | Cancel/clear Authored search, or return to Me from Radar |
@@ -168,6 +169,14 @@ spans several. The section shape also appears in `rollup report`, with every
 section expanded so all details are visible (and with text tokens in the
 summary); `rollup report` and the web UI have no keybindings, so the `c`
 aggregation is TUI-only.
+
+Pressing `v` resolves outdated inline review threads within the selected scope.
+An outdated comment resolves just itself; **Open comments** covers its PR; a PR
+row covers that PR and its complete stack; **Stacked PRs** covers descendants
+only; and a repo header covers every PR in the repo. Current (non-outdated)
+threads and review-summary comments are never changed. Successful or partial
+resolution triggers a refresh, so resolved threads disappear from **Open
+comments**. This mutation is TUI-only.
 
 Press `/` in the Me view to start an incremental Authored-tree search. The
 footer changes to `inc search: <query>`, and every printable character or

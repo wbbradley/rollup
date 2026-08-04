@@ -1864,6 +1864,7 @@ mod tests {
     fn comment(author: &str, body: &str, path: Option<&str>, is_outdated: bool) -> PrComment {
         PrComment {
             kind: crate::model::PrCommentKind::Thread,
+            thread_id: Some(format!("thread:{author}:{body}")),
             author: author.to_string(),
             body: body.to_string(),
             url: format!("https://github.com/o/r/pull/1#discussion_r_{author}"),

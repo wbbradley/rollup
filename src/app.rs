@@ -83,8 +83,18 @@ impl AuthoredSearch {
 
 pub enum Msg {
     Fetched(Result<Data>),
-    Action { label: String, result: Result<()> },
-    WebRefresh { acknowledged: Sender<()> },
+    Action {
+        label: String,
+        result: Result<()>,
+    },
+    OutdatedCommentsResolved {
+        requested: usize,
+        resolved: usize,
+        errors: Vec<String>,
+    },
+    WebRefresh {
+        acknowledged: Sender<()>,
+    },
 }
 
 pub struct AppState {
@@ -99,6 +109,10 @@ pub struct AppState {
     pub error: Option<String>,
     pub status: Option<String>,
     pub loading: bool,
+    /// A mutation completed successfully while an older fetch was still in
+    /// flight. Launch one more fetch when that one finishes so its stale
+    /// snapshot cannot make the completed mutation appear to be undone.
+    refresh_after_current: bool,
     pub focus: Focus,
     pub mode: ViewMode,
     pub authored_sel: usize,
@@ -138,6 +152,7 @@ impl AppState {
             error: None,
             status: None,
             loading: true,
+            refresh_after_current: false,
             focus: Focus::Authored,
             mode: ViewMode::Me,
             authored_sel: 0,
@@ -651,6 +666,7 @@ fn run_app(
                         }
                         KeyCode::Char('x') => remove_selected_reviewer(&mut state, tx),
                         KeyCode::Char('c') => copy_prompt(&mut state),
+                        KeyCode::Char('v') => resolve_selected_outdated_comments(&mut state, tx),
                         KeyCode::Char('l') | KeyCode::Right => toggle_section(&mut state, true),
                         KeyCode::Char('h') | KeyCode::Left => toggle_section(&mut state, false),
                         _ => {}
@@ -762,10 +778,16 @@ where
         match msg {
             Msg::Fetched(Ok(data)) => {
                 state.apply(data);
+                if std::mem::take(&mut state.refresh_after_current) {
+                    launched_refresh |= request_refresh(state, web_snapshots, || launch_fetch(tx));
+                }
                 changed = true;
             }
             Msg::Fetched(Err(e)) => {
                 state.fail(format!("{e:#}"));
+                if std::mem::take(&mut state.refresh_after_current) {
+                    launched_refresh |= request_refresh(state, web_snapshots, || launch_fetch(tx));
+                }
                 changed = true;
             }
             Msg::Action { label, result } => match result {
@@ -779,6 +801,31 @@ where
                     changed = true;
                 }
             },
+            Msg::OutdatedCommentsResolved {
+                requested,
+                resolved,
+                errors,
+            } => {
+                state.status = Some(if errors.is_empty() {
+                    format!(
+                        "v: resolved {resolved} outdated comment{}",
+                        if resolved == 1 { "" } else { "s" }
+                    )
+                } else if resolved > 0 {
+                    format!(
+                        "v: resolved {resolved}/{requested}; {} failed: {}",
+                        errors.len(),
+                        errors[0]
+                    )
+                } else {
+                    format!("v: resolve failed: {}", errors[0])
+                });
+                if resolved > 0 {
+                    launched_refresh |=
+                        refresh_after_action(state, web_snapshots, || launch_fetch(tx));
+                }
+                changed = true;
+            }
             Msg::WebRefresh { acknowledged } => {
                 let launched = request_refresh(state, web_snapshots, || launch_fetch(tx));
                 changed |= launched;
@@ -813,6 +860,25 @@ where
     web_snapshots.publish(web::WebSnapshot::from_app(state));
     launch_fetch();
     true
+}
+
+/// Refresh after a successful mutation. Unlike an ordinary user-requested
+/// refresh, this must not be dropped when a fetch is already in flight: that
+/// fetch began before the mutation completed and may contain stale state.
+fn refresh_after_action<F>(
+    state: &mut AppState,
+    web_snapshots: &web::SnapshotStore,
+    launch_fetch: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    if state.loading {
+        state.refresh_after_current = true;
+        false
+    } else {
+        request_refresh(state, web_snapshots, launch_fetch)
+    }
 }
 
 fn spawn_fetch(tx: &Sender<Msg>) {
@@ -986,6 +1052,130 @@ fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
         };
         let _ = tx.send(Msg::Action { label, result });
     });
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewThreadTarget {
+    id: String,
+    url: String,
+}
+
+fn outdated_threads_on_pr(pr: &Pr) -> Vec<ReviewThreadTarget> {
+    pr.unresolved_comments
+        .iter()
+        .filter_map(|comment| {
+            if comment.kind != PrCommentKind::Thread || !comment.is_outdated {
+                return None;
+            }
+            comment.thread_id.as_ref().map(|id| ReviewThreadTarget {
+                id: id.clone(),
+                url: comment.url.clone(),
+            })
+        })
+        .collect()
+}
+
+fn gather_outdated_threads(node: &PrTreeNode<'_>) -> Vec<ReviewThreadTarget> {
+    let mut targets = outdated_threads_on_pr(node.pr);
+    for child in &node.children {
+        targets.extend(gather_outdated_threads(child));
+    }
+    targets
+}
+
+fn gather_child_outdated_threads(node: &PrTreeNode<'_>) -> Vec<ReviewThreadTarget> {
+    node.children
+        .iter()
+        .flat_map(gather_outdated_threads)
+        .collect()
+}
+
+/// Resolve the current Authored selection to its outdated inline-review
+/// threads. Container scopes follow `c`/`p`: a PR includes its complete stack,
+/// Stacked PRs includes descendants only, and a repo includes every PR.
+fn selected_outdated_threads(state: &AppState) -> Vec<ReviewThreadTarget> {
+    let section = state.authored_section();
+    let Some(selected) = selected_row(&section.rows, state.authored_sel) else {
+        return Vec::new();
+    };
+    match selected {
+        Selected::Comment(_, comment) => comment
+            .thread_id
+            .as_ref()
+            .filter(|_| comment.kind == PrCommentKind::Thread && comment.is_outdated)
+            .map(|id| {
+                vec![ReviewThreadTarget {
+                    id: id.clone(),
+                    url: comment.url.clone(),
+                }]
+            })
+            .unwrap_or_default(),
+        Selected::Section(pr, SectionId::Comments) => outdated_threads_on_pr(pr),
+        Selected::Pr(pr) => {
+            let tree = repo_tree(&state.authored, &pr.repo);
+            find_node(&tree, &pr.repo, pr.number)
+                .map(gather_outdated_threads)
+                .unwrap_or_default()
+        }
+        Selected::Section(pr, SectionId::Stacked) => {
+            let tree = repo_tree(&state.authored, &pr.repo);
+            find_node(&tree, &pr.repo, pr.number)
+                .map(gather_child_outdated_threads)
+                .unwrap_or_default()
+        }
+        Selected::Repo(repo) => repo_tree(&state.authored, &repo)
+            .iter()
+            .flat_map(gather_outdated_threads)
+            .collect(),
+        Selected::Reviewer(_, _) | Selected::Check(_, _) | Selected::Section(_, _) => Vec::new(),
+    }
+}
+
+fn resolve_selected_outdated_comments(state: &mut AppState, tx: &Sender<Msg>) {
+    if state.mode != ViewMode::Me {
+        return;
+    }
+    let targets = selected_outdated_threads(state);
+    if targets.is_empty() {
+        state.status = Some("v: no outdated comments in selection".to_string());
+        return;
+    }
+
+    let requested = targets.len();
+    state.status = Some(format!(
+        "v: resolving {requested} outdated comment{}…",
+        if requested == 1 { "" } else { "s" }
+    ));
+    let tx = tx.clone();
+    thread::spawn(move || {
+        let (resolved, errors) = resolve_thread_targets(targets, github::resolve_review_thread);
+        let _ = tx.send(Msg::OutdatedCommentsResolved {
+            requested,
+            resolved,
+            errors,
+        });
+    });
+}
+
+/// Run a mutation batch to completion, retaining per-thread context for every
+/// failure. Kept separate from the worker-thread launcher so complete and
+/// partial failures can be tested without invoking `gh`.
+fn resolve_thread_targets<F>(
+    targets: Vec<ReviewThreadTarget>,
+    mut resolve: F,
+) -> (usize, Vec<String>)
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let mut resolved = 0;
+    let mut errors = Vec::new();
+    for target in targets {
+        match resolve(&target.id) {
+            Ok(()) => resolved += 1,
+            Err(error) => errors.push(format!("{}: {error:#}", target.url)),
+        }
+    }
+    (resolved, errors)
 }
 
 /// The actionable items gathered from a single PR for the aggregate copy
@@ -1379,6 +1569,7 @@ mod tests {
             merged_at: None,
             unresolved_comments: vec![PrComment {
                 kind: crate::model::PrCommentKind::Thread,
+                thread_id: Some("thread-1".to_string()),
                 author: "carol".to_string(),
                 body: "add a test here".to_string(),
                 url: "https://github.com/o/r/pull/12#discussion_r1".to_string(),
@@ -1849,6 +2040,100 @@ mod tests {
     }
 
     #[test]
+    fn resolved_outdated_comment_message_refreshes_after_partial_success() {
+        let mut state = AppState::new();
+        state.loading = false;
+        let snapshots = web::SnapshotStore::new();
+        let (tx, rx) = mpsc::channel::<Msg>();
+        tx.send(Msg::OutdatedCommentsResolved {
+            requested: 2,
+            resolved: 1,
+            errors: vec!["https://x/2: denied".into()],
+        })
+        .unwrap();
+        let launches = Cell::new(0);
+
+        let drained = drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
+            launches.set(launches.get() + 1);
+        });
+        assert!(drained.changed);
+        assert!(drained.launched_refresh);
+        assert_eq!(launches.get(), 1);
+        assert_eq!(
+            state.status.as_deref(),
+            Some("v: resolved 1/2; 1 failed: https://x/2: denied")
+        );
+    }
+
+    #[test]
+    fn totally_failed_outdated_comment_batch_does_not_refresh() {
+        let mut state = AppState::new();
+        state.loading = false;
+        let snapshots = web::SnapshotStore::new();
+        let (tx, rx) = mpsc::channel::<Msg>();
+        tx.send(Msg::OutdatedCommentsResolved {
+            requested: 2,
+            resolved: 0,
+            errors: vec!["https://x/1: denied".into(), "https://x/2: denied".into()],
+        })
+        .unwrap();
+        let launches = Cell::new(0);
+
+        let drained = drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
+            launches.set(launches.get() + 1);
+        });
+        assert!(drained.changed);
+        assert!(!drained.launched_refresh);
+        assert_eq!(launches.get(), 0);
+        assert_eq!(
+            state.status.as_deref(),
+            Some("v: resolve failed: https://x/1: denied")
+        );
+    }
+
+    #[test]
+    fn successful_resolution_queues_refresh_behind_an_in_flight_fetch() {
+        let mut state = AppState::new();
+        let snapshots = web::SnapshotStore::new();
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let launches = Cell::new(0);
+        tx.send(Msg::OutdatedCommentsResolved {
+            requested: 1,
+            resolved: 1,
+            errors: vec![],
+        })
+        .unwrap();
+
+        let first = drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
+            launches.set(launches.get() + 1);
+        });
+        assert!(first.changed);
+        assert!(!first.launched_refresh);
+        assert!(state.loading);
+        assert!(state.refresh_after_current);
+        assert_eq!(launches.get(), 0);
+
+        tx.send(Msg::Fetched(Ok(Data {
+            viewer: "me".into(),
+            authored: vec![],
+            reviewing: vec![],
+            merged: vec![],
+            releases: vec![],
+            config_error: None,
+            warnings: vec![],
+        })))
+        .unwrap();
+        let second = drain_msgs(&rx, &mut state, &tx, &snapshots, &mut |_| {
+            launches.set(launches.get() + 1);
+        });
+        assert!(second.changed);
+        assert!(second.launched_refresh);
+        assert!(state.loading);
+        assert!(!state.refresh_after_current);
+        assert_eq!(launches.get(), 1);
+    }
+
+    #[test]
     fn shared_refresh_transition_publishes_loading_and_is_single_flight() {
         let mut state = AppState::new();
         state.loading = false;
@@ -1915,12 +2200,12 @@ mod tests {
             AuthoredSearch::Editing(String::new())
         );
 
-        for character in ['q', 'r', 'p', 'e', 'j'] {
+        for character in ['q', 'r', 'p', 'e', 'j', 'v'] {
             assert!(press(&mut state, KeyCode::Char(character)));
         }
         assert_eq!(
             state.authored_search,
-            AuthoredSearch::Editing("qrpej".into())
+            AuthoredSearch::Editing("qrpejv".into())
         );
         assert_eq!(state.mode, ViewMode::Me);
         assert!(!state.loading);
@@ -2078,12 +2363,177 @@ mod tests {
     fn comment(url: &str) -> PrComment {
         PrComment {
             kind: crate::model::PrCommentKind::Thread,
+            thread_id: Some(format!("thread:{url}")),
             author: "carol".to_string(),
             body: "add a test".to_string(),
             url: url.to_string(),
             path: None,
             is_outdated: false,
         }
+    }
+
+    fn outdated_comment(url: &str) -> PrComment {
+        let mut comment = comment(url);
+        comment.is_outdated = true;
+        comment
+    }
+
+    fn target_ids(targets: Vec<ReviewThreadTarget>) -> Vec<String> {
+        targets.into_iter().map(|target| target.id).collect()
+    }
+
+    #[test]
+    fn outdated_comment_resolution_scopes_follow_the_authored_tree() {
+        let mut state = stacked_state();
+        state.authored[0].unresolved_comments = vec![
+            outdated_comment("https://x/#root"),
+            comment("https://x/#current"),
+        ];
+        state.authored[1].unresolved_comments = vec![outdated_comment("https://x/#child")];
+        state.authored[2].unresolved_comments = vec![outdated_comment("https://x/#sibling")];
+
+        let section = state.authored_section();
+        let repo = sel_where(&section, |selected| matches!(selected, Selected::Repo(_)));
+        let root = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Pr(pr) if pr.number == 1),
+        );
+        let comments = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Section(pr, SectionId::Comments) if pr.number == 1),
+        );
+        let root_comment = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Comment(_, comment) if comment.url == "https://x/#root"),
+        );
+        let stacked = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Section(pr, SectionId::Stacked) if pr.number == 1),
+        );
+        let root_check = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Check(pr, _) if pr.number == 1),
+        );
+        drop(section);
+
+        state.authored_sel = root_comment;
+        assert_eq!(
+            target_ids(selected_outdated_threads(&state)),
+            vec!["thread:https://x/#root"]
+        );
+        state.authored_sel = comments;
+        assert_eq!(
+            target_ids(selected_outdated_threads(&state)),
+            vec!["thread:https://x/#root"]
+        );
+        state.authored_sel = stacked;
+        assert_eq!(
+            target_ids(selected_outdated_threads(&state)),
+            vec!["thread:https://x/#child"]
+        );
+        state.authored_sel = root_check;
+        assert!(selected_outdated_threads(&state).is_empty());
+        state.authored_sel = repo;
+        assert_eq!(
+            target_ids(selected_outdated_threads(&state)),
+            vec![
+                "thread:https://x/#root",
+                "thread:https://x/#child",
+                "thread:https://x/#sibling"
+            ]
+        );
+
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Subtree, false);
+        let section = state.authored_section();
+        let collapsed_root = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Pr(pr) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = collapsed_root;
+        assert_eq!(state.authored_sel, root);
+        assert_eq!(
+            target_ids(selected_outdated_threads(&state)),
+            vec!["thread:https://x/#root", "thread:https://x/#child"]
+        );
+
+        state.authored_search = AuthoredSearch::Filtered("second".into());
+        let section = state.authored_section();
+        let filtered_root = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Pr(pr) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = filtered_root;
+        assert_eq!(
+            target_ids(selected_outdated_threads(&state)),
+            vec!["thread:https://x/#root", "thread:https://x/#child"]
+        );
+    }
+
+    #[test]
+    fn resolution_excludes_current_review_summary_and_unidentified_threads() {
+        let mut pr = simple_pr(1, "main", "a", vec![]);
+        pr.unresolved_comments = vec![
+            comment("https://x/#current"),
+            PrComment {
+                kind: PrCommentKind::ReviewSummary,
+                thread_id: Some("not-a-thread".into()),
+                author: "reviewer".into(),
+                body: "summary".into(),
+                url: "https://x/#summary".into(),
+                path: None,
+                is_outdated: true,
+            },
+            PrComment {
+                thread_id: None,
+                ..outdated_comment("https://x/#missing-id")
+            },
+            outdated_comment("https://x/#eligible"),
+        ];
+        assert_eq!(
+            target_ids(outdated_threads_on_pr(&pr)),
+            vec!["thread:https://x/#eligible"]
+        );
+    }
+
+    #[test]
+    fn resolution_batch_attempts_every_target_after_failures() {
+        let targets = ["one", "two", "three"]
+            .into_iter()
+            .map(|id| ReviewThreadTarget {
+                id: id.into(),
+                url: format!("https://x/{id}"),
+            })
+            .collect();
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let (resolved, errors) = resolve_thread_targets(targets, |id| {
+            attempted.borrow_mut().push(id.to_string());
+            if id == "two" {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("denied"))
+            }
+        });
+
+        assert_eq!(&*attempted.borrow(), &["one", "two", "three"]);
+        assert_eq!(resolved, 1);
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].starts_with("https://x/one: denied"));
+        assert!(errors[1].starts_with("https://x/three: denied"));
+    }
+
+    #[test]
+    fn resolve_key_reports_when_selection_has_no_outdated_comments() {
+        let mut state = me_state(vec![simple_pr(1, "main", "a", vec![])]);
+        state.authored_sel = 1;
+        let (tx, rx) = mpsc::channel();
+        resolve_selected_outdated_comments(&mut state, &tx);
+        assert_eq!(
+            state.status.as_deref(),
+            Some("v: no outdated comments in selection")
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     /// A failing check named `name` with details URL `url`.
