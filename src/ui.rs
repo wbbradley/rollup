@@ -15,7 +15,7 @@ use crate::{
     report::{self, ChecksSummary, ReviewerSummaryToken, Row, Section, SectionId},
 };
 
-pub fn draw(f: &mut Frame, state: &mut AppState) {
+pub fn draw(f: &mut Frame, state: &mut AppState, web_address: &str) {
     let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
     let top_and_merged =
         Layout::vertical([Constraint::Percentage(75), Constraint::Percentage(25)]).split(outer[0]);
@@ -96,7 +96,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     }
     draw_merged_pane(f, merged_area, &merged_section);
 
-    draw_footer(f, outer[1], state);
+    draw_footer(f, outer[1], state, web_address);
 }
 
 const SCROLL_MARGIN: usize = 4;
@@ -635,13 +635,14 @@ fn spinner_frame() -> &'static str {
     FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
-    f.render_widget(Paragraph::new(footer_line(state)), area);
+fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, web_address: &str) {
+    f.render_widget(Paragraph::new(footer_line(state, web_address)), area);
 }
 
-fn footer_line(state: &AppState) -> Line<'static> {
+fn footer_line(state: &AppState, web_address: &str) -> Line<'static> {
+    let web_label = format!("web {web_address} · ");
     if let AuthoredSearch::Editing(query) = &state.authored_search {
-        return Line::from(format!("inc search: {query}"));
+        return Line::from(format!("{web_label}inc search: {query}"));
     }
 
     let status = if let Some(err) = &state.error {
@@ -685,6 +686,7 @@ fn footer_line(state: &AppState) -> Line<'static> {
         (ViewMode::Radar, _) => "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   ".to_string(),
     };
     Line::from(vec![
+        Span::styled(web_label, Style::default().add_modifier(Modifier::DIM)),
         Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         Span::raw("["),
         status,
@@ -694,7 +696,7 @@ fn footer_line(state: &AppState) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{Local, TimeZone, Utc};
 
     use super::*;
     use crate::model::ChecksRollup;
@@ -810,5 +812,40 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(text, "   └─ Please skip the legacy flow");
+    }
+
+    fn line_text(line: Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn footer_keeps_web_address_across_status_and_search_states() {
+        let mut state = AppState::new();
+        let address = "localhost:7011";
+        let assert_address = |state: &AppState| {
+            assert!(line_text(footer_line(state, address)).starts_with("web localhost:7011 · "));
+        };
+
+        assert_address(&state); // loading
+        state.loading = false;
+        assert_address(&state); // normal
+        state.status = Some("refreshed".into());
+        assert_address(&state);
+        state.status = None;
+        state.error = Some("boom".into());
+        assert_address(&state);
+        state.error = None;
+        state.loaded_at = Some(Local.timestamp_opt(100, 0).unwrap());
+        assert_address(&state);
+        state.authored_search = AuthoredSearch::Filtered("needle".into());
+        assert_address(&state);
+        state.authored_search = AuthoredSearch::Editing("need".into());
+        assert_eq!(
+            line_text(footer_line(&state, address)),
+            "web localhost:7011 · inc search: need"
+        );
     }
 }

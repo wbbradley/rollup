@@ -46,7 +46,9 @@ Requires [`gh`](https://cli.github.com) on your `PATH` and already authenticated
 rollup
 ```
 
-Then use the TUI directly or visit <http://127.0.0.1:7011/> in a browser.
+Then use the TUI directly or visit <http://127.0.0.1:7011/> in a browser. The
+TUI footer continuously shows the actual bound endpoint as `web
+localhost:7011` for the default loopback listener.
 
 The interactive process owns three concurrent pieces: a TUI event loop, worker
 threads that fetch GitHub data, and a small synchronous loopback HTTP listener.

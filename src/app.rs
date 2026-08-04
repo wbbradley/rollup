@@ -128,7 +128,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             viewer: None,
             authored: Vec::new(),
@@ -529,8 +529,16 @@ pub fn run() -> Result<()> {
     // contextual error without requiring terminal restoration.
     let web_server = web::start(web::DEFAULT_ADDRESS, tx.clone())?;
     let web_snapshots = web_server.snapshots();
+    let web_address = web_server.display_address();
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, &web_snapshots, &tx, &rx, refresh_interval);
+    let result = run_app(
+        &mut terminal,
+        &web_snapshots,
+        &web_address,
+        &tx,
+        &rx,
+        refresh_interval,
+    );
     ratatui::restore();
     result
 }
@@ -538,6 +546,7 @@ pub fn run() -> Result<()> {
 fn run_app(
     terminal: &mut DefaultTerminal,
     web_snapshots: &web::SnapshotStore,
+    web_address: &str,
     tx: &Sender<Msg>,
     rx: &Receiver<Msg>,
     refresh_interval: Duration,
@@ -564,7 +573,7 @@ fn run_app(
         }
 
         if should_redraw(dirty, drained.changed, state.loading) {
-            terminal.draw(|f| ui::draw(f, &mut state))?;
+            terminal.draw(|f| ui::draw(f, &mut state, web_address))?;
             dirty = false;
         }
 

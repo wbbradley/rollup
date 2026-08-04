@@ -1,7 +1,7 @@
 use std::{
     fmt::Write as _,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, RwLock,
         mpsc::{self, Sender},
@@ -93,8 +93,7 @@ impl SnapshotStore {
 
 pub struct WebServer {
     snapshots: SnapshotStore,
-    #[cfg(test)]
-    address: std::net::SocketAddr,
+    address: SocketAddr,
     shutdown: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
@@ -104,9 +103,21 @@ impl WebServer {
         self.snapshots.clone()
     }
 
+    pub fn display_address(&self) -> String {
+        format_listener_address(self.address)
+    }
+
     #[cfg(test)]
-    fn local_addr(&self) -> std::net::SocketAddr {
+    fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+}
+
+fn format_listener_address(address: SocketAddr) -> String {
+    if address.ip().is_loopback() {
+        format!("localhost:{}", address.port())
+    } else {
+        address.to_string()
     }
 }
 
@@ -125,7 +136,6 @@ pub fn start(address: &str, refresh_requests: Sender<Msg>) -> Result<WebServer> 
     listener
         .set_nonblocking(true)
         .context("configuring web dashboard listener")?;
-    #[cfg(test)]
     let bound_address = listener
         .local_addr()
         .context("reading web dashboard listener address")?;
@@ -152,7 +162,6 @@ pub fn start(address: &str, refresh_requests: Sender<Msg>) -> Result<WebServer> 
 
     Ok(WebServer {
         snapshots,
-        #[cfg(test)]
         address: bound_address,
         shutdown,
         worker: Some(worker),
@@ -1289,6 +1298,10 @@ mod tests {
     fn ephemeral_listener_serves_published_snapshot() {
         let (tx, _rx) = mpsc::channel();
         let server = start("127.0.0.1:0", tx).unwrap();
+        assert_eq!(
+            server.display_address(),
+            format!("localhost:{}", server.local_addr().port())
+        );
         server.snapshots().publish(rich_snapshot());
         let mut stream = TcpStream::connect(server.local_addr()).unwrap();
         stream
@@ -1312,5 +1325,25 @@ mod tests {
         let address = server.local_addr().to_string();
         let error = start(&address, tx).err().expect("second bind should fail");
         assert!(format!("{error:#}").contains(&address));
+    }
+
+    #[test]
+    fn listener_address_formats_loopback_and_preserves_other_socket_addresses() {
+        assert_eq!(
+            format_listener_address("127.0.0.1:7011".parse().unwrap()),
+            "localhost:7011"
+        );
+        assert_eq!(
+            format_listener_address("[::1]:7012".parse().unwrap()),
+            "localhost:7012"
+        );
+        assert_eq!(
+            format_listener_address("192.0.2.10:7013".parse().unwrap()),
+            "192.0.2.10:7013"
+        );
+        assert_eq!(
+            format_listener_address("[2001:db8::10]:7014".parse().unwrap()),
+            "[2001:db8::10]:7014"
+        );
     }
 }
