@@ -110,9 +110,10 @@ Under each PR its children are grouped into up to four ordered sections:
 1. **Checks** — a merge-readiness rollup for the PR's head commit. It starts
    expanded when any required or optional check has failed/errored, and starts
    collapsed otherwise; the header shows a glyph + required ratio, e.g.
-   `▸ Checks ✓ 4/4 required`. Failure/Error and Pending rows sit directly under
-   Checks in attention-first order. Success, Skipped, and Neutral rows are
-   grouped under a nested, default-collapsed **Valid Results** node. When a
+   `▸ Checks ✓ 4/4 required`. Failure/Error rows sit directly under Checks in
+   attention-first order. Pending rows are grouped under a nested,
+   default-collapsed **Pending** node; Success, Skipped, and Neutral rows are
+   grouped under a separate, default-collapsed **Valid Results** node. When a
    check has been retried or re-run, only its latest run is shown. `Enter` on a
    check opens its details page (falling back to the PR). See
    [Checks signal](#checks-signal) below.
@@ -140,10 +141,11 @@ Only non-empty sections appear, in that order. Every non-empty section shows a
 selectable `▸`/`▾` header that is also a **collapse control**: `l`/Right expands
 it, `h`/Left collapses it. `h`/Left on a child row (check, reviewer, comment, or
 nested PR) collapses its enclosing section and moves the cursor back to that
-section's header. A valid check collapses back to **Valid Results**; an
-actionable check collapses back to **Checks**. Checks conditionally expands as
-described above, while Valid Results and Reviewers start collapsed unless a
-review summary needs attention (Open comments and Stacked PRs start expanded).
+section's header. A pending check collapses back to **Pending**, a valid check
+to **Valid Results**, and a failing/errored check to **Checks**. Checks
+conditionally expands as described above, while Pending, Valid Results, and
+Reviewers start collapsed unless a review summary needs attention (Open
+comments and Stacked PRs start expanded).
 The Reviewers header carries a compact
 response-state summary — e.g. `▸ Reviewers [req, ✗ changes]` — so a
 changes-requested review (`✗`) is visible at a glance without expanding.
@@ -163,8 +165,8 @@ covers every PR in the repo; the **Reviewers**, **Open comments**, and **Checks*
 headers cover that one PR's review summaries, inline comments, or failing
 checks; and a reviewer, single comment, or single check copies just that scope
 (a single check works even when it is passing). Nodes with no prompting notion
-(such as **Valid Results**) and empty subtrees report `c: nothing to address
-here`. The prompt closes with a
+(such as **Pending** or **Valid Results**) and empty subtrees report
+`c: nothing to address here`. The prompt closes with a
 worktree instruction that is branch-count aware — one worktree for a single
 branch, or a worktree (and possibly a separate sub-agent) per branch when it
 spans several. The section shape also appears in `rollup report`, with every
@@ -188,8 +190,9 @@ reviewers, comments, and checks. PR labels include their displayed source branch
 so branch names are searchable; URLs and undisplayed metadata are not searched.
 Only matching rows and the ancestor path needed to reach them remain; matches
 inside normally collapsed sections are temporarily exposed without changing
-your saved collapse state. A matching valid check retains both Checks and Valid
-Results as ancestors; matching the Valid Results label retains Checks. Enter
+your saved collapse state. A matching pending or valid check retains Checks and
+its **Pending** or **Valid Results** ancestor; matching either nested section's
+label retains Checks. Enter
 commits the filter so navigation, opening,
 and temporary `h`/`l` folding continue to work. Esc cancels an edit or clears a
 committed filter and restores the full tree and its prior folds. An empty Enter

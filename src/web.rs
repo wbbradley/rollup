@@ -500,15 +500,30 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             escape(&pr.url)
         );
         let ordered = checks_by_display_priority(&pr.checks);
-        for check in ordered.iter().copied().filter(|check| {
-            matches!(
-                check.state,
-                CheckState::Failure | CheckState::Error | CheckState::Pending
-            )
-        }) {
+        for check in ordered
+            .iter()
+            .copied()
+            .filter(|check| matches!(check.state, CheckState::Failure | CheckState::Error))
+        {
             render_web_check(out, check, pr);
         }
         out.push_str("</ul>");
+        let pending: Vec<&CheckStatus> = ordered
+            .iter()
+            .copied()
+            .filter(|check| check.state == CheckState::Pending)
+            .collect();
+        if !pending.is_empty() {
+            let _ = write!(
+                out,
+                "<details class=\"check-results pending-results\" data-state-key=\"{}\"><summary>Pending</summary><ul>",
+                escape(&section_state_key(pr, "pending")),
+            );
+            for check in pending {
+                render_web_check(out, check, pr);
+            }
+            out.push_str("</ul></details>");
+        }
         let valid: Vec<&CheckStatus> = ordered
             .into_iter()
             .filter(|check| {
@@ -1059,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn checks_disclosures_use_failure_default_and_omit_empty_valid_results() {
+    fn checks_disclosures_group_pending_and_valid_results_independently() {
         let mut healthy = pr("o/r", 1, "me", 1);
         healthy.checks = vec![CheckStatus {
             name: "success".into(),
@@ -1100,6 +1115,16 @@ mod tests {
             ..WebSnapshot::default()
         });
         assert!(actionable_html.contains("data-state-key=\"repo:o/r:pr:2:section:checks\" open"));
+        assert!(actionable_html.contains(
+            "<details class=\"check-results pending-results\" data-state-key=\"repo:o/r:pr:2:section:pending\"><summary>Pending</summary>"
+        ));
+        assert!(!actionable_html.contains("section:pending\" open"));
+        assert!(
+            actionable_html.find("optional error").unwrap()
+                < actionable_html.find("<summary>Pending</summary>").unwrap()
+        );
+        let pending_start = actionable_html.find("<summary>Pending</summary>").unwrap();
+        assert!(actionable_html[pending_start..].contains(" pending "));
         assert!(!actionable_html.contains("section:valid-results"));
     }
 

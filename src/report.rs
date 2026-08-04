@@ -58,6 +58,7 @@ pub enum SectionId {
     /// One Authored PR's complete rendered subtree. Starts expanded.
     Subtree,
     Checks,
+    Pending,
     ValidResults,
     Reviewers,
     Comments,
@@ -70,6 +71,7 @@ impl SectionId {
             SectionId::Repo => "Repo",
             SectionId::Subtree => "PR subtree",
             SectionId::Checks => "Checks",
+            SectionId::Pending => "Pending",
             SectionId::ValidResults => "Valid Results",
             SectionId::Reviewers => "Reviewers",
             SectionId::Comments => "Open comments",
@@ -78,12 +80,12 @@ impl SectionId {
     }
 
     /// Static section default. Checks supplies a data-driven default at its
-    /// call site; Valid Results and Reviewers start collapsed, while Repo, Open
-    /// comments, and Stacked PRs start expanded.
+    /// call site; Pending, Valid Results, and Reviewers start collapsed, while
+    /// Repo, Open comments, and Stacked PRs start expanded.
     pub fn default_expanded(self) -> bool {
         !matches!(
             self,
-            SectionId::Checks | SectionId::ValidResults | SectionId::Reviewers
+            SectionId::Checks | SectionId::Pending | SectionId::ValidResults | SectionId::Reviewers
         )
     }
 }
@@ -182,6 +184,14 @@ fn check_is_valid(check: &CheckStatus) -> bool {
         check.state,
         CheckState::Success | CheckState::Skipped | CheckState::Neutral
     )
+}
+
+fn check_is_pending(check: &CheckStatus) -> bool {
+    check.state == CheckState::Pending
+}
+
+fn check_is_failed(check: &CheckStatus) -> bool {
+    matches!(check.state, CheckState::Failure | CheckState::Error)
 }
 
 fn checks_default_expanded(pr: &Pr) -> bool {
@@ -528,7 +538,7 @@ fn section_visible_text(section: SectionId, pr: &Pr) -> String {
             };
             format!("{} {glyph} {}", section.label(), summary.ratio_text())
         }
-        SectionId::ValidResults => section.label().to_string(),
+        SectionId::Pending | SectionId::ValidResults => section.label().to_string(),
         SectionId::Reviewers => {
             let summary = reviewer_summary(&pr.reviewers, !pr.unresolved_comments.is_empty())
                 .into_iter()
@@ -548,6 +558,8 @@ fn filtered_pr_matches(node: &PrTreeNode<'_>, viewer: &str, query: &str) -> bool
     visible_text_matches(&pr_visible_text(pr, viewer), query)
         || (!pr.checks.is_empty()
             && (visible_text_matches(&section_visible_text(SectionId::Checks, pr), query)
+                || (pr.checks.iter().any(check_is_pending)
+                    && visible_text_matches(&section_visible_text(SectionId::Pending, pr), query))
                 || (pr.checks.iter().any(check_is_valid)
                     && visible_text_matches(
                         &section_visible_text(SectionId::ValidResults, pr),
@@ -611,23 +623,33 @@ fn push_filtered_pr<'a>(
     if !pr.checks.is_empty() {
         let checks_section_matches =
             visible_text_matches(&section_visible_text(SectionId::Checks, pr), query);
+        let pending_section_matches = pr.checks.iter().any(check_is_pending)
+            && visible_text_matches(&section_visible_text(SectionId::Pending, pr), query);
         let valid_section_matches = pr.checks.iter().any(check_is_valid)
             && visible_text_matches(&section_visible_text(SectionId::ValidResults, pr), query);
         let matching: Vec<&CheckStatus> = checks_by_display_priority(&pr.checks)
             .into_iter()
             .filter(|check| visible_text_matches(&check_visible_text(check), query))
             .collect();
-        let matching_actionable: Vec<&CheckStatus> = matching
+        let matching_failed: Vec<&CheckStatus> = matching
             .iter()
             .copied()
-            .filter(|check| !check_is_valid(check))
+            .filter(|check| check_is_failed(check))
+            .collect();
+        let matching_pending: Vec<&CheckStatus> = matching
+            .iter()
+            .copied()
+            .filter(|check| check_is_pending(check))
             .collect();
         let matching_valid: Vec<&CheckStatus> = matching
             .into_iter()
             .filter(|check| check_is_valid(check))
             .collect();
-        let checks_has_descendants =
-            !matching_actionable.is_empty() || valid_section_matches || !matching_valid.is_empty();
+        let checks_has_descendants = !matching_failed.is_empty()
+            || pending_section_matches
+            || !matching_pending.is_empty()
+            || valid_section_matches
+            || !matching_valid.is_empty();
         if checks_section_matches || checks_has_descendants {
             let checks_expanded = search_collapsed
                 .get(&(pr.repo.clone(), pr.number, SectionId::Checks))
@@ -642,9 +664,12 @@ fn push_filtered_pr<'a>(
                 tree_prefix: child_base.clone(),
             });
             if checks_expanded {
+                let show_pending = pending_section_matches || !matching_pending.is_empty();
                 let show_valid_results = valid_section_matches || !matching_valid.is_empty();
-                let direct_count = matching_actionable.len() + usize::from(show_valid_results);
-                for (index, check) in matching_actionable.into_iter().enumerate() {
+                let direct_count = matching_failed.len()
+                    + usize::from(show_pending)
+                    + usize::from(show_valid_results);
+                for (index, check) in matching_failed.into_iter().enumerate() {
                     rows.push(Row::Check {
                         c: check,
                         tree_prefix: format!(
@@ -656,6 +681,48 @@ fn push_filtered_pr<'a>(
                             }
                         ),
                     });
+                }
+                if show_pending {
+                    let pending_expanded = search_collapsed
+                        .get(&(pr.repo.clone(), pr.number, SectionId::Pending))
+                        .copied()
+                        .unwrap_or(true)
+                        && !matching_pending.is_empty();
+                    let pending_is_last = !show_valid_results;
+                    rows.push(Row::SectionHeader {
+                        section: SectionId::Pending,
+                        expanded: pending_expanded,
+                        summary: Vec::new(),
+                        checks: None,
+                        tree_prefix: format!(
+                            "{child_base}{}",
+                            if pending_is_last {
+                                "└─ "
+                            } else {
+                                "├─ "
+                            }
+                        ),
+                    });
+                    if pending_expanded {
+                        let pending_base = format!(
+                            "{child_base}{}",
+                            if pending_is_last { "   " } else { "│  " }
+                        );
+                        let count = matching_pending.len();
+                        for (index, check) in matching_pending.into_iter().enumerate() {
+                            rows.push(Row::Check {
+                                c: check,
+                                tree_prefix: format!(
+                                    "{pending_base}{}",
+                                    if index + 1 == count {
+                                        "└─ "
+                                    } else {
+                                        "├─ "
+                                    }
+                                ),
+                            });
+                        }
+                    }
                 }
                 if show_valid_results {
                     let valid_expanded = search_collapsed
@@ -895,8 +962,8 @@ fn push_pr<'a>(
     let number = node.pr.number;
 
     // Checks section — emitted first and opened by default when any check is
-    // failing/errored. Actionable checks remain direct children; completed
-    // outcomes live under a nested, default-collapsed Valid Results node.
+    // failing/errored. Failures remain direct children; pending and completed
+    // outcomes live under independent, default-collapsed nested nodes.
     if !node.pr.checks.is_empty() {
         let expanded = is_expanded(
             toggled,
@@ -914,17 +981,23 @@ fn push_pr<'a>(
         });
         if expanded {
             let checks = checks_by_display_priority(&node.pr.checks);
-            let actionable: Vec<&CheckStatus> = checks
+            let failed: Vec<&CheckStatus> = checks
                 .iter()
                 .copied()
-                .filter(|check| !check_is_valid(check))
+                .filter(|check| check_is_failed(check))
+                .collect();
+            let pending: Vec<&CheckStatus> = checks
+                .iter()
+                .copied()
+                .filter(|check| check_is_pending(check))
                 .collect();
             let valid: Vec<&CheckStatus> = checks
                 .into_iter()
                 .filter(|check| check_is_valid(check))
                 .collect();
-            let direct_count = actionable.len() + usize::from(!valid.is_empty());
-            for (i, c) in actionable.into_iter().enumerate() {
+            let direct_count =
+                failed.len() + usize::from(!pending.is_empty()) + usize::from(!valid.is_empty());
+            for (i, c) in failed.into_iter().enumerate() {
                 let conn = if i + 1 == direct_count {
                     "└─ "
                 } else {
@@ -934,6 +1007,50 @@ fn push_pr<'a>(
                     c,
                     tree_prefix: format!("{child_base}{conn}"),
                 });
+            }
+            if !pending.is_empty() {
+                let pending_expanded = is_expanded(
+                    toggled,
+                    repo,
+                    number,
+                    SectionId::Pending,
+                    SectionId::Pending.default_expanded(),
+                );
+                let pending_is_last = valid.is_empty();
+                rows.push(Row::SectionHeader {
+                    section: SectionId::Pending,
+                    expanded: pending_expanded,
+                    summary: Vec::new(),
+                    checks: None,
+                    tree_prefix: format!(
+                        "{child_base}{}",
+                        if pending_is_last {
+                            "└─ "
+                        } else {
+                            "├─ "
+                        }
+                    ),
+                });
+                if pending_expanded {
+                    let pending_base = format!(
+                        "{child_base}{}",
+                        if pending_is_last { "   " } else { "│  " }
+                    );
+                    let count = pending.len();
+                    for (index, check) in pending.into_iter().enumerate() {
+                        rows.push(Row::Check {
+                            c: check,
+                            tree_prefix: format!(
+                                "{pending_base}{}",
+                                if index + 1 == count {
+                                    "└─ "
+                                } else {
+                                    "├─ "
+                                }
+                            ),
+                        });
+                    }
+                }
             }
             if !valid.is_empty() {
                 let valid_expanded = is_expanded(
@@ -1184,6 +1301,7 @@ pub fn build_full_report<'a>(
     let mut toggled = ToggledSet::new();
     for pr in authored {
         set_expanded(&mut toggled, &pr.repo, pr.number, SectionId::Checks, true);
+        set_expanded(&mut toggled, &pr.repo, pr.number, SectionId::Pending, true);
         set_expanded(
             &mut toggled,
             &pr.repo,
@@ -2330,7 +2448,10 @@ mod tests {
     fn full_console_report_expands_every_authored_section() {
         let viewer = "me";
         let mut p = pr("o/r", 1, viewer, false, 100, vec![user("alice", true)]);
-        p.checks = vec![check("build", CheckState::Success, true)];
+        p.checks = vec![
+            check("build", CheckState::Success, true),
+            check("waiting", CheckState::Pending, false),
+        ];
         p.checks_rollup = ChecksRollup::Green;
         p.unresolved_comments = vec![comment("bob", "please fix", None, false)];
         let authored = vec![p];
@@ -2354,6 +2475,14 @@ mod tests {
                 .iter()
                 .any(|row| matches!(row, Row::Check { .. }))
         );
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Pending,
+                expanded: true,
+                ..
+            }
+        )));
         assert!(
             section
                 .rows
@@ -2823,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn failing_checks_open_with_actionable_rows_above_collapsed_valid_results() {
+    fn failing_checks_open_with_failures_above_collapsed_pending_and_valid_results() {
         let mut p = pr("o/r", 1, "me", false, 100, vec![]);
         p.checks = vec![
             check("success", CheckState::Success, true),
@@ -2854,9 +2983,74 @@ mod tests {
             vec![
                 "H:Checks:true:        ",
                 "C:optional failure:        ├─ ",
-                "C:pending:        ├─ ",
+                "H:Pending:false:        ├─ ",
                 "H:Valid Results:false:        └─ ",
             ]
+        );
+
+        let mut expanded = ToggledSet::new();
+        set_expanded(&mut expanded, "o/r", 1, SectionId::Pending, true);
+        let section = build_section_authored(&authored, "me", &expanded);
+        let pending_rows: Vec<String> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section: SectionId::Pending,
+                    expanded,
+                    tree_prefix,
+                    ..
+                } => Some(format!("H:{expanded}:{tree_prefix}")),
+                Row::Check { c, tree_prefix } if c.state == CheckState::Pending => {
+                    Some(format!("C:{}:{tree_prefix}", c.name))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pending_rows,
+            vec!["H:true:        ├─ ", "C:pending:        │  └─ "]
+        );
+    }
+
+    #[test]
+    fn pending_only_checks_keep_checks_and_pending_collapsed_by_default() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![check("build", CheckState::Pending, true)];
+        let authored = vec![p];
+        let collapsed = build_section_authored(&authored, "me", &ToggledSet::new());
+        assert!(collapsed.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Checks,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(!collapsed.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Pending,
+                ..
+            }
+        )));
+
+        let mut checks_open = ToggledSet::new();
+        set_expanded(&mut checks_open, "o/r", 1, SectionId::Checks, true);
+        let section = build_section_authored(&authored, "me", &checks_open);
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Pending,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
         );
     }
 
@@ -3173,7 +3367,6 @@ mod tests {
 
         for (query, expected_section) in [
             ("needlereviewer", SectionId::Reviewers),
-            ("needlecheck", SectionId::Checks),
             ("needlecomment", SectionId::Comments),
         ] {
             let section = build_section_authored_filtered(
@@ -3195,6 +3388,25 @@ mod tests {
             ));
             assert!(section.rows[3].is_selectable());
         }
+
+        let section = build_section_authored_filtered(
+            std::slice::from_ref(&authored_pr),
+            "me",
+            "needlecheck",
+            &ToggledSet::new(),
+        );
+        let shape: Vec<String> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section, expanded, ..
+                } => Some(format!("{}:{expanded}", section.label())),
+                Row::Check { c, .. } => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shape, vec!["Checks:true", "Pending:true", "NeedleCheck"]);
     }
 
     #[test]
@@ -3280,6 +3492,35 @@ mod tests {
         assert_eq!(
             headers,
             vec![(SectionId::Checks, true), (SectionId::ValidResults, false),]
+        );
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
+    }
+
+    #[test]
+    fn filtered_pending_label_retains_checks_without_exposing_checks() {
+        let mut p = pr("o/r", 1, "me", false, 100, vec![]);
+        p.checks = vec![check("build", CheckState::Pending, true)];
+        let authored = vec![p];
+        let section =
+            build_section_authored_filtered(&authored, "me", "pending", &ToggledSet::new());
+        let headers: Vec<(SectionId, bool)> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section, expanded, ..
+                } => Some((*section, *expanded)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![(SectionId::Checks, true), (SectionId::Pending, false)]
         );
         assert!(
             !section

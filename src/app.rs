@@ -430,7 +430,10 @@ fn section_ctx_at(rows: &[Row<'_>], sel: usize) -> Option<SectionCtx> {
                 idx += 1;
             }
             Row::SectionHeader { section, .. } => {
-                if matches!(section, SectionId::Checks | SectionId::ValidResults) {
+                if matches!(
+                    section,
+                    SectionId::Checks | SectionId::Pending | SectionId::ValidResults
+                ) {
                     current_check_section = *section;
                 }
                 if idx == sel {
@@ -1428,7 +1431,7 @@ fn build_copy_prompt(state: &AppState) -> Option<String> {
             let items: Vec<PrActions> = tree.iter().flat_map(gather_actionable).collect();
             combined_prompt(&items)
         }
-        // Valid Results and other non-actionable section headers.
+        // Pending, Valid Results, and other non-actionable section headers.
         Selected::Section(_, _) => None,
     }
 }
@@ -1448,7 +1451,7 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 /// repo header every PR in the repo), grouped per PR. Single comments, single
 /// checks, and section headers use the same unified format. When the subtree
 /// has nothing actionable — including a reviewer with no review summary and
-/// prompt-notion-free nodes such as Valid Results — the footer reads
+/// prompt-notion-free nodes such as Pending and Valid Results — the footer reads
 /// `c: nothing to address here`.
 /// Only acts in the Me/Authored pane; a no-op elsewhere (no comment/check/repo
 /// gather notion exists in the other views).
@@ -1920,6 +1923,53 @@ mod tests {
             row,
             Row::SectionHeader {
                 section: SectionId::ValidResults,
+                expanded: false,
+                ..
+            }
+        )));
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Check { .. }))
+        );
+    }
+
+    #[test]
+    fn toggle_h_on_pending_check_collapses_pending_and_reselects_nested_header() {
+        let mut pending = check("build", Some("https://ci/build"), true);
+        pending.state = CheckState::Pending;
+        let mut state = me_state(vec![pr_with_checks(1, vec![pending])]);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Pending, true);
+        // Selectable: Repo(0), PR(1), Checks(2), Pending(3), pending check(4).
+        state.authored_sel = 4;
+        let section = state.authored_section();
+        let ctx = section_ctx_at(&section.rows, 4).expect("pending check resolves");
+        assert_eq!(ctx.section, SectionId::Pending);
+        drop(section);
+
+        toggle_section(&mut state, false);
+        assert_eq!(state.authored_sel, 3);
+        assert!(report::is_expanded(
+            &state.toggled,
+            "o/r",
+            1,
+            SectionId::Checks,
+            false,
+        ));
+        assert!(!report::is_expanded(
+            &state.toggled,
+            "o/r",
+            1,
+            SectionId::Pending,
+            false,
+        ));
+        let section = state.authored_section();
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader {
+                section: SectionId::Pending,
                 expanded: false,
                 ..
             }
