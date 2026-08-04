@@ -202,12 +202,14 @@ fn render_list_item(row: &Row<'_>, width: usize) -> ListItem<'static> {
             hide_author_if,
             show_head_ref,
             tree_prefix,
+            expanded,
             ..
         } => ListItem::new(pr_line(
             pr,
             hide_author_if.as_deref(),
             *show_head_ref,
             tree_prefix.as_deref(),
+            *expanded,
         )),
         Row::Reviewer { r, tree_prefix } => ListItem::new(reviewer_line(r, tree_prefix.as_deref())),
         Row::SectionHeader {
@@ -352,6 +354,7 @@ fn pr_line(
     hide_author_if: Option<&str>,
     show_head_ref: bool,
     tree_prefix: Option<&str>,
+    expanded: Option<bool>,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     match tree_prefix {
@@ -360,6 +363,12 @@ fn pr_line(
             Style::default().add_modifier(Modifier::DIM),
         )),
         None => spans.push(Span::raw("  ")),
+    }
+    if let Some(expanded) = expanded {
+        spans.push(Span::styled(
+            if expanded { "▾ " } else { "▸ " },
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
     spans.push(Span::styled(
         format!("#{} ", pr.number),
@@ -711,22 +720,46 @@ mod tests {
 
     #[test]
     fn pr_line_dims_head_ref_only_when_enabled_and_non_empty() {
-        let line = pr_line(&test_pr("feature/render"), Some("me"), true, None);
+        let line = pr_line(&test_pr("feature/render"), Some("me"), true, None, None);
         let suffix = line.spans.last().unwrap();
         assert_eq!(suffix.content.as_ref(), " [feature/render]");
         assert!(suffix.style.add_modifier.contains(Modifier::DIM));
 
-        let disabled = pr_line(&test_pr("feature/render"), Some("me"), false, None);
+        let disabled = pr_line(&test_pr("feature/render"), Some("me"), false, None, None);
         assert_eq!(
             disabled.spans.last().unwrap().content.as_ref(),
             "Improve rendering"
         );
 
-        let empty = pr_line(&test_pr(""), Some("me"), true, None);
+        let empty = pr_line(&test_pr(""), Some("me"), true, None, None);
         assert_eq!(
             empty.spans.last().unwrap().content.as_ref(),
             "Improve rendering"
         );
+    }
+
+    #[test]
+    fn pr_line_renders_disclosure_only_for_collapsible_prs() {
+        let expanded = pr_line(
+            &test_pr("branch"),
+            Some("me"),
+            true,
+            Some("└─ "),
+            Some(true),
+        );
+        assert_eq!(expanded.spans[1].content.as_ref(), "▾ ");
+
+        let collapsed = pr_line(
+            &test_pr("branch"),
+            Some("me"),
+            true,
+            Some("└─ "),
+            Some(false),
+        );
+        assert_eq!(collapsed.spans[1].content.as_ref(), "▸ ");
+
+        let leaf = pr_line(&test_pr("branch"), Some("me"), true, Some("└─ "), None);
+        assert_eq!(leaf.spans[1].content.as_ref(), "#7 ");
     }
 
     #[test]

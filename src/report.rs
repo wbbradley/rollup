@@ -55,6 +55,8 @@ pub enum SectionId {
     /// as `(repo, 0, Repo)` — no real PR is `#0` — so a whole repo grouping can
     /// be collapsed. Starts expanded.
     Repo,
+    /// One Authored PR's complete rendered subtree. Starts expanded.
+    Subtree,
     Checks,
     ValidResults,
     Reviewers,
@@ -66,6 +68,7 @@ impl SectionId {
     pub fn label(self) -> &'static str {
         match self {
             SectionId::Repo => "Repo",
+            SectionId::Subtree => "PR subtree",
             SectionId::Checks => "Checks",
             SectionId::ValidResults => "Valid Results",
             SectionId::Reviewers => "Reviewers",
@@ -241,10 +244,10 @@ pub enum Row<'a> {
         /// Full leading indent string for tree rendering (with `├`/`└`/`│`
         /// connectors). `None` in flat panes, which fall back to a fixed indent.
         tree_prefix: Option<String>,
-        /// For a stacked child PR in the Authored pane, the parent PR's number
-        /// (same repo), so `h` on the child collapses the parent's Stacked PRs
-        /// node. `None` for roots and in every other pane's builder.
-        stacked_under: Option<u64>,
+        /// Whether this PR's complete rendered subtree is expanded. `Some`
+        /// only for Authored PRs with at least one rendered child; `None` in
+        /// flat panes and for childless Authored PRs.
+        expanded: Option<bool>,
     },
     Reviewer {
         r: &'a ReviewerStatus,
@@ -321,7 +324,7 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
                 hide_author_if: None,
                 show_head_ref: false,
                 tree_prefix: None,
-                stacked_under: None,
+                expanded: None,
             });
             for r in &pr.reviewers {
                 rows.push(Row::Reviewer {
@@ -370,7 +373,7 @@ pub fn build_section_authored<'a>(
         let tree = authored_tree(&group_prs);
         let n = tree.len();
         for (i, node) in tree.iter().enumerate() {
-            push_pr(&mut rows, node, viewer, "  ", i + 1 == n, None, toggled);
+            push_pr(&mut rows, node, viewer, "  ", i + 1 == n, toggled);
         }
     }
     Section {
@@ -424,7 +427,6 @@ pub fn build_section_authored_filtered<'a>(
                     &query,
                     "  ",
                     index + 1 == root_count,
-                    None,
                     search_collapsed,
                 );
             }
@@ -535,7 +537,9 @@ fn section_visible_text(section: SectionId, pr: &Pr) -> String {
                 .join(", ");
             format!("{} {summary}", section.label())
         }
-        SectionId::Comments | SectionId::Stacked | SectionId::Repo => section.label().to_string(),
+        SectionId::Comments | SectionId::Stacked | SectionId::Repo | SectionId::Subtree => {
+            section.label().to_string()
+        }
     }
 }
 
@@ -588,16 +592,16 @@ fn push_filtered_pr<'a>(
     query: &str,
     prefix: &str,
     is_last: bool,
-    stacked_under: Option<u64>,
     search_collapsed: &ToggledSet,
 ) {
     let connector = if is_last { "└─ " } else { "├─ " };
+    let pr_row_index = rows.len();
     rows.push(Row::Pr {
         pr: node.pr,
         hide_author_if: Some(viewer.to_string()),
         show_head_ref: true,
         tree_prefix: Some(format!("{prefix}{connector}")),
-        stacked_under,
+        expanded: None,
     });
     let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
     let pr = node.pr;
@@ -826,11 +830,28 @@ fn push_filtered_pr<'a>(
                         query,
                         &child_base,
                         index + 1 == count,
-                        Some(pr.number),
                         search_collapsed,
                     );
                 }
             }
+        }
+    }
+
+    let has_rendered_children = rows.len() > pr_row_index + 1;
+    if has_rendered_children {
+        let expanded = search_collapsed
+            .get(&(pr.repo.clone(), pr.number, SectionId::Subtree))
+            .copied()
+            .unwrap_or(true);
+        if let Row::Pr {
+            expanded: row_expanded,
+            ..
+        } = &mut rows[pr_row_index]
+        {
+            *row_expanded = Some(expanded);
+        }
+        if !expanded {
+            rows.truncate(pr_row_index + 1);
         }
     }
 }
@@ -843,10 +864,6 @@ fn push_filtered_pr<'a>(
 /// expanded per `toggled` (Reviewers collapsed by default, the others
 /// expanded).
 ///
-/// `stacked_under` is the parent PR's number when this node is a stacked child
-/// (so `h` on the child can collapse the parent's Stacked PRs node); `None` for
-/// roots.
-///
 /// `node: &PrTreeNode<'a>` yields `node.pr: &'a Pr`; iterating
 /// `node.pr.reviewers` / `node.pr.unresolved_comments` produces `&'a _`, so the
 /// rows carry `'a` references into `authored` and are independent of the local
@@ -858,16 +875,16 @@ fn push_pr<'a>(
     viewer: &str,
     prefix: &str,
     is_last: bool,
-    stacked_under: Option<u64>,
     toggled: &ToggledSet,
 ) {
     let connector = if is_last { "└─ " } else { "├─ " };
+    let pr_row_index = rows.len();
     rows.push(Row::Pr {
         pr: node.pr,
         hide_author_if: Some(viewer.to_string()),
         show_head_ref: true,
         tree_prefix: Some(format!("{prefix}{connector}")),
-        stacked_under,
+        expanded: None,
     });
     let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
     let repo = node.pr.repo.as_str();
@@ -1061,16 +1078,29 @@ fn push_pr<'a>(
         if expanded {
             let m = node.children.len();
             for (i, kid) in node.children.iter().enumerate() {
-                push_pr(
-                    rows,
-                    kid,
-                    viewer,
-                    &child_base,
-                    i + 1 == m,
-                    Some(number),
-                    toggled,
-                );
+                push_pr(rows, kid, viewer, &child_base, i + 1 == m, toggled);
             }
+        }
+    }
+
+    let has_rendered_children = rows.len() > pr_row_index + 1;
+    if has_rendered_children {
+        let expanded = is_expanded(
+            toggled,
+            repo,
+            number,
+            SectionId::Subtree,
+            SectionId::Subtree.default_expanded(),
+        );
+        if let Row::Pr {
+            expanded: row_expanded,
+            ..
+        } = &mut rows[pr_row_index]
+        {
+            *row_expanded = Some(expanded);
+        }
+        if !expanded {
+            rows.truncate(pr_row_index + 1);
         }
     }
 }
@@ -2072,6 +2102,48 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_pr_subtree_hides_all_descendants_but_not_siblings() {
+        let mut root = pr_refs("o/r", 1, "main", "a");
+        root.reviewers = vec![user("alice", true)];
+        root.unresolved_comments = vec![comment("bob", "fix this", None, false)];
+        root.checks = vec![check("build", CheckState::Failure, true)];
+        let child = pr_refs("o/r", 2, "a", "b");
+        let sibling = pr_refs("o/r", 3, "main", "c");
+        let authored = vec![root, child, sibling];
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Subtree, false);
+
+        let section = build_section_authored(&authored, "me", &toggled);
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Pr {
+                pr,
+                expanded: Some(false),
+                ..
+            } if pr.number == 1
+        )));
+        assert!(
+            section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Pr { pr, .. } if pr.number == 3))
+        );
+        assert!(
+            !section
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Pr { pr, .. } if pr.number == 2))
+        );
+        assert!(!section.rows.iter().any(|row| matches!(
+            row,
+            Row::SectionHeader { .. }
+                | Row::Reviewer { .. }
+                | Row::Comment { .. }
+                | Row::Check { .. }
+        )));
+    }
+
+    #[test]
     fn non_authored_pr_rows_do_not_enable_head_ref_labels() {
         let reviewing = vec![pr("o/r", 2, "bob", false, 200, vec![])];
         let sections = [build_section_reviewing(&reviewing)];
@@ -2309,7 +2381,7 @@ mod tests {
                 hide_author_if: None,
                 show_head_ref: false,
                 tree_prefix: None,
-                stacked_under: None,
+                expanded: None,
             }
             .is_selectable()
         );
@@ -3177,6 +3249,29 @@ mod tests {
                 .rows
                 .iter()
                 .any(|row| matches!(row, Row::Reviewer { .. }))
+        );
+    }
+
+    #[test]
+    fn filtered_authored_pr_subtree_fold_is_temporary_and_keeps_pr_visible() {
+        let authored = vec![pr("o/r", 1, "me", false, 100, vec![user("needle", true)])];
+        let mut search_collapsed = ToggledSet::new();
+        search_collapsed.insert(("o/r".into(), 1, SectionId::Subtree), false);
+        let section = build_section_authored_filtered(&authored, "me", "needle", &search_collapsed);
+
+        assert_eq!(section.count, 1);
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Pr {
+                pr,
+                expanded: Some(false),
+                ..
+            } if pr.number == 1
+        )));
+        assert_eq!(
+            section.rows.len(),
+            2,
+            "only the repo and collapsed PR remain"
         );
     }
 }

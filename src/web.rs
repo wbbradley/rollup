@@ -418,7 +418,23 @@ fn render_authored(snapshot: &WebSnapshot) -> String {
 
 fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     let pr = node.pr;
-    out.push_str("<li class=\"pr\"><article><h3>");
+    let has_rendered_children = !pr.checks.is_empty()
+        || !pr.reviewers.is_empty()
+        || pr
+            .unresolved_comments
+            .iter()
+            .any(|comment| comment.kind == PrCommentKind::Thread)
+        || !node.children.is_empty();
+    out.push_str("<li class=\"pr\"><article>");
+    if has_rendered_children {
+        let _ = write!(
+            out,
+            "<details class=\"pr-subtree\" data-state-key=\"{}\" open><summary>",
+            escape(&section_state_key(pr, "subtree"))
+        );
+    } else {
+        out.push_str("<h3>");
+    }
     let _ = write!(
         out,
         "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span> {}{}</a>{}",
@@ -436,7 +452,11 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             ""
         }
     );
-    out.push_str("</h3>");
+    out.push_str(if has_rendered_children {
+        "</summary>"
+    } else {
+        "</h3>"
+    });
 
     if !pr.checks.is_empty() {
         let summary = ChecksSummary::of(pr);
@@ -595,6 +615,9 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
             render_pr(out, child);
         }
         out.push_str("</ul></details>");
+    }
+    if has_rendered_children {
+        out.push_str("</details>");
     }
     out.push_str("</article></li>");
 }
@@ -961,6 +984,9 @@ mod tests {
         let html = render_authored(&rich_snapshot());
         assert!(html.find("A/repo").unwrap() < html.find("z/repo").unwrap());
         assert!(html.find("Parent &lt;fix&gt;").unwrap() < html.find("title 2").unwrap());
+        assert!(html.contains(
+            "<details class=\"pr-subtree\" data-state-key=\"repo:z/repo:pr:1:section:subtree\" open><summary>"
+        ));
         assert!(html.contains("<details class=\"pr-section checks\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section reviewers\" data-state-key="));
         assert!(html.contains("<details class=\"pr-section comments\" data-state-key="));
@@ -1000,6 +1026,18 @@ mod tests {
         assert!(html.contains("say &lt;hello&gt; &amp; goodbye"));
         assert!(html.contains("Parent &lt;fix&gt; <span class=\"muted\">[branch-1]</span>"));
         assert!(html.contains("title 2 <span class=\"muted\">[branch-2]</span>"));
+    }
+
+    #[test]
+    fn childless_authored_pr_stays_a_plain_heading() {
+        let html = render_authored(&WebSnapshot {
+            viewer: "me".into(),
+            authored: vec![pr("o/r", 7, "me", 1)],
+            ..WebSnapshot::default()
+        });
+
+        assert!(html.contains("<li class=\"pr\"><article><h3><a href="));
+        assert!(!html.contains("section:subtree"));
     }
 
     #[test]
@@ -1106,6 +1144,8 @@ mod tests {
         let first_keys = state_keys(&first);
         let unique: std::collections::BTreeSet<_> = first_keys.iter().copied().collect();
         assert_eq!(first_keys.len(), unique.len());
+        assert!(unique.contains("repo:z/repo:pr:1:section:subtree"));
+        assert!(!unique.contains("repo:z/repo:pr:2:section:subtree"));
         assert!(unique.contains("repo:z/repo:pr:1:section:checks"));
         assert!(unique.contains("repo:z/repo:pr:1:section:valid-results"));
         assert!(unique.contains("repo:z/repo:pr:1:section:stacked"));

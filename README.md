@@ -22,7 +22,10 @@ The server binds only to loopback, starts and stops with the TUI, and never
 opens a browser automatically. Use **Refresh** on either page (or press `r` in
 the TUI) to start one shared GitHub fetch for both interfaces. The browser shows
 loading progress, reloads when the fetch finishes, and keeps each PR section's
-expanded or folded state within that tab. A failed refresh leaves the last good
+expanded or folded state within that tab. Authored PRs with children are also
+disclosures: folding a PR keeps its heading visible while hiding every nested
+section and stacked descendant, without changing their individual folds. A
+failed refresh leaves the last good
 data visible alongside the current error. Refresh only reads GitHub data; the
 web UI has no GitHub mutation actions. A port conflict at
 `127.0.0.1:7011` exits cleanly before the terminal enters raw mode. The web UI's
@@ -58,7 +61,7 @@ a later refresh fails. `rollup report` does not start the listener.
 | Key             | Action                                                |
 |-----------------|-------------------------------------------------------|
 | `↑` `↓` `k` `j` | Move selection (PR rows *and* reviewer sub-rows)      |
-| `l` / `h`       | Expand / collapse the selected section or repo grouping (Authored pane; Right/Left also work) |
+| `l` / `h`       | Expand / collapse the selected PR subtree, section, or repo grouping (Authored pane; Right/Left also work) |
 | `g` / `G`       | Jump to top / bottom of the pane                      |
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
@@ -119,6 +122,14 @@ Under each PR its children are grouped into up to four ordered sections:
    diff hunk has moved or collapsed are still listed, tagged `[outdated]`.
 4. **Stacked PRs** — PRs stacked on this one, each recursing into its own
    sections.
+
+An Authored PR with any rendered children has its own `▾`/`▸` disclosure.
+`h`/Left on the PR keeps that PR row visible while hiding all four sections and
+every stacked descendant; `l`/Right restores them with their prior inner fold
+choices intact. A nested PR folds itself, while the parent **Stacked PRs**
+header remains the control for hiding all sibling stacks together. The web
+dashboard provides the same outer PR disclosure and preserves its state within
+the browser tab.
 
 Only non-empty sections appear, in that order. Every non-empty section shows a
 selectable `▸`/`▾` header that is also a **collapse control**: `l`/Right expands

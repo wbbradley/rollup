@@ -367,8 +367,8 @@ fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
 
 /// A collapse/expand target resolved from the selected row (or the parent
 /// context of a child row). `is_header` is true when the selected row is the
-/// section header itself; false when it's a child of the section (a reviewer,
-/// comment, or nested PR) whose enclosing section should be collapsed.
+/// section/PR header itself; false when it's a child of a section (a reviewer,
+/// comment, or check) whose enclosing section should be collapsed.
 struct SectionCtx {
     repo: String,
     number: u64,
@@ -378,9 +378,8 @@ struct SectionCtx {
 
 /// Resolve the selected row to the section it belongs to. Walks in lock-step
 /// with `is_selectable`, tracking the current PR. A repo header resolves to its
-/// own `(repo, 0, Repo)` node; a nested child PR resolves to its parent's
-/// Stacked PRs node (via `stacked_under`); a root PR resolves to `None` (PRs
-/// aren't collapsible).
+/// own `(repo, 0, Repo)` node. An Authored PR with rendered children resolves
+/// to its own Subtree node; childless and flat-pane PR rows are not collapsible.
 fn section_ctx_at(rows: &[Row<'_>], sel: usize) -> Option<SectionCtx> {
     let mut idx = 0usize;
     let mut current_pr: Option<&Pr> = None;
@@ -402,17 +401,15 @@ fn section_ctx_at(rows: &[Row<'_>], sel: usize) -> Option<SectionCtx> {
                 }
                 idx += 1;
             }
-            Row::Pr {
-                pr, stacked_under, ..
-            } => {
+            Row::Pr { pr, expanded, .. } => {
                 current_pr = Some(pr);
                 current_check_section = SectionId::Checks;
                 if idx == sel {
-                    return stacked_under.map(|parent| SectionCtx {
+                    return expanded.map(|_| SectionCtx {
                         repo: pr.repo.clone(),
-                        number: parent,
-                        section: SectionId::Stacked,
-                        is_header: false,
+                        number: pr.number,
+                        section: SectionId::Subtree,
+                        is_header: true,
                     });
                 }
                 idx += 1;
@@ -495,6 +492,9 @@ fn header_sel_index(
             }
             Row::Pr { pr, .. } => {
                 current_pr = Some(pr);
+                if section == SectionId::Subtree && pr.repo == repo && pr.number == number {
+                    return Some(idx);
+                }
                 idx += 1;
             }
             Row::SectionHeader { section: s, .. } => {
@@ -886,9 +886,10 @@ fn open_selected(state: &AppState) {
 /// Expand (`expand == true`) or collapse (`expand == false`) the section node
 /// resolved from the current Authored-pane selection. Expanding acts only on a
 /// header row; collapsing also acts on a section's child (reviewer, comment, or
-/// nested PR), folding the enclosing section. After toggling, the selection is
-/// recomputed against freshly built rows so the cursor lands on the toggled
-/// section's header. No-op outside `ViewMode::Me`.
+/// check), folding the enclosing section. PR rows always target their own
+/// complete subtree. After toggling, the selection is recomputed against
+/// freshly built rows so the cursor lands on the toggled header. No-op outside
+/// `ViewMode::Me`.
 fn toggle_section(state: &mut AppState, expand: bool) {
     if state.mode != ViewMode::Me {
         return;
@@ -1542,39 +1543,80 @@ mod tests {
     }
 
     #[test]
-    fn section_ctx_nested_child_resolves_to_parent_stacked_and_h_collapses_it() {
-        // A(main←a) root; B(a←b) stacked on A. Stacked PRs expanded by default.
+    fn nested_pr_collapses_its_own_subtree_and_keeps_its_row_selected() {
+        // A(main←a) root; B(a←b) stacked on A, with a reviewer child of its own.
         let mut state = me_state(vec![
             simple_pr(1, "main", "a", vec![]),
-            simple_pr(2, "a", "b", vec![]),
+            simple_pr(2, "a", "b", vec![requested_user("alice")]),
         ]);
-        // Selectable: Repo(0), Pr#1(1), Stacked header(2), Pr#2(3).
+        // Selectable: Repo(0), Pr#1(1), Stacked header(2), Pr#2(3), Reviewers(4).
         let section = state.authored_section();
         let ctx = section_ctx_at(&section.rows, 3).expect("nested child resolves");
         assert_eq!(ctx.repo, "o/r");
-        assert_eq!(ctx.number, 1); // parent PR
-        assert_eq!(ctx.section, SectionId::Stacked);
-        assert!(!ctx.is_header);
+        assert_eq!(ctx.number, 2);
+        assert_eq!(ctx.section, SectionId::Subtree);
+        assert!(ctx.is_header);
         drop(section);
 
-        // `h` on the nested child collapses the parent's Stacked node.
+        // `h` leaves the child PR visible and hides only its own descendants.
         state.authored_sel = 3;
         toggle_section(&mut state, false);
         assert!(!report::is_expanded(
             &state.toggled,
             "o/r",
-            1,
-            SectionId::Stacked,
-            SectionId::Stacked.default_expanded()
+            2,
+            SectionId::Subtree,
+            SectionId::Subtree.default_expanded()
         ));
-        assert_eq!(state.authored_sel, 2); // back on the Stacked header
+        assert_eq!(state.authored_sel, 3);
         let section = state.authored_section();
         assert!(
-            !section
+            section
                 .rows
                 .iter()
                 .any(|r| matches!(r, Row::Pr { pr, .. } if pr.number == 2)),
-            "collapsing Stacked hides the nested child PR",
+            "the collapsed nested PR remains visible",
+        );
+        assert!(
+            !section.rows.iter().any(|r| matches!(
+                r,
+                Row::SectionHeader {
+                    section: SectionId::Reviewers,
+                    ..
+                }
+            )),
+            "the nested PR's sections are hidden",
+        );
+    }
+
+    #[test]
+    fn root_pr_subtree_fold_restores_inner_section_state() {
+        let mut state = me_state(vec![simple_pr(
+            1,
+            "main",
+            "a",
+            vec![requested_user("alice")],
+        )]);
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Reviewers, true);
+        state.authored_sel = 1;
+        toggle_section(&mut state, false);
+        assert_eq!(state.authored_sel, 1);
+        assert!(
+            !state
+                .authored_section()
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Reviewer { .. }))
+        );
+
+        toggle_section(&mut state, true);
+        assert_eq!(state.authored_sel, 1);
+        assert!(
+            state
+                .authored_section()
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Reviewer { .. }))
         );
     }
 
@@ -1997,6 +2039,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn committed_filter_pr_subtree_fold_clears_with_the_filter() {
+        let mut state = me_state(vec![simple_pr(
+            1,
+            "main",
+            "a",
+            vec![requested_user("needle")],
+        )]);
+        state.authored_search = AuthoredSearch::Filtered("needle".into());
+        state.authored_sel = 1;
+        toggle_section(&mut state, false);
+
+        assert_eq!(state.authored_sel, 1);
+        assert_eq!(
+            state
+                .search_collapsed
+                .get(&("o/r".into(), 1, SectionId::Subtree)),
+            Some(&false)
+        );
+        assert_eq!(state.authored_section().rows.len(), 2);
+
+        press(&mut state, KeyCode::Esc);
+        assert!(state.search_collapsed.is_empty());
+        assert!(matches!(state.authored_search, AuthoredSearch::Normal));
+        assert!(state.authored_section().rows.len() > 2);
+    }
+
     fn comment(url: &str) -> PrComment {
         PrComment {
             kind: crate::model::PrCommentKind::Thread,
@@ -2183,6 +2252,7 @@ mod tests {
     #[test]
     fn copy_prompt_on_pr_row_aggregates_the_whole_stack() {
         let mut state = stacked_state();
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Subtree, false);
         let section = state.authored_section();
         let idx = sel_where(
             &section,
@@ -2478,6 +2548,7 @@ mod tests {
     #[test]
     fn build_review_request_pr_row_covers_whole_stack() {
         let mut state = stacked_state();
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Subtree, false);
         let section = state.authored_section();
         let idx = sel_where(
             &section,
