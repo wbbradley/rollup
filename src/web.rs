@@ -189,7 +189,14 @@ fn serve_connection(
     snapshot: &WebSnapshot,
     refresh_requests: &Sender<Msg>,
 ) -> io::Result<()> {
+    // macOS propagates the listener's nonblocking mode to accepted sockets.
+    // A large dashboard can fill the kernel send buffer, at which point a
+    // nonblocking `write!` returns WouldBlock and leaves a truncated HTTP body.
+    // Serve each already-accepted connection in blocking mode, bounded by
+    // timeouts so a stalled client cannot hold the single worker forever.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut bytes = [0_u8; 8192];
     let mut read = 0;
     while read < bytes.len() {
@@ -1324,6 +1331,31 @@ mod tests {
             "unexpected response: {response:?}"
         );
         assert!(response.contains("Recently merged PRs"));
+    }
+
+    #[test]
+    fn ephemeral_listener_sends_complete_large_response_body() {
+        let (tx, _rx) = mpsc::channel();
+        let server = start("127.0.0.1:0", tx).unwrap();
+        let mut snapshot = rich_snapshot();
+        let marker = "large-response-marker";
+        snapshot.authored[0].unresolved_comments[0].body =
+            format!("{}-{marker}", "x".repeat(2 * 1024 * 1024));
+        server.snapshots().publish(snapshot);
+
+        let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let response = read_http_response(&mut stream).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.len() > 2 * 1024 * 1024);
+        assert!(response.contains(marker));
     }
 
     #[test]

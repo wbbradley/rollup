@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- The web dashboard now sends large HTML responses to completion instead of closing early when the page exceeds the accepted socket's nonblocking send-buffer capacity.
+
 ### Added
 - TUI-only `v` keybinding for resolving outdated inline review threads in the selected Authored scope. It supports a single outdated comment, one PR's Open comments, complete PR stacks, Stacked descendants, and whole repos; current threads and review summaries are left untouched, partial failures are reported, and successful resolutions trigger a refresh.
 - The interactive TUI footer now continuously shows the web dashboard's actual bound endpoint, using `localhost:<port>` for IPv4 and IPv6 loopback listeners and preserving other socket addresses.
