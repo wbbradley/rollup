@@ -166,7 +166,9 @@ headers cover that one PR's review summaries, inline comments, or failing
 checks; and a reviewer, single comment, or single check copies just that scope
 (a single check works even when it is passing). Nodes with no prompting notion
 (such as **Pending** or **Valid Results**) and empty subtrees report
-`c: nothing to address here`. The prompt closes with a
+`c: nothing to address here`. Comment items are emitted as focused `gh api`
+commands so the receiving agent can fetch their useful fields directly rather
+than following browser URLs. The prompt closes with a
 worktree instruction that is branch-count aware — one worktree for a single
 branch, or a worktree (and possibly a separate sub-agent) per branch when it
 spans several. The section shape also appears in `rollup report`, with every

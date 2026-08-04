@@ -1281,8 +1281,8 @@ fn repo_tree<'a>(authored: &'a [Pr], repo: &str) -> Vec<PrTreeNode<'a>> {
 /// of per-PR actionable items, or `None` when nothing is actionable. Each PR
 /// with ≥1 item becomes a group: an `In {head_ref} (#{number} {title}):`
 /// sub-header (the `In {head_ref} ` prefix and parentheses are dropped when the
-/// source branch is empty, leaving `#{number} {title}:`), a `- {url}` bullet per
-/// comment, then a `- check {name} ({url})` bullet per check (the check's URL,
+/// source branch is empty, leaving `#{number} {title}:`), a GitHub API command
+/// per comment, then a `- check {name} ({url})` bullet per check (the check's URL,
 /// falling back to the owning PR's). The trailer is branch-count aware: with a
 /// single distinct branch it asks for one worktree; with more than one it asks
 /// for a worktree per branch and to consider a sub-agent per branch.
@@ -1308,7 +1308,7 @@ fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
         }
         for comment in &item.comments {
             out.push_str("- ");
-            out.push_str(&comment.url);
+            out.push_str(&comment_api_command(pr, comment).unwrap_or_else(|| comment.url.clone()));
             out.push('\n');
         }
         for check in &item.checks {
@@ -1331,6 +1331,32 @@ fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
         "Use a worktree if this branch is not already active in the current worktree."
     });
     Some(out)
+}
+
+/// Turn a GitHub comment permalink into a command that gives a downstream
+/// agent the useful comment fields without making it scrape or open a browser.
+fn comment_api_command(pr: &Pr, comment: &PrComment) -> Option<String> {
+    match comment.kind {
+        PrCommentKind::Thread => {
+            let id = numeric_fragment_suffix(&comment.url, "#discussion_r")?;
+            Some(format!(
+                "gh api repos/{}/pulls/comments/{id} --jq '{{id,path,line,body,created_at,updated_at}}'",
+                pr.repo
+            ))
+        }
+        PrCommentKind::ReviewSummary => {
+            let id = numeric_fragment_suffix(&comment.url, "#pullrequestreview-")?;
+            Some(format!(
+                "gh api repos/{}/pulls/{}/reviews/{id} --jq '{{id,body,state,submitted_at}}'",
+                pr.repo, pr.number
+            ))
+        }
+    }
+}
+
+fn numeric_fragment_suffix<'a>(url: &'a str, marker: &str) -> Option<&'a str> {
+    let suffix = url.split_once(marker)?.1;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(suffix)
 }
 
 /// Resolve the current Authored-pane selection to its aggregate copy prompt, or
@@ -2685,6 +2711,38 @@ mod tests {
              - https://x/#c9\n\
              \n\
              Use a worktree if this branch is not already active in the current worktree."
+        );
+    }
+
+    #[test]
+    fn combined_prompt_replaces_comment_permalinks_with_api_commands() {
+        let mut pr = simple_pr(12, "main", "feature", vec![]);
+        pr.repo = "langchain-ai/langchainplus".into();
+        let c = comment(
+            "https://github.com/langchain-ai/langchainplus/pull/123#discussion_r3716654034",
+        );
+        let items = vec![PrActions {
+            pr: &pr,
+            comments: vec![&c],
+            checks: vec![],
+        }];
+
+        let prompt = combined_prompt(&items).unwrap();
+        assert!(prompt.contains(
+            "gh api repos/langchain-ai/langchainplus/pulls/comments/3716654034 --jq '{id,path,line,body,created_at,updated_at}'"
+        ));
+        assert!(!prompt.contains("https://github.com/langchain-ai"));
+    }
+
+    #[test]
+    fn review_summary_uses_reviews_api_command() {
+        let pr = simple_pr(12, "main", "feature", vec![]);
+        let mut c = comment("https://github.com/o/r/pull/12#pullrequestreview-42");
+        c.kind = PrCommentKind::ReviewSummary;
+
+        assert_eq!(
+            comment_api_command(&pr, &c).unwrap(),
+            "gh api repos/o/r/pulls/12/reviews/42 --jq '{id,body,state,submitted_at}'"
         );
     }
 
