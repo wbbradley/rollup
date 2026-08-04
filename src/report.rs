@@ -603,7 +603,9 @@ fn push_filtered_pr<'a>(
         tree_prefix: Some(format!("{prefix}{connector}")),
         expanded: None,
     });
-    let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
+    // The PR row is itself a disclosure node. Its sections therefore begin a
+    // full tree level beneath the PR label rather than sharing its text column.
+    let child_base = format!("{prefix}{}   ", if is_last { "   " } else { "│  " });
     let pr = node.pr;
 
     if !pr.checks.is_empty() {
@@ -886,7 +888,9 @@ fn push_pr<'a>(
         tree_prefix: Some(format!("{prefix}{connector}")),
         expanded: None,
     });
-    let child_base = format!("{prefix}{}", if is_last { "   " } else { "│  " });
+    // The PR row is itself a disclosure node. Its sections therefore begin a
+    // full tree level beneath the PR label rather than sharing its text column.
+    let child_base = format!("{prefix}{}   ", if is_last { "   " } else { "│  " });
     let repo = node.pr.repo.as_str();
     let number = node.pr.number;
 
@@ -2086,9 +2090,9 @@ mod tests {
         // sibling), so it uses `├─`; C is the last root, so `└─`.
         assert_eq!(prefix(1), "  ├─ ");
         assert_eq!(prefix(3), "  └─ ");
-        // B is A's only child: one continuation bar under A (A is not last),
-        // then a `└─` connector.
-        assert_eq!(prefix(2), "  │  └─ ");
+        // B is nested beneath A's Stacked PRs section: one continuation bar
+        // under A (A is not last), one PR-child level, then a `└─` connector.
+        assert_eq!(prefix(2), "  │     └─ ");
 
         assert!(
             section
@@ -2100,6 +2104,61 @@ mod tests {
                 })
                 .all(|show_head_ref| *show_head_ref)
         );
+    }
+
+    #[test]
+    fn every_pr_child_kind_starts_one_full_level_below_its_pr() {
+        let mut root = pr_refs("o/r", 1, "main", "a");
+        root.checks = vec![check("build", CheckState::Failure, true)];
+        root.reviewers = vec![user("alice", true)];
+        root.unresolved_comments = vec![comment("bob", "fix this", None, false)];
+        let child = pr_refs("o/r", 2, "a", "b");
+        let authored = vec![root, child];
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Reviewers, true);
+
+        let section = build_section_authored(&authored, "me", &toggled);
+        let direct_section_prefixes: Vec<&str> = section
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SectionHeader {
+                    section:
+                        SectionId::Checks
+                        | SectionId::Reviewers
+                        | SectionId::Comments
+                        | SectionId::Stacked,
+                    tree_prefix,
+                    ..
+                } => Some(tree_prefix.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(direct_section_prefixes, vec!["        "; 4]);
+
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Check { tree_prefix, .. } if tree_prefix == "        └─ "
+        )));
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Reviewer {
+                tree_prefix: Some(tree_prefix),
+                ..
+            } if tree_prefix == "        └─ "
+        )));
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Comment { tree_prefix, .. } if tree_prefix == "        └─ "
+        )));
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::Pr {
+                pr,
+                tree_prefix: Some(tree_prefix),
+                ..
+            } if pr.number == 2 && tree_prefix == "        └─ "
+        )));
     }
 
     #[test]
@@ -2217,15 +2276,15 @@ mod tests {
                 })
                 .expect("pr present with prefix")
         };
-        // A: sole root → `└─`; child base is five spaces.
+        // A: sole root → `└─`; its sections begin one full level below it.
         assert_eq!(prefix(1), "  └─ ");
         // B1: first of A's two children → `├─`, no ancestor bar (A is last).
-        assert_eq!(prefix(2), "     ├─ ");
+        assert_eq!(prefix(2), "        ├─ ");
         // B2: last child → `└─`.
-        assert_eq!(prefix(4), "     └─ ");
+        assert_eq!(prefix(4), "        └─ ");
         // C: only child of B1. B1 is *not* last, so its column keeps a `│`
         // bar, then C's own `└─`.
-        assert_eq!(prefix(3), "     │  └─ ");
+        assert_eq!(prefix(3), "        │     └─ ");
     }
 
     #[test]
@@ -2493,8 +2552,9 @@ mod tests {
         let authored = vec![p];
         let section = build_section_authored(&authored, "me", &ToggledSet::new());
 
-        // Root PR at the two-space base → child base is "     " (2 + 3).
-        let child_base = "     ";
+        // Root PR at the two-space base → its children sit one full tree level
+        // beyond the PR's own connector column.
+        let child_base = "        ";
 
         let headers: Vec<(SectionId, bool, String)> = section
             .rows
@@ -2537,7 +2597,7 @@ mod tests {
             .collect();
         assert_eq!(
             comment_prefixes,
-            vec!["     ├─ ".to_string(), "     └─ ".to_string()],
+            vec!["        ├─ ".to_string(), "        └─ ".to_string()],
         );
     }
 
@@ -2792,10 +2852,10 @@ mod tests {
         assert_eq!(
             shape,
             vec![
-                "H:Checks:true:     ",
-                "C:optional failure:     ├─ ",
-                "C:pending:     ├─ ",
-                "H:Valid Results:false:     └─ ",
+                "H:Checks:true:        ",
+                "C:optional failure:        ├─ ",
+                "C:pending:        ├─ ",
+                "H:Valid Results:false:        └─ ",
             ]
         );
     }
@@ -3162,7 +3222,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(prs, vec![(1, "  └─ ".into()), (3, "     └─ ".into())]);
+        assert_eq!(prs, vec![(1, "  └─ ".into()), (3, "        └─ ".into())]);
         assert!(section.rows.iter().any(|row| matches!(
             row,
             Row::SectionHeader {

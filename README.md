@@ -127,6 +127,8 @@ Under each PR its children are grouped into up to four ordered sections:
    sections.
 
 An Authored PR with any rendered children has its own `▾`/`▸` disclosure.
+Every section beneath it is indented one full tree level past the PR label;
+stacked PRs repeat that hierarchy for their own sections.
 `h`/Left on the PR keeps that PR row visible while hiding all four sections and
 every stacked descendant; `l`/Right restores them with their prior inner fold
 choices intact. A nested PR folds itself, while the parent **Stacked PRs**
