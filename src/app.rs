@@ -1277,15 +1277,10 @@ fn repo_tree<'a>(authored: &'a [Pr], repo: &str) -> Vec<PrTreeNode<'a>> {
     authored_tree(&group)
 }
 
-/// Build the aggregate "please address the following" agent prompt from a set
-/// of per-PR actionable items, or `None` when nothing is actionable. Each PR
-/// with ≥1 item becomes a group: an `In {head_ref} (#{number} {title}):`
-/// sub-header (the `In {head_ref} ` prefix and parentheses are dropped when the
-/// source branch is empty, leaving `#{number} {title}:`), a GitHub API command
-/// per comment, then a `- check {name} ({url})` bullet per check (the check's URL,
-/// falling back to the owning PR's). The trailer is branch-count aware: with a
-/// single distinct branch it asks for one worktree; with more than one it asks
-/// for a worktree per branch and to consider a sub-agent per branch.
+/// Build the aggregate agent prompt from a set of per-PR actionable items, or
+/// `None` when nothing is actionable. Comments are identified by REST API ID
+/// and a short body excerpt, followed by a reusable `gh api` command that keeps
+/// `$comment_id` literal for the receiving agent to substitute.
 fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
     let groups: Vec<&PrActions> = items
         .iter()
@@ -1295,7 +1290,7 @@ fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
         return None;
     }
 
-    let mut out = String::from("Please address the following:\n\n");
+    let mut out = String::new();
     for item in &groups {
         let pr = item.pr;
         if pr.head_ref.is_empty() {
@@ -1306,52 +1301,104 @@ fn combined_prompt(items: &[PrActions<'_>]) -> Option<String> {
                 pr.head_ref, pr.number, pr.title
             ));
         }
-        for comment in &item.comments {
-            out.push_str("- ");
-            out.push_str(&comment_api_command(pr, comment).unwrap_or_else(|| comment.url.clone()));
-            out.push('\n');
+
+        let thread_comments: Vec<(&PrComment, &str)> = item
+            .comments
+            .iter()
+            .filter(|comment| comment.kind == PrCommentKind::Thread)
+            .filter_map(|comment| {
+                numeric_fragment_suffix(&comment.url, "#discussion_r").map(|id| (*comment, id))
+            })
+            .collect();
+        if !thread_comments.is_empty() {
+            out.push_str("\nComment IDs:\n");
+            for (comment, id) in thread_comments {
+                out.push_str(&format!(
+                    "  - {id} - {}\n",
+                    comment_description(&comment.body)
+                ));
+            }
+            out.push_str(
+                "\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\n",
+            );
+            out.push_str(&format!(
+                "gh api repos/{}/pulls/comments/$comment_id --jq '{{id,path,line,body,created_at,updated_at}}'\n```\n",
+                pr.repo
+            ));
         }
-        for check in &item.checks {
-            let url = check.url.as_deref().unwrap_or(pr.url.as_str());
-            out.push_str(&format!("- check {} ({url})\n", check.name));
+
+        let review_summaries: Vec<(&PrComment, &str)> = item
+            .comments
+            .iter()
+            .filter(|comment| comment.kind == PrCommentKind::ReviewSummary)
+            .filter_map(|comment| {
+                numeric_fragment_suffix(&comment.url, "#pullrequestreview-")
+                    .map(|id| (*comment, id))
+            })
+            .collect();
+        if !review_summaries.is_empty() {
+            out.push_str("\nReview IDs:\n");
+            for (comment, id) in review_summaries {
+                out.push_str(&format!(
+                    "  - {id} - {}\n",
+                    comment_description(&comment.body)
+                ));
+            }
+            out.push_str(
+                "\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\n",
+            );
+            out.push_str(&format!(
+                "gh api repos/{}/pulls/{}/reviews/$review_id --jq '{{id,body,state,submitted_at}}'\n```\n",
+                pr.repo, pr.number
+            ));
+        }
+
+        let unidentified: Vec<&PrComment> = item
+            .comments
+            .iter()
+            .copied()
+            .filter(|comment| {
+                let marker = match comment.kind {
+                    PrCommentKind::Thread => "#discussion_r",
+                    PrCommentKind::ReviewSummary => "#pullrequestreview-",
+                };
+                numeric_fragment_suffix(&comment.url, marker).is_none()
+            })
+            .collect();
+        if !unidentified.is_empty() {
+            out.push_str("\nComments:\n");
+            for comment in unidentified {
+                out.push_str(&format!(
+                    "  - {} - {}\n",
+                    comment.url,
+                    comment_description(&comment.body)
+                ));
+            }
+        }
+
+        if !item.checks.is_empty() {
+            out.push_str("\nChecks:\n");
+            for check in &item.checks {
+                let url = check.url.as_deref().unwrap_or(pr.url.as_str());
+                out.push_str(&format!("  - {} ({url})\n", check.name));
+            }
         }
         out.push('\n');
     }
 
-    let mut branches: Vec<&str> = groups
-        .iter()
-        .map(|item| item.pr.head_ref.as_str())
-        .filter(|branch| !branch.is_empty())
-        .collect();
-    branches.sort_unstable();
-    branches.dedup();
-    out.push_str(if branches.len() > 1 {
-        "Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch."
-    } else {
-        "Use a worktree if this branch is not already active in the current worktree."
-    });
+    out.push_str(
+        "Use a worktree if the relevant branches are not already active in the current worktree.",
+    );
     Some(out)
 }
 
-/// Turn a GitHub comment permalink into a command that gives a downstream
-/// agent the useful comment fields without making it scrape or open a browser.
-fn comment_api_command(pr: &Pr, comment: &PrComment) -> Option<String> {
-    match comment.kind {
-        PrCommentKind::Thread => {
-            let id = numeric_fragment_suffix(&comment.url, "#discussion_r")?;
-            Some(format!(
-                "gh api repos/{}/pulls/comments/{id} --jq '{{id,path,line,body,created_at,updated_at}}'",
-                pr.repo
-            ))
-        }
-        PrCommentKind::ReviewSummary => {
-            let id = numeric_fragment_suffix(&comment.url, "#pullrequestreview-")?;
-            Some(format!(
-                "gh api repos/{}/pulls/{}/reviews/{id} --jq '{{id,body,state,submitted_at}}'",
-                pr.repo, pr.number
-            ))
-        }
-    }
+fn comment_description(body: &str) -> String {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(100)
+        .collect()
 }
 
 fn numeric_fragment_suffix<'a>(url: &'a str, marker: &str) -> Option<&'a str> {
@@ -2683,13 +2730,14 @@ mod tests {
         }];
         assert_eq!(
             combined_prompt(&items).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In feature (#12 Fix the thing):\n\
-             - https://x/#c1\n\
-             - check build (https://ci/build)\n\
-             \n\
-             Use a worktree if this branch is not already active in the current worktree."
+            concat!(
+                "In feature (#12 Fix the thing):\n\n",
+                "Comments:\n",
+                "  - https://x/#c1 - add a test\n\n",
+                "Checks:\n",
+                "  - build (https://ci/build)\n\n",
+                "Use a worktree if the relevant branches are not already active in the current worktree.",
+            )
         );
     }
 
@@ -2705,45 +2753,68 @@ mod tests {
         }];
         assert_eq!(
             combined_prompt(&items).unwrap(),
-            "Please address the following:\n\
-             \n\
-             #5 No branch:\n\
-             - https://x/#c9\n\
-             \n\
-             Use a worktree if this branch is not already active in the current worktree."
+            concat!(
+                "#5 No branch:\n\n",
+                "Comments:\n",
+                "  - https://x/#c9 - add a test\n\n",
+                "Use a worktree if the relevant branches are not already active in the current worktree.",
+            )
         );
     }
 
     #[test]
-    fn combined_prompt_replaces_comment_permalinks_with_api_commands() {
-        let mut pr = simple_pr(12, "main", "feature", vec![]);
+    fn combined_prompt_uses_comment_ids_descriptions_and_literal_api_placeholder() {
+        let mut pr = simple_pr(32825, "main", "feature", vec![]);
         pr.repo = "langchain-ai/langchainplus".into();
-        let c = comment(
-            "https://github.com/langchain-ai/langchainplus/pull/123#discussion_r3716654034",
+        pr.title = "fix(abac)!: report access-policy errors as RFC 7807 problem details".into();
+        pr.head_ref = "wbbradley/access-policy-problem-details".into();
+        let mut c = comment(
+            "https://github.com/langchain-ai/langchainplus/pull/32825#discussion_r3716754457",
         );
+        c.body = "Explain the actual review concern here so the agent has useful context".into();
         let items = vec![PrActions {
             pr: &pr,
             comments: vec![&c],
             checks: vec![],
         }];
 
-        let prompt = combined_prompt(&items).unwrap();
-        assert!(prompt.contains(
-            "gh api repos/langchain-ai/langchainplus/pulls/comments/3716654034 --jq '{id,path,line,body,created_at,updated_at}'"
-        ));
-        assert!(!prompt.contains("https://github.com/langchain-ai"));
+        assert_eq!(
+            combined_prompt(&items).unwrap(),
+            concat!(
+                "In wbbradley/access-policy-problem-details (#32825 fix(abac)!: report access-policy errors as RFC 7807 problem details):\n\n",
+                "Comment IDs:\n",
+                "  - 3716754457 - Explain the actual review concern here so the agent has useful context\n\n",
+                "Please use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n",
+                "```\n",
+                "gh api repos/langchain-ai/langchainplus/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n",
+                "```\n\n",
+                "Use a worktree if the relevant branches are not already active in the current worktree.",
+            )
+        );
     }
 
     #[test]
-    fn review_summary_uses_reviews_api_command() {
+    fn review_summary_uses_review_id_description_and_literal_placeholder() {
         let pr = simple_pr(12, "main", "feature", vec![]);
         let mut c = comment("https://github.com/o/r/pull/12#pullrequestreview-42");
         c.kind = PrCommentKind::ReviewSummary;
+        let prompt = combined_prompt(&[PrActions {
+            pr: &pr,
+            comments: vec![&c],
+            checks: vec![],
+        }])
+        .unwrap();
+        assert!(prompt.contains("Review IDs:\n  - 42 - add a test"));
+        assert!(prompt.contains("pulls/12/reviews/$review_id"));
+    }
 
-        assert_eq!(
-            comment_api_command(&pr, &c).unwrap(),
-            "gh api repos/o/r/pulls/12/reviews/42 --jq '{id,body,state,submitted_at}'"
-        );
+    #[test]
+    fn comment_description_normalizes_whitespace_and_limits_unicode_by_character() {
+        let body = format!("  first line\nsecond   line {}tail", "é".repeat(90));
+        let description = comment_description(&body);
+        assert_eq!(description.chars().count(), 100);
+        assert!(description.starts_with("first line second line "));
+        assert!(!description.ends_with("tail"));
     }
 
     #[test]
@@ -2767,22 +2838,14 @@ mod tests {
                 checks: vec![&nourl],
             },
         ];
-        assert_eq!(
-            combined_prompt(&items).unwrap(),
-            format!(
-                "Please address the following:\n\
-                 \n\
-                 In a (#1 first):\n\
-                 - https://x/#c1\n\
-                 - check build (https://ci/build)\n\
-                 \n\
-                 In b (#2 second):\n\
-                 - check test ({})\n\
-                 \n\
-                 Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch.",
-                pr2.url
-            )
-        );
+        let prompt = combined_prompt(&items).unwrap();
+        assert!(prompt.contains("In a (#1 first):"));
+        assert!(prompt.contains("- build (https://ci/build)"));
+        assert!(prompt.contains("In b (#2 second):"));
+        assert!(prompt.contains(&format!("- test ({})", pr2.url)));
+        assert!(prompt.ends_with(
+            "Use a worktree if the relevant branches are not already active in the current worktree."
+        ));
     }
 
     #[test]
@@ -2828,19 +2891,10 @@ mod tests {
         drop(section);
         state.authored_sel = idx;
         // The whole #1 stack (#1 and its child #2), but NOT the sibling root #3.
-        assert_eq!(
-            build_copy_prompt(&state).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In a (#1 first):\n\
-             - https://x/#c1\n\
-             - check build (https://ci/build)\n\
-             \n\
-             In b (#2 second):\n\
-             - check test (https://github.com/o/r/pull/2)\n\
-             \n\
-             Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch."
-        );
+        let prompt = build_copy_prompt(&state).unwrap();
+        assert!(prompt.contains("In a (#1 first):"));
+        assert!(prompt.contains("In b (#2 second):"));
+        assert!(!prompt.contains("In c (#3 third):"));
     }
 
     #[test]
@@ -2854,15 +2908,10 @@ mod tests {
         drop(section);
         state.authored_sel = idx;
         // Only the child #2, not the parent #1 → single branch.
-        assert_eq!(
-            build_copy_prompt(&state).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In b (#2 second):\n\
-             - check test (https://github.com/o/r/pull/2)\n\
-             \n\
-             Use a worktree if this branch is not already active in the current worktree."
-        );
+        let prompt = build_copy_prompt(&state).unwrap();
+        assert!(prompt.contains("In b (#2 second):"));
+        assert!(!prompt.contains("In a (#1 first):"));
+        assert!(!prompt.contains("In c (#3 third):"));
     }
 
     #[test]
@@ -2873,22 +2922,10 @@ mod tests {
         drop(section);
         state.authored_sel = idx;
         // Both roots and the child: #1, #2, #3 → three branches.
-        assert_eq!(
-            build_copy_prompt(&state).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In a (#1 first):\n\
-             - https://x/#c1\n\
-             - check build (https://ci/build)\n\
-             \n\
-             In b (#2 second):\n\
-             - check test (https://github.com/o/r/pull/2)\n\
-             \n\
-             In c (#3 third):\n\
-             - https://x/#c3\n\
-             \n\
-             Use a worktree for each branch if it is not already active in the current worktree, and consider spawning a separate sub-agent per branch."
-        );
+        let prompt = build_copy_prompt(&state).unwrap();
+        assert!(prompt.contains("In a (#1 first):"));
+        assert!(prompt.contains("In b (#2 second):"));
+        assert!(prompt.contains("In c (#3 third):"));
     }
 
     #[test]
@@ -2906,26 +2943,16 @@ mod tests {
         drop(section);
 
         state.authored_sel = comment_idx;
-        assert_eq!(
-            build_copy_prompt(&state).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In a (#1 first):\n\
-             - https://x/#c1\n\
-             \n\
-             Use a worktree if this branch is not already active in the current worktree."
-        );
+        let prompt = build_copy_prompt(&state).unwrap();
+        assert!(prompt.contains("In a (#1 first):"));
+        assert!(prompt.contains("https://x/#c1 - add a test"));
+        assert!(!prompt.contains("build (https://ci/build)"));
 
         state.authored_sel = check_idx;
-        assert_eq!(
-            build_copy_prompt(&state).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In a (#1 first):\n\
-             - check build (https://ci/build)\n\
-             \n\
-             Use a worktree if this branch is not already active in the current worktree."
-        );
+        let prompt = build_copy_prompt(&state).unwrap();
+        assert!(prompt.contains("In a (#1 first):"));
+        assert!(prompt.contains("Checks:\n  - build (https://ci/build)"));
+        assert!(!prompt.contains("https://x/#c1"));
     }
 
     #[test]
@@ -3006,12 +3033,12 @@ mod tests {
         state.authored_sel = lint;
         assert_eq!(
             build_copy_prompt(&state).unwrap(),
-            "Please address the following:\n\
-             \n\
-             In a (#1 t1):\n\
-             - check lint (https://ci/lint)\n\
-             \n\
-             Use a worktree if this branch is not already active in the current worktree."
+            concat!(
+                "In a (#1 t1):\n\n",
+                "Checks:\n",
+                "  - lint (https://ci/lint)\n\n",
+                "Use a worktree if the relevant branches are not already active in the current worktree.",
+            )
         );
     }
 

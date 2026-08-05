@@ -540,7 +540,7 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
                 kind: PrCommentKind::ReviewSummary,
                 thread_id: None,
                 author: author.login,
-                body: first_nonempty_line(&body),
+                body: normalized_comment_body(&body),
                 url,
                 path: None,
                 is_outdated: false,
@@ -567,7 +567,7 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
                     .author
                     .map(|a| a.login)
                     .unwrap_or_else(|| "ghost".into()),
-                body: first_nonempty_line(&comment.body_text.unwrap_or_default()),
+                body: normalized_comment_body(&comment.body_text.unwrap_or_default()),
                 url,
                 path,
                 is_outdated: thread.is_outdated,
@@ -612,14 +612,8 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
     })
 }
 
-/// The first non-empty line of a review comment body, trimmed. Width-aware
-/// truncation belongs to the renderer so wider panes can show more text.
-fn first_nonempty_line(body: &str) -> String {
-    body.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_string()
+fn normalized_comment_body(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Deserialize)]
@@ -1738,7 +1732,10 @@ mod tests {
         let comment = &pr.unresolved_comments[0];
         assert_eq!(comment.kind, PrCommentKind::ReviewSummary);
         assert_eq!(comment.author, "carol");
-        assert_eq!(comment.body, "Please skip the legacy flow.");
+        assert_eq!(
+            comment.body,
+            "Please skip the legacy flow. More detail here."
+        );
         assert_eq!(
             comment.url,
             "https://github.com/o/r/pull/12#pullrequestreview-42"
@@ -2144,11 +2141,14 @@ mod tests {
     }
 
     #[test]
-    fn first_nonempty_line_trims_but_does_not_truncate() {
-        assert_eq!(first_nonempty_line(""), "");
-        assert_eq!(first_nonempty_line("\n\n  hello  \nworld"), "hello");
+    fn normalized_comment_body_flattens_whitespace_but_does_not_truncate() {
+        assert_eq!(normalized_comment_body(""), "");
+        assert_eq!(
+            normalized_comment_body("\n\n  hello  \nworld"),
+            "hello world"
+        );
         let long = "x".repeat(100);
-        assert_eq!(first_nonempty_line(&long), long);
+        assert_eq!(normalized_comment_body(&long), long);
     }
 
     /// Build an `Output` with the given exit code and stdout/stderr text. On

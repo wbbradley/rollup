@@ -145,8 +145,8 @@ pub struct PrComment {
     /// `Thread` comments; review summaries have no resolvable thread.
     pub thread_id: Option<String>,
     pub author: String,
-    /// Full first non-empty line of the comment body; renderers truncate it to
-    /// their available width.
+    /// Full comment body normalized to one whitespace-separated line;
+    /// renderers truncate it to their available width.
     pub body: String,
     /// Direct comment or review permalink.
     pub url: String,
