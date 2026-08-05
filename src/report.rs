@@ -467,7 +467,17 @@ fn visible_text_matches(text: &str, query: &str) -> bool {
 }
 
 fn pr_visible_text(pr: &Pr, viewer: &str) -> String {
+    let auto_merge = if pr.has_auto_merge {
+        " [auto-merge]"
+    } else {
+        ""
+    };
     let draft = if pr.is_draft { " [draft]" } else { "" };
+    let conflict = if pr.has_merge_conflict {
+        " [conflict]"
+    } else {
+        ""
+    };
     let author = if pr.author == viewer {
         String::new()
     } else {
@@ -478,7 +488,10 @@ fn pr_visible_text(pr: &Pr, viewer: &str) -> String {
     } else {
         format!(" [{}]", pr.head_ref)
     };
-    format!("#{}{}{} {}{head_ref}", pr.number, draft, author, pr.title)
+    format!(
+        "#{}{}{}{}{} {}{head_ref}",
+        pr.number, auto_merge, draft, conflict, author, pr.title
+    )
 }
 
 fn reviewer_visible_text(reviewer: &ReviewerStatus) -> String {
@@ -1686,10 +1699,26 @@ fn render_pr_line(
     prefix.push_str(&num);
     prefix.push_str(&reset(use_color));
 
+    if pr.has_auto_merge {
+        let tag = "[auto-merge] ";
+        plain_prefix_cols += tag.chars().count();
+        prefix.push_str(&fg_named(use_color, 36));
+        prefix.push_str(tag);
+        prefix.push_str(&reset(use_color));
+    }
+
     if pr.is_draft {
         let tag = "[draft] ";
         plain_prefix_cols += tag.chars().count();
         prefix.push_str(&dim(use_color));
+        prefix.push_str(tag);
+        prefix.push_str(&reset(use_color));
+    }
+
+    if pr.has_merge_conflict {
+        let tag = "[conflict] ";
+        plain_prefix_cols += tag.chars().count();
+        prefix.push_str(&fg_named(use_color, 31));
         prefix.push_str(tag);
         prefix.push_str(&reset(use_color));
     }
@@ -1970,6 +1999,8 @@ mod tests {
             merged_at: None,
             unresolved_comments: vec![],
             checks: vec![],
+            has_auto_merge: false,
+            has_merge_conflict: false,
             checks_rollup: ChecksRollup::Unknown,
         }
     }

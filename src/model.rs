@@ -183,6 +183,12 @@ pub struct Pr {
     /// reviewing/merged fetches don't request the status-check rollup). Empty
     /// when the PR has no checks, in which case the Checks section is omitted.
     pub checks: Vec<CheckStatus>,
+    /// GitHub has an active auto-merge request for this PR. Only populated for
+    /// authored PRs.
+    pub has_auto_merge: bool,
+    /// GitHub has determined that the head branch cannot currently be merged
+    /// cleanly into its base branch. Only populated for authored PRs.
+    pub has_merge_conflict: bool,
     /// Merge-readiness signal derived from `checks` (required only). See
     /// [`compute_checks_rollup`].
     pub checks_rollup: ChecksRollup,
@@ -435,6 +441,8 @@ mod tests {
             merged_at: None,
             unresolved_comments: vec![],
             checks: vec![],
+            has_auto_merge: false,
+            has_merge_conflict: false,
             checks_rollup: ChecksRollup::Unknown,
         }
     }

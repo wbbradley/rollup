@@ -54,6 +54,7 @@ fragment PrFields on PullRequest {
 fragment AuthoredPrFields on PullRequest {
   ...PrFields
   mergeable
+  autoMergeRequest { enabledAt }
   reviews(first: 50, states: COMMENTED) {
     nodes { author { __typename login } bodyText url }
   }
@@ -585,6 +586,8 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
     // paginated set and recomputes the rollup. `mergeable == UNKNOWN` (or a
     // missing field) means GitHub is still computing → Unknown.
     let (checks, rollup_present) = checks_from_commits(&node.commits);
+    let has_auto_merge = node.auto_merge_request.is_some();
+    let has_merge_conflict = matches!(node.mergeable.as_deref(), Some("CONFLICTING"));
     let mergeable_unknown = !matches!(
         node.mergeable.as_deref(),
         Some("MERGEABLE") | Some("CONFLICTING")
@@ -608,6 +611,8 @@ fn node_to_pr(node: PrNode) -> Option<Pr> {
         merged_at,
         unresolved_comments,
         checks,
+        has_auto_merge,
+        has_merge_conflict,
         checks_rollup,
     })
 }
@@ -668,8 +673,18 @@ struct PrNode {
     /// `MergeableState`: MERGEABLE | CONFLICTING | UNKNOWN. Only fetched by the
     /// authored fragment. UNKNOWN/absent means GitHub is still computing.
     mergeable: Option<String>,
+    /// Non-null while auto-merge is enabled for the PR. Only fetched by the
+    /// authored fragment.
+    #[serde(rename = "autoMergeRequest")]
+    auto_merge_request: Option<AutoMergeRequestNode>,
     /// Last commit's status-check rollup. Only fetched by the authored fragment.
     commits: Option<CommitsConnection>,
+}
+
+#[derive(Deserialize)]
+struct AutoMergeRequestNode {
+    #[serde(rename = "enabledAt")]
+    _enabled_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2138,6 +2153,23 @@ mod tests {
         let mut authored = vec![pr];
         finalize_checks(&mut authored, &HashMap::new());
         assert_eq!(authored[0].checks_rollup, ChecksRollup::Unknown);
+    }
+
+    #[test]
+    fn node_to_pr_records_auto_merge_and_conflict_status() {
+        let json = r#"{
+            "number": 1,
+            "repository": { "nameWithOwner": "o/r" },
+            "mergeable": "CONFLICTING",
+            "autoMergeRequest": { "enabledAt": "2026-08-05T12:00:00Z" },
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": [] } } } }] }
+        }"#;
+        let node: PrNode = serde_json::from_str(json).unwrap();
+        let pr = node_to_pr(node).unwrap();
+        assert!(pr.has_auto_merge);
+        assert!(pr.has_merge_conflict);
+        // A conflict is independent of the required-check rollup.
+        assert_eq!(pr.checks_rollup, ChecksRollup::Green);
     }
 
     #[test]

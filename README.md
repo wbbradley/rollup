@@ -3,7 +3,7 @@
 A terminal dashboard for your GitHub PR review workload. Panes:
 
 - **Review requested of me** — open PRs waiting on your review (Radar page, `e`).
-- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch), with each source branch shown as a muted `[branch/name]` suffix. Fills the full width of the Me view.
+- **Authored by me** — your open PRs and where each reviewer stands, nested into a merge-target tree (stacked PRs shown under their base branch), with auto-merge and merge-conflict status plus each source branch on the PR heading. Fills the full width of the Me view.
 - **Recent releases** — for every repo in your config, the three most recent releases per repo as a tree (Radar page, `e`).
 - **Recently merged PRs** — recent merges by the authors visible in the current view (you and the authors of the PRs awaiting your review).
 
@@ -104,6 +104,10 @@ that PR, with `├─`/`└─`/`│` connectors — so stacked PRs read at a gl
 that targets a branch you don't have an open PR for (e.g. `main`) sits at the
 top level under its repo header. Each PR label ends with its GitHub source
 branch in muted square brackets, such as `Improve rendering [feature/render]`.
+An `[auto-merge]` badge immediately after the PR number means GitHub auto-merge
+is enabled. A red `[conflict]` badge means GitHub has determined the PR cannot
+currently merge cleanly into its base branch. The web UI spells these badges
+`auto-merge` and `merge conflict`.
 
 Under each PR its children are grouped into up to four ordered sections:
 

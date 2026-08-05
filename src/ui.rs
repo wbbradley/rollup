@@ -381,10 +381,22 @@ fn pr_line(
         format!("#{} ", pr.number),
         Style::default().fg(Color::Blue),
     ));
+    if pr.has_auto_merge {
+        spans.push(Span::styled(
+            "[auto-merge] ",
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if pr.is_draft {
         spans.push(Span::styled(
             "[draft] ",
             Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if pr.has_merge_conflict {
+        spans.push(Span::styled(
+            "[conflict] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
     let show_author = hide_author_if.is_none_or(|v| v != pr.author);
@@ -726,6 +738,8 @@ mod tests {
             merged_at: None,
             unresolved_comments: Vec::new(),
             checks: Vec::new(),
+            has_auto_merge: false,
+            has_merge_conflict: false,
             checks_rollup: ChecksRollup::Unknown,
         }
     }
@@ -772,6 +786,27 @@ mod tests {
 
         let leaf = pr_line(&test_pr("branch"), Some("me"), true, Some("└─ "), None);
         assert_eq!(leaf.spans[1].content.as_ref(), "#7 ");
+    }
+
+    #[test]
+    fn pr_line_places_auto_merge_before_draft_and_conflict() {
+        let mut pr = test_pr("branch");
+        pr.has_auto_merge = true;
+        pr.is_draft = true;
+        pr.has_merge_conflict = true;
+        let line = pr_line(&pr, Some("me"), true, None, None);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("#7 [auto-merge] [draft] [conflict] Improve rendering"));
+        let conflict = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "[conflict] ")
+            .unwrap();
+        assert_eq!(conflict.style.fg, Some(Color::Red));
     }
 
     #[test]

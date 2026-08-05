@@ -1653,6 +1653,8 @@ mod tests {
                 is_outdated: false,
             }],
             checks: vec![],
+            has_auto_merge: false,
+            has_merge_conflict: false,
             checks_rollup: crate::model::ChecksRollup::Unknown,
         }
     }
@@ -1741,6 +1743,8 @@ mod tests {
             merged_at: None,
             unresolved_comments: vec![],
             checks: vec![],
+            has_auto_merge: false,
+            has_merge_conflict: false,
             checks_rollup: crate::model::ChecksRollup::Unknown,
         }
     }

@@ -451,21 +451,31 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
     } else {
         out.push_str("<h3>");
     }
+    let mut badges = String::new();
+    if pr.has_auto_merge {
+        badges.push_str(
+            " <span class=\"badge\" style=\"border-color:var(--link);color:var(--link)\">auto-merge</span>",
+        );
+    }
+    if pr.is_draft {
+        badges.push_str(" <span class=\"badge\">draft</span>");
+    }
+    if pr.has_merge_conflict {
+        badges.push_str(
+            " <span class=\"badge\" style=\"border-color:var(--bad);color:var(--bad);font-weight:700\">merge conflict</span>",
+        );
+    }
     let _ = write!(
         out,
-        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span> {}{}</a>{}",
+        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><span class=\"number\">#{}</span>{} {}{}</a>",
         escape(&pr.url),
         pr.number,
+        badges,
         escape(&pr.title),
         if pr.head_ref.is_empty() {
             String::new()
         } else {
             format!(" <span class=\"muted\">[{}]</span>", escape(&pr.head_ref))
-        },
-        if pr.is_draft {
-            " <span class=\"badge\">draft</span>"
-        } else {
-            ""
         }
     );
     out.push_str(if has_rendered_children {
@@ -871,6 +881,8 @@ mod tests {
             merged_at: None,
             unresolved_comments: Vec::new(),
             checks: Vec::new(),
+            has_auto_merge: false,
+            has_merge_conflict: false,
             checks_rollup: ChecksRollup::Unknown,
         }
     }
@@ -1071,6 +1083,23 @@ mod tests {
 
         assert!(html.contains("<li class=\"pr\"><article><h3><a href="));
         assert!(!html.contains("section:subtree"));
+    }
+
+    #[test]
+    fn authored_pr_heading_reports_auto_merge_and_conflict() {
+        let mut pr = pr("o/r", 7, "me", 1);
+        pr.has_auto_merge = true;
+        pr.is_draft = true;
+        pr.has_merge_conflict = true;
+        let html = render_authored(&WebSnapshot {
+            viewer: "me".into(),
+            authored: vec![pr],
+            ..WebSnapshot::default()
+        });
+        let auto = html.find(">auto-merge</span>").unwrap();
+        let draft = html.find(">draft</span>").unwrap();
+        let conflict = html.find(">merge conflict</span>").unwrap();
+        assert!(auto < draft && draft < conflict);
     }
 
     #[test]
