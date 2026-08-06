@@ -113,8 +113,7 @@ currently merge cleanly into its base branch. The web UI spells these badges
 Under each PR its children are grouped into up to four ordered sections:
 
 1. **Checks** — a merge-readiness rollup for the PR's head commit. It starts
-   expanded when any required or optional check has failed/errored, and starts
-   collapsed otherwise; the header shows a glyph + required ratio, e.g.
+   collapsed; the header shows a glyph + required ratio, e.g.
    `▸ Checks ✓ 4/4 required`. Failure/Error rows sit directly under Checks in
    attention-first order. Pending rows are grouped under a nested,
    default-collapsed **Pending** node; Success, Skipped, and Neutral rows are
@@ -243,8 +242,9 @@ The file is optional — without it, the Recent releases pane just shows
 in the footer status line rather than crashing the app.
 
 Backburner membership is stored separately in `$XDG_STATE_HOME/rollup.yaml`
-(normally `~/.local/state/rollup.yaml`). The file is created on first use and
-stale entries are removed after a GitHub refresh no longer returns that PR.
+(normally `~/.local/state/rollup.yaml`). The file is created on first use.
+Entries for PRs that are closed or temporarily absent from GitHub's search
+results remain dormant and do not appear in the UI.
 
 The `Recent releases` pane renders as a tree: one header per configured repo,
 with up to three of its most recent releases beneath (newest first, e.g.

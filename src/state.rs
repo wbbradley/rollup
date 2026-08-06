@@ -6,8 +6,6 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::Pr;
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PrRef {
     pub repo: String,
@@ -33,6 +31,10 @@ pub fn state_path() -> PathBuf {
 pub fn load() -> Result<BackburnerSet> {
     load_from(&state_path())
 }
+
+// Do not prune entries against a GitHub search response here. The authored
+// query is capped and may also omit inaccessible results, so absence is not
+// authoritative evidence that a PR is stale.
 
 fn load_from(path: &Path) -> Result<BackburnerSet> {
     let text = match std::fs::read_to_string(path) {
@@ -63,18 +65,7 @@ fn save_to(path: &Path, backburner: &BackburnerSet) -> Result<()> {
     Ok(())
 }
 
-/// Drop entries that were not present in the latest authored-PR fetch.
-pub fn scrub(backburner: &mut BackburnerSet, authored: &[Pr]) -> bool {
-    let before = backburner.len();
-    backburner.retain(|entry| {
-        authored
-            .iter()
-            .any(|pr| pr.repo == entry.repo && pr.number == entry.pr)
-    });
-    backburner.len() != before
-}
-
-pub fn contains(backburner: &BackburnerSet, pr: &Pr) -> bool {
+pub fn contains(backburner: &BackburnerSet, pr: &crate::model::Pr) -> bool {
     backburner.contains(&PrRef {
         repo: pr.repo.clone(),
         pr: pr.number,
@@ -86,10 +77,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_and_scrub() {
+    fn round_trip_preserves_membership() {
         let dir = std::env::temp_dir().join(format!("rollup-state-test-{}", std::process::id()));
         let path = dir.join("state.yaml");
-        let mut set = BackburnerSet::from([
+        let set = BackburnerSet::from([
             PrRef {
                 repo: "o/r".into(),
                 pr: 1,
@@ -102,8 +93,6 @@ mod tests {
         save_to(&path, &set).unwrap();
         assert_eq!(load_from(&path).unwrap(), set);
 
-        assert!(scrub(&mut set, &[]));
-        assert!(set.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

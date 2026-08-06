@@ -177,14 +177,7 @@ impl AppState {
     fn apply(&mut self, data: Data) {
         let mut notes: Vec<String> = Vec::new();
         match state::load() {
-            Ok(mut backburner) => {
-                if state::scrub(&mut backburner, &data.authored)
-                    && let Err(err) = state::save(&backburner)
-                {
-                    notes.push(format!("state: {err:#}"));
-                }
-                self.backburner = backburner;
-            }
+            Ok(backburner) => self.backburner = backburner,
             Err(err) => notes.push(format!("state: {err:#}")),
         }
         self.viewer = Some(data.viewer);
@@ -2680,6 +2673,7 @@ mod tests {
     #[test]
     fn outdated_comment_resolution_scopes_follow_the_authored_tree() {
         let mut state = stacked_state();
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
         state.authored[0].unresolved_comments = vec![
             outdated_comment("https://x/#root"),
             comment("https://x/#current"),
@@ -3103,6 +3097,7 @@ mod tests {
     #[test]
     fn copy_prompt_single_comment_and_single_check_share_the_unified_format() {
         let mut state = stacked_state();
+        report::set_expanded(&mut state.toggled, "o/r", 1, SectionId::Checks, true);
         let section = state.authored_section();
         let comment_idx = sel_where(
             &section,

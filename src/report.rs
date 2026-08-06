@@ -83,9 +83,9 @@ impl SectionId {
         }
     }
 
-    /// Static section default. Checks supplies a data-driven default at its
-    /// call site; Pending, Valid Results, and Reviewers start collapsed, while
-    /// Repo, Open comments, and Stacked PRs start expanded.
+    /// Static section default. Checks, Pending, Valid Results, and Reviewers
+    /// start collapsed, while Repo, Open comments, and Stacked PRs start
+    /// expanded.
     pub fn default_expanded(self) -> bool {
         !matches!(
             self,
@@ -200,12 +200,6 @@ fn check_is_pending(check: &CheckStatus) -> bool {
 
 fn check_is_failed(check: &CheckStatus) -> bool {
     matches!(check.state, CheckState::Failure | CheckState::Error)
-}
-
-fn checks_default_expanded(pr: &Pr) -> bool {
-    pr.checks
-        .iter()
-        .any(|check| matches!(check.state, CheckState::Failure | CheckState::Error))
 }
 
 /// The distinct reviewer response states present on a PR, stably ordered: `req`
@@ -1087,16 +1081,16 @@ fn push_pr<'a>(
     let repo = node.pr.repo.as_str();
     let number = node.pr.number;
 
-    // Checks section — emitted first and opened by default when any check is
-    // failing/errored. Failures remain direct children; pending and completed
-    // outcomes live under independent, default-collapsed nested nodes.
+    // Checks section — emitted first and collapsed by default. Failures remain
+    // direct children; pending and completed outcomes live under independent,
+    // default-collapsed nested nodes.
     if !node.pr.checks.is_empty() {
         let expanded = is_expanded(
             toggled,
             repo,
             number,
             SectionId::Checks,
-            checks_default_expanded(node.pr),
+            SectionId::Checks.default_expanded(),
         );
         rows.push(Row::SectionHeader {
             section: SectionId::Checks,
@@ -2098,18 +2092,13 @@ pub fn run() -> Result<()> {
     for w in &data.warnings {
         eprintln!("warning: {w}");
     }
-    let mut backburner = match state::load() {
+    let backburner = match state::load() {
         Ok(backburner) => backburner,
         Err(err) => {
             eprintln!("state: {err:#}");
             BackburnerSet::new()
         }
     };
-    if state::scrub(&mut backburner, &data.authored)
-        && let Err(err) = state::save(&backburner)
-    {
-        eprintln!("state: {err:#}");
-    }
     let now = Utc::now();
     let report = build_full_report_with_backburner(
         &data.viewer,
@@ -2486,6 +2475,7 @@ mod tests {
         let child = pr_refs("o/r", 2, "a", "b");
         let authored = vec![root, child];
         let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 1, SectionId::Checks, true);
         set_expanded(&mut toggled, "o/r", 1, SectionId::Reviewers, true);
 
         let section = build_section_authored(&authored, "me", &toggled);
@@ -3205,7 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn failing_checks_open_with_failures_above_collapsed_pending_and_valid_results() {
+    fn failing_checks_stay_collapsed_by_default_and_group_when_expanded() {
         let mut p = pr("o/r", 1, "me", false, 100, vec![]);
         p.checks = vec![
             check("success", CheckState::Success, true),
@@ -3231,17 +3221,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            shape,
-            vec![
-                "H:Checks:true:        ",
-                "C:optional failure:        ├─ ",
-                "H:Pending:false:        ├─ ",
-                "H:Valid Results:false:        └─ ",
-            ]
-        );
+        assert_eq!(shape, vec!["H:Checks:false:        "]);
 
         let mut expanded = ToggledSet::new();
+        set_expanded(&mut expanded, "o/r", 1, SectionId::Checks, true);
         set_expanded(&mut expanded, "o/r", 1, SectionId::Pending, true);
         let section = build_section_authored(&authored, "me", &expanded);
         let pending_rows: Vec<String> = section

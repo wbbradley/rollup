@@ -504,10 +504,6 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
 
     if !pr.checks.is_empty() {
         let summary = ChecksSummary::of(pr);
-        let checks_open = pr
-            .checks
-            .iter()
-            .any(|check| matches!(check.state, CheckState::Failure | CheckState::Error));
         let class = match summary.rollup {
             ChecksRollup::Green => "ok",
             ChecksRollup::Red => "bad",
@@ -516,9 +512,8 @@ fn render_pr(out: &mut String, node: &PrTreeNode<'_>) {
         };
         let _ = write!(
             out,
-            "<details class=\"pr-section checks\" data-state-key=\"{}\"{}><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
+            "<details class=\"pr-section checks\" data-state-key=\"{}\"><summary>Checks <span class=\"{}\">{}</span></summary><p class=\"context-link\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open PR</a></p><ul>",
             escape(&section_state_key(pr, "checks")),
-            if checks_open { " open" } else { "" },
             class,
             escape(&format!(
                 "{} — {}",
@@ -1057,7 +1052,7 @@ mod tests {
         assert!(html.contains("<ul class=\"review-comments\">"));
         assert!(html.contains("review summary &lt;note&gt;"));
         assert!(html.contains("<details class=\"pr-section stacked\" data-state-key="));
-        assert!(html.contains("data-state-key=\"repo:z/repo:pr:1:section:checks\" open"));
+        assert!(!html.contains("data-state-key=\"repo:z/repo:pr:1:section:checks\" open"));
         assert!(html.contains(
             "<details class=\"check-results valid-results\" data-state-key=\"repo:z/repo:pr:1:section:valid-results\"><summary>Valid Results</summary>"
         ));
@@ -1182,7 +1177,7 @@ mod tests {
             authored: vec![actionable],
             ..WebSnapshot::default()
         });
-        assert!(actionable_html.contains("data-state-key=\"repo:o/r:pr:2:section:checks\" open"));
+        assert!(!actionable_html.contains("data-state-key=\"repo:o/r:pr:2:section:checks\" open"));
         assert!(actionable_html.contains(
             "<details class=\"check-results pending-results\" data-state-key=\"repo:o/r:pr:2:section:pending\"><summary>Pending</summary>"
         ));
