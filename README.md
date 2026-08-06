@@ -22,7 +22,9 @@ The server binds only to loopback, starts and stops with the TUI, and never
 opens a browser automatically. Use **Refresh** on either page (or press `r` in
 the TUI) to start one shared GitHub fetch for both interfaces. The browser shows
 loading progress, reloads when the fetch finishes, and keeps each PR section's
-expanded or folded state within that tab. Authored PRs with children are also
+expanded or folded state in session storage for that tab. The app also refreshes
+automatically every five minutes by default; see [Config](#config). Authored PRs
+with children are also
 disclosures: folding a PR keeps its heading visible while hiding every nested
 section and stacked descendant, without changing their individual folds. A
 failed refresh leaves the last good
@@ -63,6 +65,7 @@ a later refresh fails. `rollup report` does not start the listener.
 | Key             | Action                                                |
 |-----------------|-------------------------------------------------------|
 | `↑` `↓` `k` `j` | Move selection (PR rows *and* reviewer sub-rows)      |
+| `PgUp` / `PgDn` | Move by half the visible pane (`Ctrl-U` / `Ctrl-D` also work) |
 | `l` / `h`       | Expand / collapse the selected PR subtree, section, or repo grouping (Authored pane; Right/Left also work) |
 | `g` / `G`       | Jump to top / bottom of the pane                      |
 | `e`             | Open the Radar page (Review requested + Recent releases) |
@@ -110,6 +113,12 @@ is enabled. A red `[conflict]` badge means GitHub has determined the PR cannot
 currently merge cleanly into its base branch. The web UI spells these badges
 `auto-merge` and `merge conflict`.
 
+Press `b` on a PR to move it and every stacked descendant into that repository's
+**Backburner** group, which appears after the active PR trees and starts
+collapsed. Press `b` on a PR inside Backburner to move its subtree back into the
+active list. Membership is shared by the TUI, web UI, and `rollup report`, and
+persists across refreshes and restarts.
+
 Under each PR its children are grouped into up to four ordered sections:
 
 1. **Checks** — a merge-readiness rollup for the PR's head commit. It starts
@@ -146,10 +155,10 @@ selectable `▸`/`▾` header that is also a **collapse control**: `l`/Right exp
 it, `h`/Left collapses it. `h`/Left on a child row (check, reviewer, comment, or
 nested PR) collapses its enclosing section and moves the cursor back to that
 section's header. A pending check collapses back to **Pending**, a valid check
-to **Valid Results**, and a failing/errored check to **Checks**. Checks
-conditionally expands as described above, while Pending, Valid Results, and
-Reviewers start collapsed unless a review summary needs attention (Open
-comments and Stacked PRs start expanded).
+to **Valid Results**, and a failing/errored check to **Checks**. Checks,
+Pending, and Valid Results start collapsed. Reviewers also starts collapsed
+unless a review summary needs attention; Open comments and Stacked PRs start
+expanded.
 The Reviewers header carries a compact
 response-state summary — e.g. `▸ Reviewers [req, ✗ changes]` — so a
 changes-requested review (`✗`) is visible at a glance without expanding.
@@ -217,8 +226,8 @@ checks only**:
 | `◉`   | Pending — a required check is still queued/running and none have failed.  |
 | `○`   | Unknown — GitHub hasn't computed mergeability/the rollup yet; resolves on refresh. |
 
-A **failing non-required check never turns the signal red**, but it does open
-the Checks section so the failure is visible; its row is dimmed and marked
+A **failing non-required check never turns the signal red**. When Checks is
+expanded, its row appears directly beneath the header, dimmed and marked
 `(not required)`. A PR whose base branch has
 no required checks (common for stacked PRs targeting an unprotected feature
 branch) shows green `no required checks`. A PR with no checks at all omits the
@@ -227,14 +236,19 @@ waiting on a review but whose required checks all pass shows **green**.
 
 ## Config
 
-`rollup` reads `~/.config/rollup/config.yaml` (or `$XDG_CONFIG_HOME/rollup/config.yaml`)
-at startup. The only field today is `repos`, a list of `owner/name` entries that
-drives the Recent releases pane:
+`rollup` reads `~/.config/rollup/config.yaml` (or
+`$XDG_CONFIG_HOME/rollup/config.yaml`) at startup. It supports:
+
+- `repos`: a list of `owner/name` entries that drives the Recent releases pane.
+- `refresh_interval_secs`: automatic GitHub refresh cadence in seconds. It
+  defaults to `300`; values below `30` are raised to `30` to avoid hammering the
+  API.
 
 ```yaml
 repos:
   - MystenLabs/walrus
   - MystenLabs/sui
+refresh_interval_secs: 300
 ```
 
 The file is optional — without it, the Recent releases pane just shows
