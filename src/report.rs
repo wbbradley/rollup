@@ -14,6 +14,7 @@ use crate::{
         ReleaseInfo, RepoReleaseInfo, ReviewState, ReviewerStatus, TagInfo, authored_tree,
         authors_for_me, checks_by_display_priority, group_by_repo, human_age,
     },
+    state::{self, BackburnerSet},
 };
 
 pub const MERGED_PANE_CAP: usize = 10;
@@ -55,6 +56,8 @@ pub enum SectionId {
     /// as `(repo, 0, Repo)` — no real PR is `#0` — so a whole repo grouping can
     /// be collapsed. Starts expanded.
     Repo,
+    /// Per-repo grouping for PRs intentionally set aside. Starts collapsed.
+    Backburner,
     /// One Authored PR's complete rendered subtree. Starts expanded.
     Subtree,
     Checks,
@@ -69,6 +72,7 @@ impl SectionId {
     pub fn label(self) -> &'static str {
         match self {
             SectionId::Repo => "Repo",
+            SectionId::Backburner => "Backburner",
             SectionId::Subtree => "PR subtree",
             SectionId::Checks => "Checks",
             SectionId::Pending => "Pending",
@@ -85,7 +89,11 @@ impl SectionId {
     pub fn default_expanded(self) -> bool {
         !matches!(
             self,
-            SectionId::Checks | SectionId::Pending | SectionId::ValidResults | SectionId::Reviewers
+            SectionId::Backburner
+                | SectionId::Checks
+                | SectionId::Pending
+                | SectionId::ValidResults
+                | SectionId::Reviewers
         )
     }
 }
@@ -245,6 +253,12 @@ pub enum Row<'a> {
         repo: String,
         expanded: Option<bool>,
     },
+    /// The final, default-collapsed child grouping within an Authored repo.
+    BackburnerHeader {
+        repo: String,
+        expanded: bool,
+        tree_prefix: String,
+    },
     Pr {
         pr: &'a Pr,
         hide_author_if: Option<String>,
@@ -310,6 +324,7 @@ impl Row<'_> {
         matches!(
             self,
             Row::RepoHeader { .. }
+                | Row::BackburnerHeader { .. }
                 | Row::Pr { .. }
                 | Row::Reviewer { .. }
                 | Row::SectionHeader { .. }
@@ -325,7 +340,7 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(reviewing) {
         rows.push(Row::RepoHeader {
-            repo,
+            repo: repo.clone(),
             expanded: None,
         });
         for pr in group_prs {
@@ -354,10 +369,20 @@ pub fn build_section_reviewing<'a>(reviewing: &'a [Pr]) -> Section<'a> {
     }
 }
 
+#[cfg(test)]
 pub fn build_section_authored<'a>(
     authored: &'a [Pr],
     viewer: &str,
     toggled: &ToggledSet,
+) -> Section<'a> {
+    build_section_authored_with_backburner(authored, viewer, toggled, &BackburnerSet::new())
+}
+
+pub fn build_section_authored_with_backburner<'a>(
+    authored: &'a [Pr],
+    viewer: &str,
+    toggled: &ToggledSet,
+    backburner: &BackburnerSet,
 ) -> Section<'a> {
     let mut rows: Vec<Row<'a>> = Vec::new();
     for (repo, group_prs) in group_by_repo(authored) {
@@ -372,18 +397,49 @@ pub fn build_section_authored<'a>(
             SectionId::Repo.default_expanded(),
         );
         rows.push(Row::RepoHeader {
-            repo,
+            repo: repo.clone(),
             expanded: Some(expanded),
         });
         if !expanded {
             continue;
         }
-        // Within each repo, nest PRs by merge target (stacked-PR tree). Roots
-        // start at the two-space base under the repo header.
-        let tree = authored_tree(&group_prs);
+        let (backburner_prs, active_prs): (Vec<_>, Vec<_>) = group_prs
+            .into_iter()
+            .partition(|pr| state::contains(backburner, pr));
+        // Within each repo, nest PRs by merge target (stacked-PR tree). Active
+        // roots come first; Backburner, when present, is always the last root.
+        let tree = authored_tree(&active_prs);
         let n = tree.len();
         for (i, node) in tree.iter().enumerate() {
-            push_pr(&mut rows, node, viewer, "  ", i + 1 == n, toggled);
+            push_pr(
+                &mut rows,
+                node,
+                viewer,
+                "  ",
+                backburner_prs.is_empty() && i + 1 == n,
+                toggled,
+            );
+        }
+        if !backburner_prs.is_empty() {
+            let expanded = is_expanded(
+                toggled,
+                &repo,
+                0,
+                SectionId::Backburner,
+                SectionId::Backburner.default_expanded(),
+            );
+            rows.push(Row::BackburnerHeader {
+                repo: repo.clone(),
+                expanded,
+                tree_prefix: "  └─ ".into(),
+            });
+            if expanded {
+                let tree = authored_tree(&backburner_prs);
+                let n = tree.len();
+                for (i, node) in tree.iter().enumerate() {
+                    push_pr(&mut rows, node, viewer, "     ", i + 1 == n, toggled);
+                }
+            }
         }
     }
     Section {
@@ -401,30 +457,62 @@ pub fn build_section_authored<'a>(
 /// only matching rows plus the repo/PR/section path needed to reach them.
 /// Persistent `ToggledSet` state is deliberately absent: `search_collapsed`
 /// contains only temporary folds made while a committed filter is active.
+#[cfg(test)]
 pub fn build_section_authored_filtered<'a>(
     authored: &'a [Pr],
     viewer: &str,
     query: &str,
     search_collapsed: &ToggledSet,
 ) -> Section<'a> {
+    build_section_authored_filtered_with_backburner(
+        authored,
+        viewer,
+        query,
+        search_collapsed,
+        &BackburnerSet::new(),
+    )
+}
+
+pub fn build_section_authored_filtered_with_backburner<'a>(
+    authored: &'a [Pr],
+    viewer: &str,
+    query: &str,
+    search_collapsed: &ToggledSet,
+    backburner: &BackburnerSet,
+) -> Section<'a> {
     let query = query.to_lowercase();
     let mut rows: Vec<Row<'a>> = Vec::new();
     let mut count = 0;
 
     for (repo, group_prs) in group_by_repo(authored) {
-        let tree = authored_tree(&group_prs);
+        let (backburner_prs, active_prs): (Vec<_>, Vec<_>) = group_prs
+            .into_iter()
+            .partition(|pr| state::contains(backburner, pr));
+        let tree = authored_tree(&active_prs);
         let matching_roots: Vec<&PrTreeNode<'_>> = tree
             .iter()
             .filter(|node| filtered_pr_matches(node, viewer, &query))
             .collect();
-        if visible_text_matches(&repo, &query) || !matching_roots.is_empty() {
+        let backburner_tree = authored_tree(&backburner_prs);
+        let matching_backburner: Vec<&PrTreeNode<'_>> = backburner_tree
+            .iter()
+            .filter(|node| filtered_pr_matches(node, viewer, &query))
+            .collect();
+        if visible_text_matches(&repo, &query)
+            || !matching_roots.is_empty()
+            || !matching_backburner.is_empty()
+        {
             // Repo grouping is not collapsible while a committed filter is
             // active (`expanded: None`), so it shows no disclosure glyph.
             rows.push(Row::RepoHeader {
-                repo,
+                repo: repo.clone(),
                 expanded: None,
             });
             count += matching_roots
+                .iter()
+                .map(|node| count_filtered_prs(node, viewer, &query))
+                .sum::<usize>();
+            count += matching_backburner
                 .iter()
                 .map(|node| count_filtered_prs(node, viewer, &query))
                 .sum::<usize>();
@@ -436,9 +524,32 @@ pub fn build_section_authored_filtered<'a>(
                     viewer,
                     &query,
                     "  ",
-                    index + 1 == root_count,
+                    matching_backburner.is_empty() && index + 1 == root_count,
                     search_collapsed,
                 );
+            }
+            if !matching_backburner.is_empty() {
+                let key = (repo.clone(), 0, SectionId::Backburner);
+                let expanded = !search_collapsed.contains_key(&key);
+                rows.push(Row::BackburnerHeader {
+                    repo: repo.clone(),
+                    expanded,
+                    tree_prefix: "  └─ ".into(),
+                });
+                if expanded {
+                    let root_count = matching_backburner.len();
+                    for (index, node) in matching_backburner.into_iter().enumerate() {
+                        push_filtered_pr(
+                            &mut rows,
+                            node,
+                            viewer,
+                            &query,
+                            "     ",
+                            index + 1 == root_count,
+                            search_collapsed,
+                        );
+                    }
+                }
             }
         }
     }
@@ -560,9 +671,11 @@ fn section_visible_text(section: SectionId, pr: &Pr) -> String {
                 .join(", ");
             format!("{} {summary}", section.label())
         }
-        SectionId::Comments | SectionId::Stacked | SectionId::Repo | SectionId::Subtree => {
-            section.label().to_string()
-        }
+        SectionId::Comments
+        | SectionId::Stacked
+        | SectionId::Repo
+        | SectionId::Backburner
+        | SectionId::Subtree => section.label().to_string(),
     }
 }
 
@@ -1299,6 +1412,7 @@ pub fn build_section_releases<'a>(
     }
 }
 
+#[cfg(test)]
 pub fn build_full_report<'a>(
     viewer: &'a str,
     authored: &'a [Pr],
@@ -1308,11 +1422,35 @@ pub fn build_full_report<'a>(
     now: DateTime<Utc>,
     loaded_at: Option<DateTime<Local>>,
 ) -> Report<'a> {
+    build_full_report_with_backburner(
+        viewer,
+        authored,
+        reviewing,
+        merged,
+        releases,
+        now,
+        loaded_at,
+        &BackburnerSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_full_report_with_backburner<'a>(
+    viewer: &'a str,
+    authored: &'a [Pr],
+    reviewing: &'a [Pr],
+    merged: &'a [Pr],
+    releases: &'a [RepoReleaseInfo],
+    now: DateTime<Utc>,
+    loaded_at: Option<DateTime<Local>>,
+    backburner: &BackburnerSet,
+) -> Report<'a> {
     let allowed: BTreeSet<String> = allowed_authors_me(viewer, reviewing);
     // The console has no interactive controls, so make every section visible.
     // Explicitly expand every interactive level for complete console output.
     let mut toggled = ToggledSet::new();
     for pr in authored {
+        set_expanded(&mut toggled, &pr.repo, 0, SectionId::Backburner, true);
         set_expanded(&mut toggled, &pr.repo, pr.number, SectionId::Checks, true);
         set_expanded(&mut toggled, &pr.repo, pr.number, SectionId::Pending, true);
         set_expanded(
@@ -1336,7 +1474,7 @@ pub fn build_full_report<'a>(
         sections: vec![
             build_section_reviewing(reviewing),
             build_section_releases(releases, now),
-            build_section_authored(authored, viewer, &toggled),
+            build_section_authored_with_backburner(authored, viewer, &toggled, backburner),
             build_section_merged(merged, &allowed, MERGED_PANE_CAP, now),
         ],
     }
@@ -1479,6 +1617,19 @@ fn render_row(
                 reset(use_color)
             )
         }
+        Row::BackburnerHeader {
+            expanded,
+            tree_prefix,
+            ..
+        } => render_section_header_line(
+            SectionId::Backburner,
+            *expanded,
+            &[],
+            None,
+            tree_prefix,
+            out,
+            use_color,
+        ),
         Row::Pr {
             pr,
             hide_author_if,
@@ -1947,8 +2098,20 @@ pub fn run() -> Result<()> {
     for w in &data.warnings {
         eprintln!("warning: {w}");
     }
+    let mut backburner = match state::load() {
+        Ok(backburner) => backburner,
+        Err(err) => {
+            eprintln!("state: {err:#}");
+            BackburnerSet::new()
+        }
+    };
+    if state::scrub(&mut backburner, &data.authored)
+        && let Err(err) = state::save(&backburner)
+    {
+        eprintln!("state: {err:#}");
+    }
     let now = Utc::now();
-    let report = build_full_report(
+    let report = build_full_report_with_backburner(
         &data.viewer,
         &data.authored,
         &data.reviewing,
@@ -1956,6 +2119,7 @@ pub fn run() -> Result<()> {
         &data.releases,
         now,
         Some(Local::now()),
+        &backburner,
     );
     let stdout = io::stdout();
     let mut lock = stdout.lock();
@@ -2253,6 +2417,64 @@ mod tests {
                 })
                 .all(|show_head_ref| *show_head_ref)
         );
+    }
+
+    #[test]
+    fn backburner_is_last_collapsed_and_keeps_moved_stack_together() {
+        let parent = pr_refs("o/r", 1, "main", "a");
+        let child = pr_refs("o/r", 2, "a", "b");
+        let active = pr_refs("o/r", 3, "main", "c");
+        let authored = vec![parent, child, active];
+        let backburner = BackburnerSet::from([
+            crate::state::PrRef {
+                repo: "o/r".into(),
+                pr: 1,
+            },
+            crate::state::PrRef {
+                repo: "o/r".into(),
+                pr: 2,
+            },
+        ]);
+
+        let collapsed = build_section_authored_with_backburner(
+            &authored,
+            "me",
+            &ToggledSet::new(),
+            &backburner,
+        );
+        assert!(matches!(
+            collapsed.rows.last(),
+            Some(Row::BackburnerHeader {
+                expanded: false,
+                ..
+            })
+        ));
+        assert!(
+            collapsed
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Pr { pr, .. } if pr.number == 3))
+        );
+        assert!(
+            !collapsed
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::Pr { pr, .. } if pr.number == 1 || pr.number == 2))
+        );
+
+        let mut toggled = ToggledSet::new();
+        set_expanded(&mut toggled, "o/r", 0, SectionId::Backburner, true);
+        let expanded =
+            build_section_authored_with_backburner(&authored, "me", &toggled, &backburner);
+        let numbers: Vec<u64> = expanded
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Pr { pr, .. } => Some(pr.number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![3, 1, 2]);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::{
     report::{
         self, ChecksSummary, Row, build_section_merged, checks_summary_text, reviewer_summary,
     },
+    state::{self, BackburnerSet},
 };
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:7011";
@@ -30,6 +31,7 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:7011";
 pub struct WebSnapshot {
     viewer: String,
     authored: Vec<Pr>,
+    backburner: BackburnerSet,
     reviewing: Vec<Pr>,
     merged: Vec<Pr>,
     loaded_at: Option<DateTime<Local>>,
@@ -43,6 +45,7 @@ impl Default for WebSnapshot {
         Self {
             viewer: String::new(),
             authored: Vec::new(),
+            backburner: BackburnerSet::new(),
             reviewing: Vec::new(),
             merged: Vec::new(),
             loaded_at: None,
@@ -58,6 +61,7 @@ impl WebSnapshot {
         Self {
             viewer: state.viewer_str().to_string(),
             authored: state.authored.clone(),
+            backburner: state.backburner.clone(),
             reviewing: state.reviewing.clone(),
             merged: state.merged.clone(),
             loaded_at: state.loaded_at,
@@ -422,8 +426,22 @@ fn render_authored(snapshot: &WebSnapshot) -> String {
                 "<section class=\"repo\"><h2>{}</h2><ul class=\"pr-tree\">",
                 escape(&repo)
             );
-            for node in authored_tree(&prs) {
+            let (backburner, active): (Vec<_>, Vec<_>) = prs
+                .into_iter()
+                .partition(|pr| state::contains(&snapshot.backburner, pr));
+            for node in authored_tree(&active) {
                 render_pr(&mut out, &node);
+            }
+            if !backburner.is_empty() {
+                let _ = write!(
+                    out,
+                    "<li><details class=\"pr-section backburner\" data-state-key=\"{}\"><summary>Backburner</summary><ul class=\"pr-tree\">",
+                    escape(&format!("repo:{repo}:section:backburner")),
+                );
+                for node in authored_tree(&backburner) {
+                    render_pr(&mut out, &node);
+                }
+                out.push_str("</ul></details></li>");
             }
             out.push_str("</ul></section>");
         }
@@ -946,6 +964,7 @@ mod tests {
         WebSnapshot {
             viewer: "me".to_string(),
             authored: vec![parent, child, pr("A/repo", 3, "me", 30)],
+            backburner: BackburnerSet::new(),
             reviewing: vec![pr("r/review", 9, "bob", 0)],
             merged: Vec::new(),
             loaded_at: None,
@@ -1083,6 +1102,26 @@ mod tests {
 
         assert!(html.contains("<li class=\"pr\"><article><h3><a href="));
         assert!(!html.contains("section:subtree"));
+    }
+
+    #[test]
+    fn authored_backburner_is_last_and_closed_by_default() {
+        let mut snapshot = WebSnapshot {
+            viewer: "me".into(),
+            authored: vec![pr("o/r", 1, "me", 2), pr("o/r", 2, "me", 1)],
+            ..WebSnapshot::default()
+        };
+        snapshot.backburner.insert(crate::state::PrRef {
+            repo: "o/r".into(),
+            pr: 1,
+        });
+        let html = render_authored(&snapshot);
+        let active = html.find("<span class=\"number\">#2</span>").unwrap();
+        let header = html.find("<summary>Backburner</summary>").unwrap();
+        let moved = html.find("<span class=\"number\">#1</span>").unwrap();
+        assert!(active < header && header < moved);
+        assert!(html.contains("section:backburner\"><summary>Backburner"));
+        assert!(!html.contains("section:backburner\" open"));
     }
 
     #[test]

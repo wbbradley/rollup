@@ -31,15 +31,19 @@ pub fn draw(f: &mut Frame, state: &mut AppState, web_address: &str) {
                 .query()
                 .filter(|query| !query.is_empty())
             {
-                Some(query) => report::build_section_authored_filtered(
+                Some(query) => report::build_section_authored_filtered_with_backburner(
                     &state.authored,
                     &viewer_str,
                     query,
                     &state.search_collapsed,
+                    &state.backburner,
                 ),
-                None => {
-                    report::build_section_authored(&state.authored, &viewer_str, &state.toggled)
-                }
+                None => report::build_section_authored_with_backburner(
+                    &state.authored,
+                    &viewer_str,
+                    &state.toggled,
+                    &state.backburner,
+                ),
             };
             state.authored_page = draw_section(
                 f,
@@ -204,6 +208,21 @@ fn render_list_item(row: &Row<'_>, width: usize) -> ListItem<'static> {
             ));
             ListItem::new(Line::from(spans))
         }
+        Row::BackburnerHeader {
+            expanded,
+            tree_prefix,
+            ..
+        } => ListItem::new(Line::from(vec![
+            Span::styled(
+                tree_prefix.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                if *expanded { "▾ " } else { "▸ " },
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled("Backburner", Style::default().add_modifier(Modifier::BOLD)),
+        ])),
         Row::Pr {
             pr,
             hide_author_if,
@@ -702,9 +721,9 @@ fn footer_line(state: &AppState, web_address: &str) -> Line<'static> {
 
     let hint = match (&state.mode, &state.authored_search) {
         (ViewMode::Me, AuthoredSearch::Filtered(query)) => format!(
-            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · Enter open · c copy · v resolve   "
+            "filter: {query} · Esc clear · / replace · ↑↓ move · h/l collapse/expand · b backburner · Enter open · c copy · v resolve   "
         ),
-        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · Enter open · c copy · p review · v resolve · e radar · r refresh · q quit   ".to_string(),
+        (ViewMode::Me, _) => "↑↓ move · / search · h/l collapse/expand · b backburner · Enter open · c copy · p review · v resolve · e radar · r refresh · q quit   ".to_string(),
         (ViewMode::Radar, _) => "↑↓ move · Tab switch · Esc back · Enter open · x remove reviewer · r refresh · q quit   ".to_string(),
     };
     Line::from(vec![

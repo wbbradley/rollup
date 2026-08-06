@@ -68,6 +68,7 @@ a later refresh fails. `rollup report` does not start the listener.
 | `e`             | Open the Radar page (Review requested + Recent releases) |
 | `Tab`           | Cycle focus between Reviewing / Releases on the Radar page (`Shift+Tab` reverses) |
 | `p`             | Copy a terse review-request line per PR in the selected Authored subtree — `{url} - {title}` with the conventional-commit prefix stripped and ` - DRAFT` appended for drafts, joined by newlines (Me view; same subtree semantics as `c`) |
+| `b`             | Toggle the selected PR and its stacked subtree in/out of the repo's default-collapsed **Backburner** group |
 | `/`             | Incrementally search/filter the Authored tree (Me view) |
 | `Enter`         | Open the selected PR (or comment / check details / repo / release/tag page) in your browser |
 | `c`             | Copy one aggregate agent prompt for the selected Authored node's subtree — every unresolved comment and failing check it contains, grouped per PR (a PR includes its whole stack; a Stacked PRs header only its descendants; a repo header every PR in the repo) (Me view) |
@@ -240,6 +241,10 @@ repos:
 The file is optional — without it, the Recent releases pane just shows
 `(no configured repos)` and everything else keeps working. Parse errors surface
 in the footer status line rather than crashing the app.
+
+Backburner membership is stored separately in `$XDG_STATE_HOME/rollup.yaml`
+(normally `~/.local/state/rollup.yaml`). The file is created on first use and
+stale entries are removed after a GitHub refresh no longer returns that PR.
 
 The `Recent releases` pane renders as a tree: one header per configured repo,
 with up to three of its most recent releases beneath (newest first, e.g.

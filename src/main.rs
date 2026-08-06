@@ -3,6 +3,7 @@ mod config;
 mod github;
 mod model;
 mod report;
+mod state;
 mod ui;
 mod web;
 

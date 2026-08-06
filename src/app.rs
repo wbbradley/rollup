@@ -18,6 +18,7 @@ use crate::{
         strip_conventional_commit_prefix,
     },
     report::{self, Row, Section, SectionId},
+    state::{self, BackburnerSet, PrRef},
     ui, web,
 };
 
@@ -119,6 +120,7 @@ pub struct AppState {
     pub reviewing_sel: usize,
     pub releases_sel: usize,
     pub releases: Vec<RepoReleaseInfo>,
+    pub backburner: BackburnerSet,
     /// Explicit collapse-state choices for Authored section nodes, keyed by
     /// `(repo, number, SectionId)`. Not reset by `apply`, so user choices
     /// survive background refetches and data-driven default changes.
@@ -159,6 +161,7 @@ impl AppState {
             reviewing_sel: 0,
             releases_sel: 0,
             releases: Vec::new(),
+            backburner: BackburnerSet::new(),
             toggled: report::ToggledSet::new(),
             authored_search: AuthoredSearch::Normal,
             search_collapsed: report::ToggledSet::new(),
@@ -172,6 +175,18 @@ impl AppState {
     }
 
     fn apply(&mut self, data: Data) {
+        let mut notes: Vec<String> = Vec::new();
+        match state::load() {
+            Ok(mut backburner) => {
+                if state::scrub(&mut backburner, &data.authored)
+                    && let Err(err) = state::save(&backburner)
+                {
+                    notes.push(format!("state: {err:#}"));
+                }
+                self.backburner = backburner;
+            }
+            Err(err) => notes.push(format!("state: {err:#}")),
+        }
         self.viewer = Some(data.viewer);
         self.authored = data.authored;
         self.reviewing = data.reviewing;
@@ -179,7 +194,6 @@ impl AppState {
         self.releases = data.releases;
         self.loaded_at = Some(Local::now());
         self.error = None;
-        let mut notes: Vec<String> = Vec::new();
         if let Some(err) = data.config_error {
             notes.push(format!("config: {err}"));
         }
@@ -234,15 +248,19 @@ impl AppState {
             .query()
             .filter(|query| !query.is_empty())
         {
-            Some(query) => report::build_section_authored_filtered(
+            Some(query) => report::build_section_authored_filtered_with_backburner(
                 &self.authored,
                 self.viewer_str(),
                 query,
                 &self.search_collapsed,
+                &self.backburner,
             ),
-            None => {
-                report::build_section_authored(&self.authored, self.viewer_str(), &self.toggled)
-            }
+            None => report::build_section_authored_with_backburner(
+                &self.authored,
+                self.viewer_str(),
+                &self.toggled,
+                &self.backburner,
+            ),
         }
     }
 
@@ -310,6 +328,7 @@ enum Selected<'a> {
     /// owned by the `Row`, not by the borrowed PR data, so it can't be a `&'a
     /// str`. `open_selected` opens `https://github.com/{repo}`.
     Repo(String),
+    Backburner(String),
     Pr(&'a Pr),
     Reviewer(&'a Pr, &'a ReviewerStatus),
     // The `SectionId` documents which header resolved and is asserted in tests;
@@ -340,6 +359,13 @@ fn selected_row<'a>(rows: &[Row<'a>], sel: usize) -> Option<Selected<'a>> {
                 current_pr = None;
                 if idx == sel {
                     return Some(Selected::Repo(repo.clone()));
+                }
+                idx += 1;
+            }
+            Row::BackburnerHeader { repo, .. } => {
+                current_pr = None;
+                if idx == sel {
+                    return Some(Selected::Backburner(repo.clone()));
                 }
                 idx += 1;
             }
@@ -411,6 +437,19 @@ fn section_ctx_at(rows: &[Row<'_>], sel: usize) -> Option<SectionCtx> {
                         repo: repo.clone(),
                         number: 0,
                         section: SectionId::Repo,
+                        is_header: true,
+                    });
+                }
+                idx += 1;
+            }
+            Row::BackburnerHeader { repo, .. } => {
+                current_pr = None;
+                current_check_section = SectionId::Checks;
+                if idx == sel {
+                    return Some(SectionCtx {
+                        repo: repo.clone(),
+                        number: 0,
+                        section: SectionId::Backburner,
                         is_header: true,
                     });
                 }
@@ -504,6 +543,13 @@ fn header_sel_index(
             Row::RepoHeader { repo: r, .. } => {
                 current_pr = None;
                 if section == SectionId::Repo && r == repo {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+            Row::BackburnerHeader { repo: r, .. } => {
+                current_pr = None;
+                if section == SectionId::Backburner && r == repo {
                     return Some(idx);
                 }
                 idx += 1;
@@ -670,6 +716,7 @@ fn run_app(
                         KeyCode::Char('x') => remove_selected_reviewer(&mut state, tx),
                         KeyCode::Char('c') => copy_prompt(&mut state),
                         KeyCode::Char('v') => resolve_selected_outdated_comments(&mut state, tx),
+                        KeyCode::Char('b') => toggle_backburner(&mut state),
                         KeyCode::Char('l') | KeyCode::Right => toggle_section(&mut state, true),
                         KeyCode::Char('h') | KeyCode::Left => toggle_section(&mut state, false),
                         _ => {}
@@ -942,7 +989,9 @@ fn open_selected(state: &AppState) {
     }
     let section = state.current_section();
     let url = match selected_row(&section.rows, state.current_sel()) {
-        Some(Selected::Repo(repo)) => Some(format!("https://github.com/{repo}")),
+        Some(Selected::Repo(repo)) | Some(Selected::Backburner(repo)) => {
+            Some(format!("https://github.com/{repo}"))
+        }
         Some(Selected::Pr(pr))
         | Some(Selected::Reviewer(pr, _))
         | Some(Selected::Section(pr, _)) => Some(pr.url.clone()),
@@ -1005,6 +1054,101 @@ fn toggle_section(state: &mut AppState, expand: bool) {
         state.authored_sel = idx;
     }
     state.clamp_selection();
+}
+
+/// Toggle the selected PR and every stacked descendant in persistent
+/// Backburner state. Keeping the same visible index makes selection naturally
+/// advance to the next row after the moved subtree disappears from its old
+/// location.
+fn toggle_backburner(state: &mut AppState) {
+    toggle_backburner_with(state, state::save);
+}
+
+#[derive(PartialEq, Eq)]
+enum SelectionTarget {
+    Repo(String),
+    Backburner(String),
+    Pr(String, u64),
+}
+
+fn selection_target(selected: Selected<'_>, moved: &[PrRef]) -> Option<SelectionTarget> {
+    match selected {
+        Selected::Repo(repo) => Some(SelectionTarget::Repo(repo)),
+        Selected::Backburner(repo) => Some(SelectionTarget::Backburner(repo)),
+        Selected::Pr(pr) if !moved.iter().any(|p| p.repo == pr.repo && p.pr == pr.number) => {
+            Some(SelectionTarget::Pr(pr.repo.clone(), pr.number))
+        }
+        _ => None,
+    }
+}
+
+fn toggle_backburner_with(state: &mut AppState, save: impl FnOnce(&BackburnerSet) -> Result<()>) {
+    if state.mode != ViewMode::Me {
+        return;
+    }
+    let section = state.authored_section();
+    let selected = match selected_row(&section.rows, state.authored_sel) {
+        Some(Selected::Pr(pr)) => Some((pr.repo.clone(), pr.number)),
+        _ => None,
+    };
+    let Some((repo, number)) = selected else {
+        state.status = Some("b: select a PR row first".into());
+        return;
+    };
+
+    let tree = repo_tree(&state.authored, &repo);
+    let Some(node) = find_node(&tree, &repo, number) else {
+        return;
+    };
+    let refs: Vec<PrRef> = gather_prs(node)
+        .into_iter()
+        .map(|pr| PrRef {
+            repo: pr.repo.clone(),
+            pr: pr.number,
+        })
+        .collect();
+    let next_target = ((state.authored_sel + 1)..count_selectable(&section)).find_map(|index| {
+        selected_row(&section.rows, index).and_then(|selected| selection_target(selected, &refs))
+    });
+    let removing = state.backburner.contains(&PrRef {
+        repo: repo.clone(),
+        pr: number,
+    });
+    let mut next = state.backburner.clone();
+    if removing {
+        for pr in &refs {
+            next.remove(pr);
+        }
+    } else {
+        next.extend(refs.iter().cloned());
+    }
+    match save(&next) {
+        Ok(()) => {
+            state.backburner = next;
+            state.status = Some(format!(
+                "{} #{} and {} stacked descendant{} {} Backburner",
+                repo,
+                number,
+                refs.len().saturating_sub(1),
+                if refs.len() == 2 { "" } else { "s" },
+                if removing { "removed from" } else { "moved to" },
+            ));
+            state.authored_sel = usize::MAX;
+            if let Some(target) = next_target {
+                let section = state.authored_section();
+                if let Some(index) = (0..count_selectable(&section)).find(|index| {
+                    selected_row(&section.rows, *index)
+                        .and_then(|selected| selection_target(selected, &[]))
+                        .as_ref()
+                        == Some(&target)
+                }) {
+                    state.authored_sel = index;
+                }
+            }
+            state.clamp_selection();
+        }
+        Err(err) => state.error = Some(format!("saving Backburner state: {err:#}")),
+    }
 }
 
 fn remove_selected_reviewer(state: &mut AppState, tx: &Sender<Msg>) {
@@ -1129,6 +1273,10 @@ fn selected_outdated_threads(state: &AppState) -> Vec<ReviewThreadTarget> {
         Selected::Repo(repo) => repo_tree(&state.authored, &repo)
             .iter()
             .flat_map(gather_outdated_threads)
+            .collect(),
+        Selected::Backburner(repo) => backburner_repo_prs(state, &repo)
+            .into_iter()
+            .flat_map(outdated_threads_on_pr)
             .collect(),
         Selected::Reviewer(_, _) | Selected::Check(_, _) | Selected::Section(_, _) => Vec::new(),
     }
@@ -1275,6 +1423,18 @@ fn repo_tree<'a>(authored: &'a [Pr], repo: &str) -> Vec<PrTreeNode<'a>> {
         .map(|(_, prs)| prs)
         .unwrap_or_default();
     authored_tree(&group)
+}
+
+fn backburner_repo_prs<'a>(state: &'a AppState, repo: &str) -> Vec<&'a Pr> {
+    group_by_repo(&state.authored)
+        .into_iter()
+        .find(|(name, _)| name == repo)
+        .map(|(_, prs)| {
+            prs.into_iter()
+                .filter(|pr| state::contains(&state.backburner, pr))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the aggregate agent prompt from a set of per-PR actionable items, or
@@ -1504,6 +1664,13 @@ fn build_copy_prompt(state: &AppState) -> Option<String> {
             let items: Vec<PrActions> = tree.iter().flat_map(gather_actionable).collect();
             combined_prompt(&items)
         }
+        Selected::Backburner(repo) => {
+            let items: Vec<PrActions> = backburner_repo_prs(state, &repo)
+                .into_iter()
+                .filter_map(pr_actions_for)
+                .collect();
+            combined_prompt(&items)
+        }
         // Pending, Valid Results, and other non-actionable section headers.
         Selected::Section(_, _) => None,
     }
@@ -1575,6 +1742,7 @@ fn build_review_request(state: &AppState) -> Option<String> {
             let tree = repo_tree(&state.authored, &repo);
             tree.iter().flat_map(gather_prs).collect()
         }
+        Selected::Backburner(repo) => backburner_repo_prs(state, &repo),
         // A PR row: that PR plus every descendant stacked PR.
         Selected::Pr(pr) => {
             let tree = repo_tree(&state.authored, &pr.repo);
@@ -3234,5 +3402,52 @@ mod tests {
         state.mode = ViewMode::Radar;
         copy_review_request(&mut state);
         assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn backburner_toggle_moves_whole_stack_and_selects_next_visible_pr() {
+        let mut state = stacked_state();
+        let section = state.authored_section();
+        let selected = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Pr(pr) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = selected;
+
+        toggle_backburner_with(&mut state, |_| Ok(()));
+
+        assert!(state.backburner.contains(&PrRef {
+            repo: "o/r".into(),
+            pr: 1,
+        }));
+        assert!(state.backburner.contains(&PrRef {
+            repo: "o/r".into(),
+            pr: 2,
+        }));
+        let section = state.authored_section();
+        assert!(matches!(
+            selected_row(&section.rows, state.authored_sel),
+            Some(Selected::Pr(pr)) if pr.number == 3
+        ));
+        assert!(section.rows.iter().any(|row| matches!(
+            row,
+            Row::BackburnerHeader {
+                expanded: false,
+                ..
+            }
+        )));
+        drop(section);
+
+        report::set_expanded(&mut state.toggled, "o/r", 0, SectionId::Backburner, true);
+        let section = state.authored_section();
+        let selected = sel_where(
+            &section,
+            |selected| matches!(selected, Selected::Pr(pr) if pr.number == 1),
+        );
+        drop(section);
+        state.authored_sel = selected;
+        toggle_backburner_with(&mut state, |_| Ok(()));
+        assert!(state.backburner.is_empty());
     }
 }
